@@ -20,9 +20,9 @@ lint 不会吭声。这个脚本是**独立于 lint 的第二道判据**：
       · 一个 .jar 路径 —— 直接用这个 jar
 
     # 例：
-    python3 tools/check_api_compat.py dist/juping-0.1.0-release.apk
-    python3 tools/check_api_compat.py dist/juping-0.1.0-release.apk 15
-    python3 tools/check_api_compat.py dist/juping-0.1.0-release.apk \\
+    python3 tools/check_api_compat.py dist/juping-<版本号>-release.apk
+    python3 tools/check_api_compat.py dist/juping-<版本号>-release.apk 15
+    python3 tools/check_api_compat.py dist/juping-<版本号>-release.apk \\
         /path/to/android-4.0.4/android.jar
 
 需要 JAVA_HOME 指向一个带 javap 的 JDK，以及 ANDROID_HOME / ANDROID_BUILD_TOOLS 里的 dexdump。

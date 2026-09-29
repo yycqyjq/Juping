@@ -32,8 +32,11 @@ android {
         // 刻意压低 targetSdk：避免 Android 5.0+ 的运行时权限模型、
         // 后台服务限制等新行为落到这个老设备上。
         targetSdkVersion 19
-        versionCode 1
-        versionName "0.1.0"
+        // versionCode 随每次「要拿去装机」的包递增。
+        // 覆盖安装本身不看它，但「设置 → 应用信息」里能靠它一眼分辨
+        // 装的是哪一版 —— 真机排障时很有用（分不清新旧会白试一轮）。
+        versionCode 2
+        versionName "0.1.1"
     }
 
     if (hasSigningConfig) {

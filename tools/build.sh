@@ -16,8 +16,12 @@
 #   ./tools/build.sh clean        # 清理构建产物
 #
 # 产物：
-#   dist/juping-0.1.0-release.apk   ← 装机用这个
-#   dist/juping-0.1.0-debug.apk     ← 排障用（含 debuggable 标记）
+#   dist/juping-<版本号>-release.apk   ← 装机用这个
+#   dist/juping-<版本号>-debug.apk     ← 排障用（含 debuggable 标记）
+#
+#   <版本号> 取自 app/build.gradle 的 versionName（脚本自己读，不写死）。
+#   这里刻意不写具体版本号 —— 写死过一次，升版本时注释没跟着改，
+#   变成文档漂移（要靠 grep 才发现）。
 
 set -euo pipefail
 
