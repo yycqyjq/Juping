@@ -20,7 +20,7 @@ import java.util.Map;
  *   <li>GET  /upnp/device.xml          —— 设备描述，控制点靠它了解我们是什么设备</li>
  *   <li>GET  /upnp/{service}.xml       —— 服务描述（SCPD），控制点靠它了解能调哪些指令</li>
  *   <li>POST /upnp/control/{service}   —— 控制指令（SetAVTransportURI / Play / Pause / Stop / Seek）</li>
- *   <li>SUBSCRIBE                      —— 事件订阅，这里只应答不真正推送</li>
+ *   <li>SUBSCRIBE / UNSUBSCRIBE        —— 事件订阅（GENA），交给 {@link EventDispatcher} 真正推 NOTIFY</li>
  * </ul>
  *
  * <p>用 {@link CommandHandler} 把「协议解析」和「业务动作」解耦：
@@ -76,16 +76,36 @@ public class UpnpHttpServer extends Thread {
     private final String friendlyName;
     private final CommandHandler handler;
 
+    /** GENA 事件分发。订阅状态、SEQ、超时都在这里面。 */
+    private final EventDispatcher events;
+
     private volatile boolean running = true;
     private ServerSocket serverSocket;
 
-    public UpnpHttpServer(int port, String uuid, String friendlyName, CommandHandler handler) {
+    public UpnpHttpServer(int port, String uuid, String friendlyName, CommandHandler handler,
+                          EventDispatcher.EventSource eventSource) {
         super("upnp-http");
         setDaemon(true);
         this.port = port;
         this.uuid = uuid;
         this.friendlyName = friendlyName;
         this.handler = handler;
+        this.events = new EventDispatcher(uuid, eventSource);
+    }
+
+    /**
+     * 状态变了，推给订阅了该服务的控制点。
+     *
+     * <p>业务层只调这一个方法，不必自己持有 {@link EventDispatcher} ——
+     * 订阅的生死由 HTTP 层管，业务层管不着也不该管。
+     */
+    public void notifyEvent(String service) {
+        events.notifyAll(service);
+    }
+
+    /** 暴露给测试与排障用（看当前有几个订阅者）。 */
+    public EventDispatcher getEventDispatcher() {
+        return events;
     }
 
     @Override
@@ -169,6 +189,11 @@ public class UpnpHttpServer extends Thread {
 
             int contentLength = 0;
             String soapAction = null;
+            // ---- GENA 订阅用的头。SUBSCRIBE 没有 body，全部信息都在这几个头里 ----
+            String callbackHeader = null;   // <http://ip:port/path>，可含多个
+            String ntHeader = null;         // 新订阅必带，值应为 upnp:event
+            String sidHeader = null;        // 续订 / 退订必带
+            String timeoutHeader = null;    // Second-1800 或 Second-infinite
             for (int i = 1; i < headLines.length; i++) {
                 String line = headLines[i];
                 if (line.length() == 0) {
@@ -183,6 +208,14 @@ public class UpnpHttpServer extends Thread {
                     contentLength = parseInt(line.substring(15).trim(), 0);
                 } else if (lower.startsWith("soapaction:")) {
                     soapAction = line.substring(11).trim().replace("\"", "");
+                } else if (lower.startsWith("callback:")) {
+                    callbackHeader = line.substring(9).trim();
+                } else if (lower.startsWith("nt:")) {
+                    ntHeader = line.substring(3).trim();
+                } else if (lower.startsWith("sid:")) {
+                    sidHeader = line.substring(4).trim();
+                } else if (lower.startsWith("timeout:")) {
+                    timeoutHeader = line.substring(8).trim();
                 }
             }
 
@@ -200,23 +233,28 @@ public class UpnpHttpServer extends Thread {
             String body = new String(bodyBytes, 0, read, "UTF-8");
 
             OutputStream out = socket.getOutputStream();
+            String initialSid = null;
             if ("GET".equals(method)) {
                 handleGet(path, out);
             } else if ("POST".equals(method)) {
                 handlePost(path, soapAction, body, out);
-            } else if ("SUBSCRIBE".equals(method) || "UNSUBSCRIBE".equals(method)) {
-                // 只应答，不真正推送事件。绝大多数控制点能容忍这一点。
-                String resp = "HTTP/1.1 200 OK\r\n"
-                        + "SID: uuid:" + uuid + "\r\n"
-                        + "TIMEOUT: Second-1800\r\n"
-                        + "Content-Length: 0\r\n\r\n";
-                out.write(resp.getBytes("UTF-8"));
+            } else if ("SUBSCRIBE".equals(method)) {
+                initialSid = handleSubscribe(path, callbackHeader, ntHeader, sidHeader,
+                        timeoutHeader, out);
+            } else if ("UNSUBSCRIBE".equals(method)) {
+                handleUnsubscribe(sidHeader, out);
             } else if ("HEAD".equals(method)) {
                 writeSimple(out, "200 OK", "text/xml", "");
             } else {
                 writeSimple(out, "405 Method Not Allowed", "text/plain", "");
             }
             out.flush();
+            // 初始事件必须在 200 响应**真正发出去之后**再推。
+            // 控制点是拿响应里的 SID 来认这条 NOTIFY 的；早到就会被当成未知 SID
+            // 丢掉，于是它永远拿不到初始状态。详见 EventDispatcher#subscribe。
+            if (initialSid != null) {
+                events.fireInitial(initialSid);
+            }
         } catch (Exception e) {
             Log.w(TAG, "处理连接出错", e);
         } finally {
@@ -308,6 +346,112 @@ public class UpnpHttpServer extends Thread {
                 + "      </service>\n";
     }
 
+    // ------------------------------------------------- SUBSCRIBE（GENA 事件）
+
+    /**
+     * 我们在 device.xml 里声明了这三个服务，SUBSCRIBE 只能指向它们。
+     *
+     * <p>不校验的话，控制点拼错一个服务名也能拿到 SID，然后永远收不到事件 ——
+     * 它只会觉得"设备事件坏了"，而日志里一切正常。宁可当场回 404。
+     */
+    private static boolean isKnownService(String s) {
+        return "AVTransport".equals(s) || "ConnectionManager".equals(s)
+                || "RenderingControl".equals(s);
+    }
+
+    /**
+     * 处理 SUBSCRIBE。同一个方法名承担两种语义，靠头区分
+     * （UPnP Device Architecture 1.0 §4.1）：
+     * <ul>
+     *   <li>带 CALLBACK、不带 SID —— **新订阅**</li>
+     *   <li>带 SID、不带 CALLBACK —— **续订**</li>
+     * </ul>
+     * 两者都有或都没有都是非法请求，回 412。
+     *
+     * @return 新订阅的 SID —— 调用方必须在写完 200 响应之后再推初始事件；
+     *         续订或失败时返回 null（失败响应已经在这里写掉了）
+     */
+    private String handleSubscribe(String path, String callback, String nt, String sid,
+                                   String timeout, OutputStream out) throws IOException {
+        String service = lastSegment(path);
+        boolean hasCallback = callback != null && callback.length() > 0;
+        boolean hasSid = sid != null && sid.length() > 0;
+
+        if (hasCallback == hasSid) {
+            Log.w(TAG, "SUBSCRIBE 头非法：CALLBACK 有=" + hasCallback + "，SID 有=" + hasSid);
+            writeStatus(out, "412 Precondition Failed");
+            return null;
+        }
+        if (!isKnownService(service)) {
+            Log.w(TAG, "SUBSCRIBE 指向未知服务: " + path);
+            writeStatus(out, "404 Not Found");
+            return null;
+        }
+
+        if (hasSid) {
+            long t = events.renew(sid, timeout);
+            if (t < 0) {
+                Log.w(TAG, "续订被拒，SID 不认识: " + sid);
+                writeStatus(out, "412 Precondition Failed");
+                return null;
+            }
+            writeSubscribeOk(out, sid, t);
+            return null;
+        }
+
+        // NT 必须是 upnp:event。缺失时宽容处理 —— 少数控制点不发这个头，
+        // 为了一个可推断的字段把订阅拒掉不值得；但值不对就必须拒。
+        if (nt != null && nt.length() > 0 && !"upnp:event".equals(nt)) {
+            Log.w(TAG, "SUBSCRIBE 的 NT 不是 upnp:event: " + nt);
+            writeStatus(out, "412 Precondition Failed");
+            return null;
+        }
+
+        String newSid = events.subscribe(service, callback, timeout);
+        if (newSid == null) {
+            Log.w(TAG, "CALLBACK 里解析不出可用地址: " + callback);
+            writeStatus(out, "412 Precondition Failed");
+            return null;
+        }
+        writeSubscribeOk(out, newSid, events.timeoutOf(newSid));
+        return newSid;
+    }
+
+    private void handleUnsubscribe(String sid, OutputStream out) throws IOException {
+        if (sid == null || sid.length() == 0) {
+            writeStatus(out, "412 Precondition Failed");
+            return;
+        }
+        if (!events.unsubscribe(sid)) {
+            // 规范：SID 不认识时回 412，而不是 404 —— 404 是"路径不存在"，
+            // 而这里路径是对的，只是订阅已经没了（过期或已退订）。
+            Log.w(TAG, "退订被拒，SID 不认识: " + sid);
+            writeStatus(out, "412 Precondition Failed");
+            return;
+        }
+        writeStatus(out, "200 OK");
+    }
+
+    private void writeSubscribeOk(OutputStream out, String sid, long timeoutSec)
+            throws IOException {
+        String resp = "HTTP/1.1 200 OK\r\n"
+                + "SID: " + sid + "\r\n"
+                + "TIMEOUT: Second-" + timeoutSec + "\r\n"
+                + "Content-Length: 0\r\n"
+                + "Connection: close\r\n"
+                + "Server: Android UPnP/1.0 Juping/1.0\r\n\r\n";
+        out.write(resp.getBytes("UTF-8"));
+    }
+
+    /** 无 body 的状态响应。412 / 404 / 200 都用它。 */
+    private void writeStatus(OutputStream out, String status) throws IOException {
+        String resp = "HTTP/1.1 " + status + "\r\n"
+                + "Content-Length: 0\r\n"
+                + "Connection: close\r\n"
+                + "Server: Android UPnP/1.0 Juping/1.0\r\n\r\n";
+        out.write(resp.getBytes("UTF-8"));
+    }
+
     // --------------------------------------------------------------- POST
 
     /**
@@ -384,6 +528,26 @@ public class UpnpHttpServer extends Thread {
         }
     }
 
+    /**
+     * 能吃的格式清单。
+     *
+     * <p>0.6GB 内存 + MT5880 的现实决定了必须「保守声明」：声明过宽 →
+     * 控制点推来解不动或解不了的流 → 直接卡死或黑屏。所以刻意不声明
+     * MKV / MPEG-PS 这类容器解析吃内存的格式。
+     *
+     * <p>公开成常量是因为它有两个出口：GetProtocolInfo 的响应，以及
+     * ConnectionManager 事件里的 {@code SinkProtocolInfo}。**必须是同一份字符串** ——
+     * 各写一份，改一处忘一处，控制点就会看到"声明的"和"事件报的"不一致。
+     */
+    public static final String SINK_PROTOCOL_INFO =
+            "http-get:*:video/mp4:*,"
+                    + "http-get:*:application/vnd.apple.mpegurl:*,"
+                    + "http-get:*:application/x-mpegURL:*,"
+                    + "http-get:*:audio/mpeg:*,"
+                    + "http-get:*:audio/mp4:*,"
+                    + "http-get:*:image/jpeg:*,"
+                    + "http-get:*:image/png:*";
+
     /** 各 action 需要回什么参数 */
     private String responseArgs(String action) {
         if ("GetTransportInfo".equals(action)) {
@@ -431,17 +595,8 @@ public class UpnpHttpServer extends Thread {
             return "<CurrentMute>0</CurrentMute>";
         }
         if ("GetProtocolInfo".equals(action)) {
-            // 声明能吃的格式。0.6GB 内存 + MT5880 的现实决定了必须「保守声明」：
-            // 声明过宽 → 控制点推来解不动或解不了的流 → 直接卡死或黑屏。
-            // 所以刻意不声明 MKV / MPEG-PS 这类容器解析吃内存的格式。
             return "<Source></Source>"
-                    + "<Sink>http-get:*:video/mp4:*,"
-                    + "http-get:*:application/vnd.apple.mpegurl:*,"
-                    + "http-get:*:application/x-mpegURL:*,"
-                    + "http-get:*:audio/mpeg:*,"
-                    + "http-get:*:audio/mp4:*,"
-                    + "http-get:*:image/jpeg:*,"
-                    + "http-get:*:image/png:*</Sink>";
+                    + "<Sink>" + SINK_PROTOCOL_INFO + "</Sink>";
         }
         if ("GetCurrentConnectionIDs".equals(action)) {
             return "<ConnectionIDs>0</ConnectionIDs>";
@@ -625,8 +780,14 @@ public class UpnpHttpServer extends Thread {
         return 0L;
     }
 
-    /** 毫秒 → UPnP 时间格式 */
-    private static String formatTime(long ms) {
+    /**
+     * 毫秒 → UPnP 时间格式 HH:MM:SS。
+     *
+     * <p>公开出来是因为业务层也要用：AVTransport 事件里的
+     * {@code CurrentTrackDuration} 和 GetPositionInfo 的 {@code TrackDuration}
+     * 是同一个值，格式必须一致 —— 各写一份迟早会漂。
+     */
+    public static String formatTime(long ms) {
         if (ms <= 0) {
             return "00:00:00";
         }
@@ -649,8 +810,11 @@ public class UpnpHttpServer extends Thread {
      *
      * <p>{@code &} 必须最先替换，否则会把后面刚生成的实体再转一遍
      * （{@code &lt;} → {@code &amp;lt;}）。
+     *
+     * <p>公开出来是给 {@link EventDispatcher} 用的：事件体里同样嵌着带
+     * {@code &} 的媒体 URL，转义规则**必须和 SOAP 响应完全一致**。
      */
-    private static String escapeXml(String s) {
+    public static String escapeXml(String s) {
         if (s == null) {
             return "";
         }
@@ -665,6 +829,8 @@ public class UpnpHttpServer extends Thread {
 
     public void shutdown() {
         running = false;
+        // 事件分发器有自己的线程池，必须一并关掉，否则它会挂着不放。
+        events.shutdown();
         try {
             if (serverSocket != null && !serverSocket.isClosed()) {
                 serverSocket.close();
@@ -691,6 +857,9 @@ public class UpnpHttpServer extends Thread {
                     + " </actionList>\n"
                     + " <serviceStateTable>\n"
                     + stateVar("TransportState", "string", true)
+                    + stateVar("TransportStatus", "string", true)
+                    + stateVar("CurrentTrackURI", "string", true)
+                    + stateVar("CurrentTrackDuration", "string", true)
                     + stateVar("CurrentURI", "string", false)
                     + stateVar("CurrentURIMetaData", "string", false)
                     + " </serviceStateTable>\n"
@@ -705,6 +874,14 @@ public class UpnpHttpServer extends Thread {
                     + action("GetCurrentConnectionIDs")
                     + action("GetCurrentConnectionInfo", "ConnectionID")
                     + " </actionList>\n"
+                    // ConnectionManager 在标准里也有可事件化变量，控制点常订阅它。
+                    // 声明了就必须在 eventedVars 里如实给值，否则控制点收到的是一份
+                    // 缺字段的事件体 —— 比不订阅更糟。
+                    + " <serviceStateTable>\n"
+                    + stateVar("SourceProtocolInfo", "string", true)
+                    + stateVar("SinkProtocolInfo", "string", true)
+                    + stateVar("CurrentConnectionIDs", "string", true)
+                    + " </serviceStateTable>\n"
                     + "</scpd>\n";
 
     private static final String SCPD_RENDERING_CONTROL =
@@ -717,6 +894,13 @@ public class UpnpHttpServer extends Thread {
                     + action("GetMute", "InstanceID", "Channel")
                     + action("SetMute", "InstanceID", "Channel", "DesiredMute")
                     + " </actionList>\n"
+                    // 声明 Volume / Mute 是「可事件化」的 —— 控制点订阅后，
+                    // 音量一变就能收到 NOTIFY。原来这里一张 stateVariable 表都没有，
+                    // 于是控制点订阅 RenderingControl 拿到的是空事件集。
+                    + " <serviceStateTable>\n"
+                    + stateVar("Volume", "ui2", true)
+                    + stateVar("Mute", "boolean", true)
+                    + " </serviceStateTable>\n"
                     + "</scpd>\n";
 
     private static String action(String name, String... args) {

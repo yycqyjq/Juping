@@ -17,6 +17,67 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
+    <!-- 音乐层：纯音频投屏时显示。
+         为什么必须有这一层：音频流走的是同一个 SurfaceView，上面什么都没有 ——
+         电视就是一片黑，只剩一条状态栏。声音明明在放，看着却像投屏失败了。
+         所以纯音频时用一层**不透明**的卡片把它盖住（background=@color/bg 是
+         必须的，透明的话下面的黑色还是会露出来）。 -->
+    <LinearLayout
+        android:id="@+id/music"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@color/bg"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:paddingLeft="48dp"
+        android:paddingRight="48dp"
+        android:visibility="gone">
+
+        <ImageView
+            android:layout_width="96dp"
+            android:layout_height="96dp"
+            android:contentDescription="@string/music_title"
+            android:src="@drawable/ic_music" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="28dp"
+            android:text="@string/music_title"
+            android:textColor="@color/text_primary"
+            android:textSize="34sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/music_source"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:ellipsize="middle"
+            android:gravity="center"
+            android:singleLine="true"
+            android:textColor="@color/text_secondary"
+            android:textSize="17sp" />
+
+        <TextView
+            android:id="@+id/music_progress"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:textColor="@color/accent"
+            android:textSize="22sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="26dp"
+            android:gravity="center"
+            android:lineSpacingExtra="4dp"
+            android:text="@string/music_hint"
+            android:textColor="@color/text_hint"
+            android:textSize="15sp" />
+    </LinearLayout>
+
     <!-- 主面板：等待投屏时显示 -->
     <LinearLayout
         android:id="@+id/panel"

@@ -19,23 +19,37 @@ import android.widget.Toast;
 /**
  * 主界面。
  *
- * <p>两种形态，靠播放状态自动切换：
+ * <p>三种形态，靠播放状态自动切换：
  * <ul>
  *   <li><b>等待投屏</b> —— 显示引导 + 设备信息卡片，用户照着做就行</li>
- *   <li><b>播放中</b> —— 隐藏面板、全屏出画面，顶部留一条半透明状态条</li>
+ *   <li><b>视频播放中</b> —— 隐藏面板、全屏出画面，顶部留一条半透明状态条</li>
+ *   <li><b>音乐播放中</b> —— 纯音频流在 SurfaceView 上什么都没有，必须换成
+ *       音符卡片。不然电视就是**一片黑**：声音明明在放，看着却像投屏坏了</li>
  * </ul>
  *
  * <p>界面刻意做得极简：0.6GB 内存的设备上，每一点 UI 开销都是奢侈的。
- * 所以没有列表、没有动画、没有图片资源，全部是纯色 shape + 文字。
+ * 所以没有列表、没有动画，图形资源只有脚本生成的那几张 PNG。
  */
 public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private static final long REFRESH_INTERVAL_MS = 1500L;
 
+    /**
+     * 界面三态。
+     *
+     * <p>用三态整数而不是「播放中 / 没播放」两个布尔，是因为音频与视频**互斥**：
+     * 写成两个布尔就允许出现"既是音频又是视频"这种非法组合，而它一旦出现，
+     * 界面会同时显示画面和音符卡片 —— 排查起来非常费劲。
+     */
+    private static final int MODE_IDLE = 0;
+    private static final int MODE_AUDIO = 1;
+    private static final int MODE_VIDEO = 2;
+
     private SurfaceView surfaceView;
     private LinearLayout panel;
     private LinearLayout overlay;
     private LinearLayout rowSource;
+    private LinearLayout music;
     private View statusDot;
 
     private TextView infoDevice;
@@ -44,11 +58,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private TextView infoState;
     private TextView infoSource;
     private TextView playingText;
+    private TextView musicSource;
+    private TextView musicProgress;
     private Button btnRestart;
 
     private DlnaRendererService service;
     private boolean bound;
-    private boolean lastPlaying;
+    private int lastMode = MODE_IDLE;
 
     private final Handler handler = new Handler();
 
@@ -85,6 +101,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         panel = (LinearLayout) findViewById(R.id.panel);
         overlay = (LinearLayout) findViewById(R.id.overlay);
         rowSource = (LinearLayout) findViewById(R.id.row_source);
+        music = (LinearLayout) findViewById(R.id.music);
         statusDot = findViewById(R.id.status_dot);
 
         infoDevice = (TextView) findViewById(R.id.info_device);
@@ -93,6 +110,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         infoState = (TextView) findViewById(R.id.info_state);
         infoSource = (TextView) findViewById(R.id.info_source);
         playingText = (TextView) findViewById(R.id.playing_text);
+        musicSource = (TextView) findViewById(R.id.music_source);
+        musicProgress = (TextView) findViewById(R.id.music_progress);
         btnRestart = (Button) findViewById(R.id.btn_restart);
 
         surfaceView.getHolder().addCallback(this);
@@ -137,6 +156,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             infoNetwork.setText("—");
             infoState.setText(R.string.state_starting);
             applyStatusDot(false);
+            applyModeIfChanged(MODE_IDLE);
             return;
         }
 
@@ -146,19 +166,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         infoNetwork.setText(service.getBoundInterfaceName());
         infoState.setText(describeState());
 
-        boolean playing = isPlaying();
-        applyStatusDot(playing);
-        if (playing != lastPlaying) {
-            lastPlaying = playing;
-            applyMode(playing);
-        }
+        int mode = currentMode();
+        applyStatusDot(mode != MODE_IDLE);
+        applyModeIfChanged(mode);
 
-        if (playing && service.getPlayer() != null) {
-            int pos = service.getPlayer().getPosition() / 1000;
-            int dur = service.getPlayer().getDuration() / 1000;
-            playingText.setText(dur > 0
-                    ? getString(R.string.fmt_progress, formatClock(pos), formatClock(dur))
-                    : shortName(service.getCurrentUri()));
+        if (mode == MODE_IDLE || service.getPlayer() == null) {
+            return;
+        }
+        int pos = service.getPlayer().getPosition() / 1000;
+        int dur = service.getPlayer().getDuration() / 1000;
+        // 时长恒为 0 的是 HLS 直播 —— 拿不到总时长就报"正在播放"，
+        // 别显示一个 00:00 的总时长把人看懵。
+        String progress = dur > 0
+                ? getString(R.string.fmt_progress, formatClock(pos), formatClock(dur))
+                : getString(R.string.music_live);
+        if (mode == MODE_AUDIO) {
+            musicSource.setText(shortName(service.getCurrentUri()));
+            musicProgress.setText(progress);
+            // 顶部状态条只报「音乐投屏」，进度数字归音乐卡片。
+            // 同一个值在屏幕上出现两遍，三米外看着很吵。
+            playingText.setText(getString(R.string.music_title));
+        } else {
+            playingText.setText(dur > 0 ? progress : shortName(service.getCurrentUri()));
         }
     }
 
@@ -173,10 +202,38 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return uri != null && uri.length() > 0;
     }
 
-    /** 切换「等待」与「播放」两种形态 */
-    private void applyMode(boolean playing) {
-        panel.setVisibility(playing ? View.GONE : View.VISIBLE);
-        overlay.setVisibility(playing ? View.VISIBLE : View.GONE);
+    /**
+     * 当前该用哪种形态。
+     *
+     * <p>判据分两层：先看「有没有内容」（{@link #isPlaying()}），
+     * 再看「内容有没有画面」（{@code service.isAudioOnly()}）。
+     * 第二层的权威来源在服务里 —— 由元数据里的 {@code upnp:class} 与
+     * MediaPlayer 报的真实视频尺寸两个信号合并得出，界面不自己猜。
+     */
+    private int currentMode() {
+        if (!isPlaying()) {
+            return MODE_IDLE;
+        }
+        return service.isAudioOnly() ? MODE_AUDIO : MODE_VIDEO;
+    }
+
+    /** 形态真的变了才动 View —— 每 1.5 秒重设一次 visibility 会触发无谓的重新布局 */
+    private void applyModeIfChanged(int mode) {
+        if (mode == lastMode) {
+            return;
+        }
+        lastMode = mode;
+        applyMode(mode);
+    }
+
+    /** 切换三种形态 */
+    private void applyMode(int mode) {
+        boolean idle = (mode == MODE_IDLE);
+        panel.setVisibility(idle ? View.VISIBLE : View.GONE);
+        // 音乐层与画面层互斥。两者同时可见时，不透明的那层会盖住另一层，
+        // 表面看"正常"，但底下还在渲染 —— 0.6GB 的盒子上不该浪费这份开销。
+        music.setVisibility(mode == MODE_AUDIO ? View.VISIBLE : View.GONE);
+        overlay.setVisibility(idle ? View.GONE : View.VISIBLE);
 
         String uri = service == null ? null : service.getCurrentUri();
         boolean hasSource = uri != null && uri.length() > 0;
@@ -186,7 +243,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (hasSource) {
             infoSource.setText(uri);
         }
-        if (playing) {
+        if (!idle) {
             bindSurfaceIfReady();
         }
     }

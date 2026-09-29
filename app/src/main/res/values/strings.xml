@@ -29,4 +29,11 @@
     <string name="toast_restarted">服务已重启</string>
     <string name="notify_title">聚屏运行中</string>
     <string name="notify_text">等待投屏 · 点击打开界面</string>
+
+    <!-- 音乐投屏。
+         纯音频流在 SurfaceView 上什么都没有，电视就是一片黑 —— 声音明明在放，
+         看着却像投屏坏了。所以纯音频时必须换成音乐形态，把这件事说清楚。 -->
+    <string name="music_title">音乐投屏</string>
+    <string name="music_live">正在播放</string>
+    <string name="music_hint">声音正在播放 · 这个片源没有画面</string>
 </resources>

@@ -1,9 +1,12 @@
+import com.juping.cast.dlna.EventDispatcher;
 import com.juping.cast.dlna.SsdpResponder;
 import com.juping.cast.dlna.UpnpHttpServer;
 
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
  * 协议测试用的服务端。
@@ -33,6 +36,20 @@ public class ProtocolTestServer {
     private static volatile String transportState = "NO_MEDIA_PRESENT";
     private static volatile String currentUri = "";
     private static volatile int volume = 42;
+
+    /**
+     * 业务回调里要能触发事件推送（和真实服务一样：状态一变就 notifyEvent）。
+     * 服务对象本身在 handler 之后才构造出来，所以用个静态引用兜一下。
+     */
+    private static volatile UpnpHttpServer SERVER;
+
+    /** 状态变了就推事件 —— 真实服务里是 DlnaRendererService#notifyEvent，语义一致。 */
+    private static void push(String service) {
+        UpnpHttpServer s = SERVER;
+        if (s != null) {
+            s.notifyEvent(service);
+        }
+    }
 
     public static void main(String[] args) throws Exception {
         final int port = args.length > 0 ? Integer.parseInt(args[0]) : 49152;
@@ -65,18 +82,32 @@ public class ProtocolTestServer {
                 // 和真实服务保持一致：收到 URI 就记下来，GetMediaInfo 要回读它
                 currentUri = uri == null ? "" : uri;
                 transportState = "TRANSITIONING";
+                push("AVTransport");
             }
 
             @Override
             public void onPlay() {
                 rec("Play");
+                // 忠实模拟真实服务：没有媒体时 MediaPlayerController.resume() 是空操作
+                // （stop() 已把 currentUrl 清成 null），状态不会变成 PLAYING。
+                // 不模拟这一点，靶机就能被驱动到真机到不了的状态 —— 后面的
+                // dlna-probe 会据此报出一条根本不存在的「不一致」，把人引去查假 bug。
+                if (currentUri.length() == 0) {
+                    return;
+                }
                 transportState = "PLAYING";
+                push("AVTransport");
             }
 
             @Override
             public void onPause() {
                 rec("Pause");
+                // 同理：pause() 只在真的在播时才生效
+                if (!"PLAYING".equals(transportState)) {
+                    return;
+                }
                 transportState = "PAUSED_PLAYBACK";
+                push("AVTransport");
             }
 
             @Override
@@ -84,6 +115,7 @@ public class ProtocolTestServer {
                 rec("Stop");
                 currentUri = "";
                 transportState = "STOPPED";
+                push("AVTransport");
             }
 
             @Override
@@ -115,6 +147,7 @@ public class ProtocolTestServer {
             public void onSetVolume(int volume0to100) {
                 volume = volume0to100;
                 rec("SetVolume", String.valueOf(volume0to100));
+                push("RenderingControl");
             }
 
             @Override
@@ -123,7 +156,36 @@ public class ProtocolTestServer {
             }
         };
 
-        UpnpHttpServer server = new UpnpHttpServer(port, UUID, "聚屏-TESTBOX", handler);
+        // 事件源：和真实服务一样，如实汇报当前状态。
+        // 驱动会订阅之后改状态，再核对收到的 NOTIFY 里字段对不对。
+        EventDispatcher.EventSource source = new EventDispatcher.EventSource() {
+            @Override
+            public Map<String, String> eventedVars(String service) {
+                Map<String, String> vars = new HashMap<String, String>();
+                if ("AVTransport".equals(service)) {
+                    vars.put("TransportState", transportState);
+                    vars.put("TransportStatus", "OK");
+                    vars.put("CurrentTrackURI", currentUri);
+                    vars.put("CurrentTrackDuration", UpnpHttpServer.formatTime(FAKE_DURATION_MS));
+                    return vars;
+                }
+                if ("RenderingControl".equals(service)) {
+                    vars.put("Volume", String.valueOf(volume));
+                    vars.put("Mute", "0");
+                    return vars;
+                }
+                if ("ConnectionManager".equals(service)) {
+                    vars.put("SourceProtocolInfo", "");
+                    vars.put("SinkProtocolInfo", UpnpHttpServer.SINK_PROTOCOL_INFO);
+                    vars.put("CurrentConnectionIDs", "0");
+                    return vars;
+                }
+                return vars;
+            }
+        };
+
+        UpnpHttpServer server = new UpnpHttpServer(port, UUID, "聚屏-TESTBOX", handler, source);
+        SERVER = server;
         server.start();
 
         // LOCATION 必须指向真实可达的设备描述地址 —— 驱动会顺着它去抓 device.xml，

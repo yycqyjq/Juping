@@ -16,6 +16,8 @@ import os
 import re
 import socket
 import sys
+import threading
+import time
 import xml.etree.ElementTree as ET
 
 HOST = '127.0.0.1'
@@ -655,9 +657,374 @@ if dev is not None:
             check('controlURL 可达：%s' % name, '404' not in c_line, '%s → %s' % (ctrl, c_line))
 
 
+# ══════════════════════════════════════════════════════════════ 10. GENA 事件
+
+print('\n── 10. GENA 事件订阅与推送 ──')
+
+
+class FakeCallback:
+    """假的控制点回调服务器：收 NOTIFY，回 200，把事件记下来。
+
+    为什么必须真的起一个 socket：GENA 的坑几乎全在「发得出去吗」这一侧 ——
+    NOTIFY 是个 HttpURLConnection 不允许自定义的 HTTP 方法，SEQ 要在真的发出
+    事件时才递增，回调地址可能带尖括号。用假的发送器测，这些一个都测不到。
+    """
+
+    def __init__(self):
+        self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(('127.0.0.1', 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        self.events = []
+        self.lock = threading.Lock()
+        self._stop = False
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def url(self):
+        return 'http://127.0.0.1:%d/notify' % self.port
+
+    def _serve(self):
+        while not self._stop:
+            try:
+                self.sock.settimeout(0.2)
+                conn, _ = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _handle(self, conn):
+        try:
+            conn.settimeout(5)
+            data = b''
+            while b'\r\n\r\n' not in data:
+                b = conn.recv(65536)
+                if not b:
+                    return
+                data += b
+            head, _, rest = data.partition(b'\r\n\r\n')
+            lines = head.decode('iso-8859-1').split('\r\n')
+            hdrs = {}
+            for hl in lines[1:]:
+                if ':' in hl:
+                    k, _, v = hl.partition(':')
+                    hdrs[k.strip().lower()] = v.strip()
+            need = int(hdrs.get('content-length', '0') or 0)
+            while len(rest) < need:
+                b = conn.recv(65536)
+                if not b:
+                    break
+                rest += b
+            with self.lock:
+                self.events.append({'line': lines[0], 'headers': hdrs, 'body': rest[:need]})
+            conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n')
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def count(self):
+        with self.lock:
+            return len(self.events)
+
+    def snapshot(self):
+        with self.lock:
+            return list(self.events)
+
+    def wait(self, n, timeout=6.0):
+        """等到至少收到 n 条事件（超时就返回现有的）"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.count() >= n:
+                break
+            time.sleep(0.02)
+        return self.snapshot()
+
+    def close(self):
+        self._stop = True
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+def drain(cb, already, timeout=6.0):
+    """等新事件，只返回第 already 条之后的那些"""
+    return cb.wait(already + 1, timeout)[already:]
+
+
+def scpd_evented(body_bytes):
+    """SCPD 里所有 sendEvents="yes" 的变量名"""
+    out = set()
+    try:
+        root = ET.fromstring(body_bytes.decode('utf-8'))
+    except Exception:
+        return out
+    for sv in root.iter():
+        if sv.tag.endswith('stateVariable') or sv.tag == 'stateVariable':
+            if (sv.get('sendEvents') or '').lower() == 'yes':
+                for ch in sv:
+                    if ch.tag.endswith('name') or ch.tag == 'name':
+                        out.add(ch.text or '')
+    return out
+
+
+def propmap(body_bytes):
+    """把事件体解析成 {变量名: 值}。
+
+    用真 XML 解析器而不是字符串查找 —— 值里的 & 没转义时这里会直接抛异常，
+    正是我们想抓的（转义错了控制点也是整条解析失败，不是"这一项读不到"）。
+    """
+    root = ET.fromstring(body_bytes.decode('utf-8'))
+    out = {}
+    for prop in root.iter():
+        if prop.tag.endswith('property') or prop.tag == 'property':
+            for ch in prop:
+                out[ch.tag.split('}')[-1]] = ch.text or ''
+    return out
+
+
+# --- 10.1 SCPD 必须先声明"哪些变量可事件化" ---
+# 没有这一节，控制点订阅到的是空事件集 —— 它不会报错，只是永远等不到东西。
+st, _, scpd_body = raw_request('GET', '/upnp/RenderingControl.xml')
+rcs_evented = scpd_evented(scpd_body)
+check('RenderingControl SCPD 声明 Volume 可事件化', 'Volume' in rcs_evented,
+      '实际: %s' % (sorted(rcs_evented) or '无'))
+
+st, _, scpd_body = raw_request('GET', '/upnp/AVTransport.xml')
+avt_evented = scpd_evented(scpd_body)
+for want in ('TransportState', 'TransportStatus', 'CurrentTrackURI', 'CurrentTrackDuration'):
+    check('AVTransport SCPD 声明 %s 可事件化' % want, want in avt_evented,
+          '实际: %s' % (sorted(avt_evented) or '无'))
+
+# --- 10.2 新订阅 ---
+cb_avt = FakeCallback()
+st, hd, _ = raw_request('SUBSCRIBE', '/upnp/event/AVTransport', {
+    'CALLBACK': '<%s>' % cb_avt.url(),
+    'NT': 'upnp:event',
+    'TIMEOUT': 'Second-1800',
+})
+check('SUBSCRIBE 新订阅回 200', st.startswith('HTTP/1.1 200'), st)
+sid_avt = hd.get('sid', '')
+check('响应带 SID 且以 uuid: 开头', sid_avt.startswith('uuid:'), sid_avt or '(缺失)')
+check('响应回 TIMEOUT', hd.get('timeout', '').startswith('Second-'),
+      hd.get('timeout', '(缺失)'))
+
+# --- 10.3 订阅后必须立刻收到初始事件（SEQ 0）---
+# 规范（UDA 1.0 §4.3）硬要求。控制点不会主动来问，它只会等。
+evs = cb_avt.wait(1, 6.0)
+check('订阅后收到初始事件', len(evs) >= 1, '收到 %d 条' % len(evs))
+if evs:
+    e0 = evs[0]
+    check('初始事件是 NOTIFY 方法', e0['line'].startswith('NOTIFY'), e0['line'])
+    check('初始事件带 NT: upnp:event', e0['headers'].get('nt') == 'upnp:event',
+          e0['headers'].get('nt', '(缺失)'))
+    check('初始事件带 NTS: upnp:propchange',
+          e0['headers'].get('nts') == 'upnp:propchange',
+          e0['headers'].get('nts', '(缺失)'))
+    check('初始事件的 SID 与订阅响应一致', e0['headers'].get('sid') == sid_avt,
+          '事件=%s 响应=%s' % (e0['headers'].get('sid'), sid_avt))
+    check('初始事件 SEQ 从 0 开始', e0['headers'].get('seq') == '0',
+          e0['headers'].get('seq', '(缺失)'))
+    check('初始事件 Content-Type 是 xml',
+          'xml' in e0['headers'].get('content-type', ''),
+          e0['headers'].get('content-type', '(缺失)'))
+    try:
+        m0 = propmap(e0['body'])
+        check('初始事件含 TransportState', 'TransportState' in m0, str(sorted(m0)))
+        check('初始事件含 CurrentTrackDuration',
+              'CurrentTrackDuration' in m0, str(sorted(m0)))
+        # 只报 SCPD 里声明过的变量：多报无益，少报会让控制点一直以为它是空的
+        extra = set(m0) - avt_evented
+        check('初始事件没有多报未声明的变量', not extra, '多报: %s' % sorted(extra))
+    except Exception as ex:
+        check('初始事件体是合法 XML', False, str(ex))
+
+# --- 10.4 状态变化必须推出去，且 SEQ 递增 ---
+n = cb_avt.count()
+# URL 里带 & —— 转义错了整条事件体就是非法 XML
+soap_post('SetAVTransportURI', SVC_AVT,
+          '<CurrentURI>http://127.0.0.1:9/gena.mp4?token=a&amp;expire=1</CurrentURI>'
+          '<CurrentURIMetaData></CurrentURIMetaData>')
+evs = drain(cb_avt, n)
+check('SetAVTransportURI 后收到事件', len(evs) >= 1, '收到 %d 条' % len(evs))
+if evs:
+    e = evs[-1]
+    check('第二个事件 SEQ 递增到 1', e['headers'].get('seq') == '1',
+          e['headers'].get('seq', '(缺失)'))
+    try:
+        m = propmap(e['body'])
+        check('事件里的 CurrentTrackURI 是刚推的地址（& 已转义）',
+              m.get('CurrentTrackURI') == 'http://127.0.0.1:9/gena.mp4?token=a&expire=1',
+              repr(m.get('CurrentTrackURI')))
+        check('事件里的 TransportState 是 TRANSITIONING',
+              m.get('TransportState') == 'TRANSITIONING', repr(m.get('TransportState')))
+    except Exception as ex:
+        check('带 & 的 URI 事件体仍是合法 XML', False, str(ex))
+
+n = cb_avt.count()
+soap_post('Play', SVC_AVT, '<Speed>1</Speed>')
+evs = drain(cb_avt, n)
+check('Play 后收到事件', len(evs) >= 1, '收到 %d 条' % len(evs))
+if evs:
+    try:
+        m = propmap(evs[-1]['body'])
+        check('事件里的 TransportState 变成 PLAYING',
+              m.get('TransportState') == 'PLAYING', repr(m.get('TransportState')))
+    except Exception as ex:
+        check('Play 事件体是合法 XML', False, str(ex))
+
+n = cb_avt.count()
+soap_post('Stop', SVC_AVT, '')
+evs = drain(cb_avt, n)
+check('Stop 后收到事件', len(evs) >= 1, '收到 %d 条' % len(evs))
+if evs:
+    try:
+        m = propmap(evs[-1]['body'])
+        check('Stop 后事件里 CurrentTrackURI 清空',
+              m.get('CurrentTrackURI') == '', repr(m.get('CurrentTrackURI')))
+        check('Stop 后事件里 TransportState 是 STOPPED',
+              m.get('TransportState') == 'STOPPED', repr(m.get('TransportState')))
+    except Exception as ex:
+        check('Stop 事件体是合法 XML', False, str(ex))
+
+# --- 10.5 续订 ---
+st, hd2, _ = raw_request('SUBSCRIBE', '/upnp/event/AVTransport',
+                         {'SID': sid_avt, 'TIMEOUT': 'Second-600'})
+check('续订回 200', st.startswith('HTTP/1.1 200'), st)
+check('续订回同一个 SID', hd2.get('sid') == sid_avt,
+      '收到=%s 原=%s' % (hd2.get('sid'), sid_avt))
+check('续订回的是新申请的 TIMEOUT', hd2.get('timeout') == 'Second-600',
+      hd2.get('timeout', '(缺失)'))
+
+# --- 10.6 非法订阅必须被拒（412），不能默默给个 SID ---
+st, _, _ = raw_request('SUBSCRIBE', '/upnp/event/AVTransport', {
+    'CALLBACK': '<%s>' % cb_avt.url(), 'NT': 'upnp:event', 'SID': sid_avt})
+check('同时带 CALLBACK 与 SID 回 412', '412' in st, st)
+
+st, _, _ = raw_request('SUBSCRIBE', '/upnp/event/AVTransport', {'NT': 'upnp:event'})
+check('两者都不带回 412', '412' in st, st)
+
+st, _, _ = raw_request('SUBSCRIBE', '/upnp/event/AVTransport',
+                       {'SID': 'uuid:11111111-0000-0000-0000-000000000000-99',
+                        'TIMEOUT': 'Second-600'})
+check('续订未知 SID 回 412', '412' in st, st)
+
+st, _, _ = raw_request('SUBSCRIBE', '/upnp/event/AVTransport', {
+    'CALLBACK': '<%s>' % cb_avt.url(), 'NT': 'upnp:device'})
+check('NT 不是 upnp:event 回 412', '412' in st, st)
+
+st, _, _ = raw_request('SUBSCRIBE', '/upnp/event/AVTransport',
+                       {'CALLBACK': 'no-brackets-here', 'NT': 'upnp:event'})
+check('CALLBACK 里没有合法地址回 412', '412' in st, st)
+
+# 未知服务名：给了 SID 也收不到事件，不如当场 404
+st, _, _ = raw_request('SUBSCRIBE', '/upnp/event/NoSuchService',
+                       {'CALLBACK': '<%s>' % cb_avt.url(), 'NT': 'upnp:event'})
+check('订阅未知服务回 404', '404' in st, st)
+
+# --- 10.7 RenderingControl：音量事件 ---
+cb_rcs = FakeCallback()
+st, hd3, _ = raw_request('SUBSCRIBE', '/upnp/event/RenderingControl', {
+    'CALLBACK': '<%s>' % cb_rcs.url(), 'NT': 'upnp:event', 'TIMEOUT': 'Second-1800'})
+check('RenderingControl 订阅回 200', st.startswith('HTTP/1.1 200'), st)
+sid_rcs = hd3.get('sid', '')
+evs = cb_rcs.wait(1, 6.0)
+check('RenderingControl 订阅后收到初始事件', len(evs) >= 1, '收到 %d 条' % len(evs))
+if evs:
+    try:
+        m = propmap(evs[0]['body'])
+        check('音量初始事件含 Volume 且是真值 42', m.get('Volume') == '42',
+              repr(m.get('Volume')))
+    except Exception as ex:
+        check('音量初始事件体是合法 XML', False, str(ex))
+
+n = cb_rcs.count()
+soap_post('SetVolume', SVC_RCS,
+          '<Channel>Master</Channel><DesiredVolume>33</DesiredVolume>',
+          control='RenderingControl')
+evs = drain(cb_rcs, n)
+check('改音量后收到事件', len(evs) >= 1, '收到 %d 条' % len(evs))
+if evs:
+    try:
+        m = propmap(evs[-1]['body'])
+        check('音量事件报的是刚设的 33（不是硬编码的假值）',
+              m.get('Volume') == '33', repr(m.get('Volume')))
+    except Exception as ex:
+        check('音量事件体是合法 XML', False, str(ex))
+
+# --- 10.8 ConnectionManager 的事件体要如实给协议声明 ---
+cb_cms = FakeCallback()
+st, _, _ = raw_request('SUBSCRIBE', '/upnp/event/ConnectionManager', {
+    'CALLBACK': '<%s>' % cb_cms.url(), 'NT': 'upnp:event'})
+check('ConnectionManager 订阅回 200', st.startswith('HTTP/1.1 200'), st)
+evs = cb_cms.wait(1, 6.0)
+check('ConnectionManager 订阅后收到初始事件', len(evs) >= 1, '收到 %d 条' % len(evs))
+if evs:
+    try:
+        m = propmap(evs[0]['body'])
+        check('SinkProtocolInfo 事件值与 GetProtocolInfo 一致',
+              'video/mp4' in m.get('SinkProtocolInfo', ''),
+              repr(m.get('SinkProtocolInfo'))[:120])
+    except Exception as ex:
+        check('ConnectionManager 事件体是合法 XML', False, str(ex))
+
+# --- 10.9 退订之后不许再推 ---
+st, _, _ = raw_request('UNSUBSCRIBE', '/upnp/event/AVTransport', {'SID': sid_avt})
+check('UNSUBSCRIBE 回 200', st.startswith('HTTP/1.1 200'), st)
+
+st, _, _ = raw_request('UNSUBSCRIBE', '/upnp/event/AVTransport', {'SID': sid_avt})
+check('重复退订回 412', '412' in st, st)
+
+st, _, _ = raw_request('UNSUBSCRIBE', '/upnp/event/AVTransport',
+                       {'SID': 'uuid:11111111-0000-0000-0000-000000000000-98'})
+check('退订未知 SID 回 412', '412' in st, st)
+
+st, _, _ = raw_request('UNSUBSCRIBE', '/upnp/event/AVTransport', {})
+check('退订不带 SID 回 412', '412' in st, st)
+
+n = cb_avt.count()
+# 用 SetAVTransportURI 而不是 Play：Play 在"没有媒体"时是空操作（忠实模拟真机），
+# 状态不变就不会推事件，这条断言会变成"什么都没测到"的空过。
+soap_post('SetAVTransportURI', SVC_AVT,
+          '<CurrentURI>http://127.0.0.1:9/after-unsub.mp4</CurrentURI>'
+          '<CurrentURIMetaData></CurrentURIMetaData>')
+time.sleep(1.0)
+check('退订后不再收到事件', cb_avt.count() == n,
+      '退订后又收到 %d 条' % (cb_avt.count() - n))
+
+# 退订一个、留一个：剩下的那个必须照常收
+n_rcs = cb_rcs.count()
+soap_post('SetVolume', SVC_RCS,
+          '<Channel>Master</Channel><DesiredVolume>77</DesiredVolume>',
+          control='RenderingControl')
+evs = drain(cb_rcs, n_rcs)
+check('未退订的 RenderingControl 仍能收到事件', len(evs) >= 1,
+      '收到 %d 条' % len(evs))
+
+raw_request('UNSUBSCRIBE', '/upnp/event/RenderingControl', {'SID': sid_rcs})
+
+# 收尾：把靶机留在「正常投屏中」的状态。
+# 后面的 dlna-probe.py 与 verify-device-selftest.sh 都从这个状态出发做自洽性
+# 判断，留个半截状态会给它们制造假警报 —— 而假警报比没测更糟。
+soap_post('SetAVTransportURI', SVC_AVT,
+          '<CurrentURI>http://127.0.0.1:9/final.mp4</CurrentURI>'
+          '<CurrentURIMetaData></CurrentURIMetaData>')
+soap_post('Play', SVC_AVT, '<Speed>1</Speed>')
+
+cb_avt.close()
+cb_rcs.close()
+cb_cms.close()
+
+
 # ══════════════════════════════════════════════════════════════ 请求行变体
 
-print('\n── 10. 请求行变体（RFC 7230 §5.3 要求服务端都接受）──')
+print('\n── 11. 请求行变体（RFC 7230 §5.3 要求服务端都接受）──')
 
 
 def raw_line(request_line, timeout=10):

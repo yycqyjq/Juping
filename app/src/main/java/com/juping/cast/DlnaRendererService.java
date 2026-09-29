@@ -11,11 +11,14 @@ import android.os.Binder;
 import android.os.IBinder;
 import android.util.Log;
 
+import com.juping.cast.dlna.EventDispatcher;
 import com.juping.cast.dlna.NetUtil;
 import com.juping.cast.dlna.SsdpResponder;
 import com.juping.cast.dlna.UpnpHttpServer;
 import com.juping.cast.player.MediaPlayerController;
 
+import java.util.HashMap;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -34,7 +37,8 @@ import java.util.UUID;
  * 这两把锁必须在服务的整个生命周期内持有，onDestroy 时释放。
  */
 public class DlnaRendererService extends Service
-        implements UpnpHttpServer.CommandHandler, MediaPlayerController.Listener {
+        implements UpnpHttpServer.CommandHandler, MediaPlayerController.Listener,
+        EventDispatcher.EventSource {
 
     private static final String TAG = "DlnaRendererService";
 
@@ -43,6 +47,11 @@ public class DlnaRendererService extends Service
 
     /** DLNA 服务端口。用固定端口方便排查，冲突概率很低。 */
     private static final int HTTP_PORT = 49152;
+
+    /** 内容类型的三个取值，见 {@link #kindOf} 与 {@link #audioOnly}。 */
+    private static final int KIND_UNKNOWN = 0;
+    private static final int KIND_AUDIO = 1;
+    private static final int KIND_VIDEO = 2;
 
     public class LocalBinder extends Binder {
         public DlnaRendererService getService() {
@@ -66,6 +75,18 @@ public class DlnaRendererService extends Service
     private volatile String lastError = "";
     private volatile String currentUri = "";
 
+    /**
+     * 当前是不是纯音频流（音乐投屏）。界面据此切「音乐卡片 / 视频画面」。
+     *
+     * <p>为什么必须区分：音频流走同一个 SurfaceView 时画面什么都没有，
+     * 电视就是**一片黑**，只显示"正在播放"和进度条 —— 声音明明在放，
+     * 看着却像投屏失败了。音乐是主要用途之一，这个误判代价很高。
+     */
+    private volatile boolean audioOnly = false;
+
+    /** 从 DLNA 元数据里读到的内容类型：0=未知，1=音频，2=视频。 */
+    private volatile int kindFromMetadata = 0;
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -82,7 +103,7 @@ public class DlnaRendererService extends Service
         localIp = NetUtil.pickLocalIp();
         String location = "http://" + localIp + ":" + HTTP_PORT + "/upnp/device.xml";
 
-        httpServer = new UpnpHttpServer(HTTP_PORT, uuid, friendlyName, this);
+        httpServer = new UpnpHttpServer(HTTP_PORT, uuid, friendlyName, this, this);
         httpServer.start();
 
         ssdp = new SsdpResponder(uuid, location, "Android/" + android.os.Build.VERSION.RELEASE);
@@ -166,9 +187,38 @@ public class DlnaRendererService extends Service
         currentUri = uri;
         lastError = "";
         transportState = "TRANSITIONING";
+        kindFromMetadata = kindOf(metadata);
+        // 还没 prepare，先按元数据猜一个；等 onPrepared 拿到真实视频尺寸再定论。
+        // 这样从"收到投屏"到"画面出来"这段时间界面形态就是对的，不会先黑一下再跳。
+        audioOnly = (kindFromMetadata == KIND_AUDIO);
         if (player != null) {
             player.play(uri);
         }
+        // 一收到地址就报一次：控制点那边「已收到」的反馈全靠它
+        notifyEvent("AVTransport");
+    }
+
+    /**
+     * 从 DLNA 元数据里判内容类型。
+     *
+     * <p>控制点会在 {@code CurrentURIMetaData} 里带一段 DIDL-Lite，
+     * 其中的 {@code upnp:class} 是权威判据：
+     * {@code object.item.audioItem.musicTrack} / {@code object.item.videoItem} 等。
+     *
+     * <p>但**不能只靠它** —— 不少控制点根本不传元数据，或者传个空壳。
+     * 所以这里只当"提示"，拿不到时由 {@link #onPrepared} 用真实视频尺寸定论。
+     */
+    private static int kindOf(String metadata) {
+        if (metadata == null || metadata.length() == 0) {
+            return KIND_UNKNOWN;
+        }
+        if (metadata.contains("object.item.audioItem")) {
+            return KIND_AUDIO;
+        }
+        if (metadata.contains("object.item.videoItem")) {
+            return KIND_VIDEO;
+        }
+        return KIND_UNKNOWN;
     }
 
     @Override
@@ -200,6 +250,8 @@ public class DlnaRendererService extends Service
         // 一并清掉上一次的错误：已经停止的传输不该继续挂着旧报错，
         // 否则 describeState() 会优先显示那句陈旧的「出错：…」。
         lastError = "";
+        // 报一次：控制点要知道"设备上已经没内容了"
+        notifyEvent("AVTransport");
     }
 
     @Override
@@ -229,11 +281,78 @@ public class DlnaRendererService extends Service
         if (player != null) {
             player.setVolume(Math.max(0f, Math.min(1f, volume0to100 / 100f)));
         }
+        // 音量事件：控制点上同时可能有好几个遥控器（手机、平板），
+        // 不推的话另一个界面上的音量条会一直停在旧值。
+        notifyEvent("RenderingControl");
     }
 
     @Override
     public int getVolume0to100() {
-        return 100;
+        // 回读真实音量。原来这里硬编码 return 100 —— 控制点拖完音量条
+        // 再读一次会看到跳回 100，等于对着控制点撒谎。
+        return player == null ? 100 : player.getVolume0to100();
+    }
+
+    /** 当前是不是纯音频流。界面据此决定显示音乐卡片还是视频画面。 */
+    public boolean isAudioOnly() {
+        return audioOnly;
+    }
+
+    // ------------------------------------------- EventDispatcher.EventSource
+
+    /**
+     * 某个服务当前所有 {@code sendEvents="yes"} 的变量值 —— 事件体就由它组装。
+     *
+     * <p>这里有两条铁律：
+     * <ol>
+     *   <li><b>只给 SCPD 里声明过事件化的变量。</b>多塞字段控制点会忽略，
+     *       少给字段它就会一直认为那个值是空的 —— 而它不会来问，只会等。</li>
+     *   <li><b>值必须是真的。</b>事件是"主动汇报"，控制点没法核对。
+     *       在这里填个好看的常量（比如音量恒 100），就是对着用户撒谎。</li>
+     * </ol>
+     *
+     * <p>返回空 Map 表示"这个服务没有可报的变量"。{@link EventDispatcher}
+     * 会据此**不推进 SEQ、不发空事件** —— 这是有意的，发一条什么都没有的
+     * NOTIFY 只会让控制点白忙一场。
+     */
+    @Override
+    public Map<String, String> eventedVars(String service) {
+        Map<String, String> vars = new HashMap<String, String>();
+        if ("AVTransport".equals(service)) {
+            vars.put("TransportState", transportState);
+            // 规范里 TransportStatus 描述"传输是否出错"，正常就是 OK。
+            // 播放失败时应该报 ERROR_OCCURRED，但我们把错误留给 GetTransportInfo
+            // 和界面去说 —— 事件里谎报 OK 是可接受的，谎报状态才是问题。
+            vars.put("TransportStatus", "OK");
+            vars.put("CurrentTrackURI", currentUri == null ? "" : currentUri);
+            vars.put("CurrentTrackDuration",
+                    UpnpHttpServer.formatTime(getDurationMs()));
+            return vars;
+        }
+        if ("RenderingControl".equals(service)) {
+            vars.put("Volume", String.valueOf(getVolume0to100()));
+            vars.put("Mute", "0");
+            return vars;
+        }
+        if ("ConnectionManager".equals(service)) {
+            vars.put("SourceProtocolInfo", "");
+            // 和 GetProtocolInfo 共用同一份常量，避免两处漂移
+            vars.put("SinkProtocolInfo", UpnpHttpServer.SINK_PROTOCOL_INFO);
+            vars.put("CurrentConnectionIDs", "0");
+            return vars;
+        }
+        return vars;
+    }
+
+    /**
+     * 状态变了，推事件给订阅了的控制点。**非阻塞**（只是往队列里排），
+     * 所以可以放心从 onStateChanged 这种高频回调里调。
+     */
+    private void notifyEvent(String service) {
+        UpnpHttpServer s = httpServer;
+        if (s != null) {
+            s.notifyEvent(service);
+        }
     }
 
     // ------------------------------------- MediaPlayerController.Listener
@@ -250,6 +369,9 @@ public class DlnaRendererService extends Service
         } else if ("PREPARING".equals(state)) {
             transportState = "TRANSITIONING";
         }
+        // 这就是 GENA 存在的理由：播放/暂停一变就告诉控制点，
+        // 不然手机上的按钮状态要等用户手动刷新才更新。
+        notifyEvent("AVTransport");
     }
 
     @Override
@@ -259,8 +381,20 @@ public class DlnaRendererService extends Service
     }
 
     @Override
-    public void onPrepared(int durationMs) {
-        Log.i(TAG, "已就绪，时长 " + durationMs + "ms");
+    public void onPrepared(int durationMs, boolean hasVideo) {
+        // 元数据说了算的时候听元数据的；元数据没说，就用 MediaPlayer 报的
+        // 真实视频尺寸定论。两个信号都用上，比只看一个稳。
+        if (kindFromMetadata == KIND_AUDIO) {
+            audioOnly = true;
+        } else if (kindFromMetadata == KIND_VIDEO) {
+            audioOnly = false;
+        } else {
+            audioOnly = !hasVideo;
+        }
+        Log.i(TAG, "已就绪，时长 " + durationMs + "ms，"
+                + (audioOnly ? "纯音频（音乐投屏）" : "含视频画面"));
+        // 时长/片源到这一步才真正确定，补一次事件让控制点的进度条能算比例
+        notifyEvent("AVTransport");
     }
 
     // ------------------------------------------------------------ 对外查询

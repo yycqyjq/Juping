@@ -48,7 +48,14 @@ public class MediaPlayerController {
 
         void onError(String message);
 
-        void onPrepared(int durationMs);
+        /**
+         * 已就绪。
+         *
+         * <p>{@code hasVideo == false} 表示这是**纯音频流**（音乐投屏）。
+         * 界面必须据此切到音乐形态 —— 否则 SurfaceView 上什么都没有，
+         * 电视就是一片黑，用户会以为投屏坏了（声音其实正常在放）。
+         */
+        void onPrepared(int durationMs, boolean hasVideo);
     }
 
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -64,6 +71,25 @@ public class MediaPlayerController {
     private int stallCount;
     private long lastPosition = -1L;
     private long lastProgressAt;
+
+    /**
+     * 当前音量，0.0 ~ 1.0。
+     *
+     * <p>**必须自己记**：{@code MediaPlayer.getVolume()} 是 API 23 才有的方法，
+     * 在 API 15 的盒子上调用就是 NoSuchMethodError。而这个字段要回给
+     * RenderingControl 的 GetVolume —— 原来那里硬编码 return 100，
+     * 控制点拖完音量条回读会看到跳回 100，等于谎报。
+     */
+    private float volume = 1.0f;
+
+    /**
+     * 当前流有没有视频轨。onPrepared 时用 {@code getVideoWidth()} 判定。
+     *
+     * <p>用 getVideoWidth 而不是 {@code getTrackInfo()}：后者是 API 16 才有的，
+     * 而 minSdk 是 14。{@code getVideoWidth()} 从 API 1 就在，
+     * 纯音频时返回 0 —— 这是这个版本上唯一可靠的判据。
+     */
+    private boolean hasVideo;
 
     /**
      * 已排期但还没执行的那次重连。
@@ -119,6 +145,9 @@ public class MediaPlayerController {
         try {
             player = new MediaPlayer();
             player.setAudioStreamType(AudioManager.STREAM_MUSIC);
+            // 把记住的音量应用到新的 MediaPlayer 实例上。
+            // 重连会重建实例，不重放这一句的话，一次断流就会把音量悄悄拉回满格。
+            player.setVolume(volume, volume);
             if (surface != null) {
                 player.setSurface(surface);
             }
@@ -136,10 +165,11 @@ public class MediaPlayerController {
                     retryCount = 0;
                     lastPosition = -1L;
                     lastProgressAt = System.currentTimeMillis();
+                    hasVideo = detectVideo(mp);
                     mp.start();
                     notifyState("PLAYING");
                     if (listener != null) {
-                        listener.onPrepared(mp.getDuration());
+                        listener.onPrepared(mp.getDuration(), hasVideo);
                     }
                     startWatchdog();
                 }
@@ -347,12 +377,45 @@ public class MediaPlayerController {
     }
 
     public void setVolume(float volume) {
+        // 先记下来再下发：重连会重建 MediaPlayer 实例，不记的话音量会丢。
+        this.volume = Math.max(0f, Math.min(1f, volume));
         if (player != null) {
             try {
-                player.setVolume(volume, volume);
+                player.setVolume(this.volume, this.volume);
             } catch (Exception e) {
                 Log.w(TAG, "setVolume 失败", e);
             }
+        }
+    }
+
+    /** 当前音量，0 ~ 100。给 RenderingControl 的 GetVolume 回读用。 */
+    public int getVolume0to100() {
+        return Math.round(volume * 100f);
+    }
+
+    /**
+     * 当前流有没有视频轨。只在 onPrepared 之后有意义。
+     * 界面据此决定显示视频画面还是音乐卡片。
+     */
+    public boolean hasVideo() {
+        return hasVideo;
+    }
+
+    /**
+     * 判定这个流有没有视频轨。
+     *
+     * <p>{@code getVideoWidth()} 从 API 1 就在，纯音频返回 0 ——
+     * 这是这个版本上唯一可靠的判据（{@code getTrackInfo()} 要 API 16，不能用）。
+     *
+     * <p>异常时**按有视频处理**：宁可退回原来的黑屏，也不要对着一个视频
+     * 弹出音乐卡片 —— 后者更离谱，也更难解释。
+     */
+    private static boolean detectVideo(MediaPlayer mp) {
+        try {
+            return mp.getVideoWidth() > 0;
+        } catch (Exception e) {
+            Log.w(TAG, "getVideoWidth 失败，按有视频处理", e);
+            return true;
         }
     }
 

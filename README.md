@@ -33,12 +33,19 @@
    |-- 3. 取设备描述 XML ---->|  GET /upnp/device.xml
    |<-- 4. 描述 + 服务列表 ---|
    |                          |
-   |-- 5. SetAVTransportURI ->|  POST /upnp/control/AVTransport
+   |-- 5. SUBSCRIBE 订阅 ---->|  SUBSCRIBE /upnp/event/AVTransport
+   |<-- 6. SID + TIMEOUT -----|
+   |<-- 7. 初始事件 NOTIFY ---|  SEQ=0，含当前全部事件变量
+   |                          |
+   |-- 8. SetAVTransportURI ->|  POST /upnp/control/AVTransport
    |   （把视频 URL 交过来）   |       ↓
-   |<-- 6. 播放状态回报 ------|  MediaPlayer 直接播这个 URL
+   |<-- 9. 状态事件 NOTIFY ---|  MediaPlayer 直接播这个 URL
+   |                          |  （播放/暂停/换片一变就推一条，SEQ 递增）
 ```
 
 关键点：**手机推过来的是一个 URL，不是视频流本身**。所以盒子不需要解码手机的画面，只需要用系统自带的 `MediaPlayer` 硬解那个 URL —— 芯片是什么都无所谓，这就是「全兼容」的来源。
+
+第 5–7 步（GENA 事件订阅）和 9 是**双向**的：手机不只是发指令，它还要知道盒子上到底发生了什么。少了这一段，手机上的播放进度条和播放/暂停按钮就会一直停在旧状态 —— 用户按了暂停，手机上还显示在播。
 
 ---
 
@@ -49,16 +56,17 @@ Juping/
 ├── app/src/main/
 │   ├── AndroidManifest.xml          权限、组件、开机自启声明
 │   ├── java/com/juping/cast/
-│   │   ├── MainActivity.java        电视界面：等待投屏 / 播放中 双形态
+│   │   ├── MainActivity.java        电视界面：等待 / 视频 / 音乐 三形态
 │   │   ├── BootReceiver.java        开机自启
 │   │   ├── DlnaRendererService.java 前台服务心脏（DLNA + 播放器都挂这儿）
 │   │   ├── dlna/
 │   │   │   ├── NetUtil.java         网卡选择的唯一出处（SSDP 与 LOCATION 共用）
 │   │   │   ├── SsdpResponder.java   组播监听 + 设备回应
-│   │   │   └── UpnpHttpServer.java  HTTP 服务 + SOAP 控制解析
+│   │   │   ├── EventDispatcher.java GENA 事件订阅与 NOTIFY 推送（自带单线程池保 SEQ 有序）
+│   │   │   └── UpnpHttpServer.java  HTTP 服务 + SOAP 控制解析 + SUBSCRIBE 路由
 │   │   └── player/
 │   │       ├── PlaybackPolicy.java         重连策略：纯逻辑，零 Android 依赖
-│   │       └── MediaPlayerController.java  播放 + 看门狗 + 指数退避重连
+│   │       └── MediaPlayerController.java  播放 + 看门狗 + 指数退避重连 + 音量状态
 │   └── res/                         布局、配色、字符串、图标、banner
 └── tools/
     ├── build.sh              一键构建 + 出包前核验
@@ -72,7 +80,7 @@ Juping/
     ├── check_sources.py      无 JDK 环境下的源码结构检查
     ├── protocol-test/        DLNA 协议层端到端测试（桌面 JVM，不需要真机）
     │   ├── run.sh            编译 → 起服务 → 驱动 → 验证两个自检脚本
-    │   ├── drive.py          95 项一致性检查（原始 socket 精确控字节）
+    │   ├── drive.py          145 项一致性检查（原始 socket 精确控字节）
     │   ├── ProtocolTestServer.java  在桌面跑真实的 UpnpHttpServer + SsdpResponder
     │   ├── verify-device-selftest.sh  用假 adb 验 verify-on-device.sh 的管道
     │   └── android/util/Log.java    android.util.Log 的桌面替身
@@ -101,8 +109,8 @@ Juping/
 产物：
 
 ```
-dist/juping-0.1.0-release.apk   ← 装机用这个（47K，已签名）
-dist/juping-0.1.0-debug.apk     ← 排障用（74K，带 debuggable 标记）
+dist/juping-0.1.0-release.apk   ← 装机用这个（60K，已签名）
+dist/juping-0.1.0-debug.apk     ← 排障用（77K，带 debuggable 标记）
 ```
 
 `dist` 目标会在归集后**自动跑五道闸**，任何一道不过就报错退出 —— 免得把一个装不上的、投不进来的、断联后恢复不了的、或者带着签名密钥的包交出去：
@@ -206,6 +214,46 @@ adb install -r dist/juping-0.1.0-release.apk
 
 ---
 
+## 界面三态
+
+电视上只有三种形态，靠播放状态自动切换：
+
+| 形态 | 什么时候 | 显示什么 |
+|---|---|---|
+| **等待投屏** | 没有内容 | 引导卡片 + 设备信息（名字 / 地址 / 网络 / 状态） |
+| **视频播放** | 有内容，且含画面 | 全屏出画面，顶部一条半透明状态条 |
+| **音乐播放** | 有内容，但**纯音频** | 音符卡片：音符 + 「音乐投屏」+ 片源 + 进度 |
+
+### 为什么「音乐播放」必须单独做一层
+
+纯音频流走的是**同一个 `SurfaceView`**，上面什么都没有 —— 电视就是**一片黑**，
+只剩一条状态栏。声音明明在放，看着却像投屏坏了。音乐是主要用途之一，
+这个误判的代价很高，所以必须换成音符卡片。
+
+这里有两个不做就会前功尽弃的细节，都写进了源码级不变量：
+
+- **音乐层必须画在 `SurfaceView` 之后**。`FrameLayout` 里后画的在上面，
+  顺序反了就会被画面层盖住 —— 而画面层此时是全黑的，等于没做。
+- **音乐层的背景必须完全不透明**（`@color/bg`，alpha = `FF`）。
+  半透明或透明都会让底下那片黑透出来。
+
+三态用**一个整数**而不是两个布尔表示。两个布尔允许出现「既是音频又是视频」
+这种非法组合，而它一旦出现，界面会同时显示画面和音符卡片 —— 排查起来非常费劲。
+
+「是不是纯音频」这个判断的权威来源在服务里（`isAudioOnly()`），界面不自己猜：
+它由**两个信号合并**得出 —— 控制点传的 DIDL-Lite 里 `upnp:class` 是
+`object.item.audioItem` 还是 `object.item.videoItem`，以及 `MediaPlayer` 报的
+真实视频尺寸（`getVideoWidth()`）。
+
+> 为什么不用 `getTrackInfo()` 判断有没有视频轨：**那是 API 16 才有的**。
+> 而 `getVideoWidth()` 从 API 1 就在，纯音频返回 0 —— 这是 API 15 上唯一可靠的判据。
+>
+> 元数据只是「提示」，很多控制点根本不传它，所以两个信号都要用；
+> `getVideoWidth()` 抛异常时**按「有视频」处理**：宁可退回原来的黑屏，
+> 也不要对着一个视频弹出音乐卡片 —— 后者更离谱，也更难解释。
+
+---
+
 ## 兼容性红线
 
 代码按 android-33 编译，但**运行在 API 15**。以下都是「编译得过、真机上崩」的坑，已在 `app/build.gradle` 的 `lint` 块里显式关闭并注明理由：
@@ -217,7 +265,10 @@ adb install -r dist/juping-0.1.0-release.apk
 | `MediaCodec` | API 16 才有 —— 本项目全程不碰它 |
 | AndroidX 任何组件 | 普遍要求 minSdk 19+ → 直接编译不过 |
 
-### 四道独立的验证
+### 四道深度验证
+
+上面五道闸里，签名与密钥核查各管一件事、判据单一。这四道不一样：
+它们**各自独立实现、互为判据**，而且每一道都做过反向验证（能红才算测过）。
 
 光靠编译过是不够的 —— 对着新版 android.jar 编译，调用新 API 完全不会报错。
 
@@ -240,8 +291,8 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 当前结果：
 
 ```
-被引用的平台类 55 个 · 方法 178 个 · 字段 3 个
-结论：181 个平台引用全部命中，无 API 越界。
+被引用的平台类 63 个 · 方法 210 个 · 字段 3 个
+结论：213 个平台引用全部命中，无 API 越界。
 ```
 
 为什么要两道：lint 依赖内置数据库，而且本项目关掉了 8 项检查 ——
@@ -266,7 +317,7 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 ```
 
 ```
-协议一致性：95 / 95 通过
+协议一致性：145 / 145 通过
 ```
 
 覆盖两大故障场景 —— **「手机搜不到设备」和「投屏没反应」**：
@@ -279,7 +330,8 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 | 7 | 健壮性：未知路径 / 缺失头 / 畸形报文后服务是否还活着 |
 | **8** | **SSDP 发现**：`ssdp:all` 要回全 6 个搜索目标；每个 ST 必须原样回、USN 格式正确；无关搜索与 NOTIFY 不能应答 |
 | **9** | **发现链路闭环**：顺着 LOCATION 抓 device.xml → 校验 UDN/deviceType 与 SSDP 一致 → 逐个抓 SCPDURL → 每个 controlURL 可达 |
-| 10 | 请求行变体：绝对形式（`GET http://host/path`）、多余空格、带查询串 |
+| **10** | **GENA 事件订阅**：SCPD 必须声明哪些变量可事件化；订阅后必须立刻收到 SEQ 0 的初始事件；状态一变必须推、SEQ 必须递增；非法订阅（CALLBACK 与 SID 同给/同不给、NT 不对、SID 不认识、服务名不对）必须回 412/404；退订后不许再推 |
+| 11 | 请求行变体：绝对形式（`GET http://host/path`）、多余空格、带查询串 |
 
 > **这套测试累计抓出六个真 bug**，每一个都能让投屏在真机上失效，
 > 而真机上全都无从定位：
@@ -318,10 +370,38 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 > （`GET http://192.168.1.50:49152/upnp/device.xml HTTP/1.1`，RFC 7230 §5.3.2），
 > 而服务端必须接受。原来直接拿路径比较，绝对形式下返回 404 →
 > 手机「搜到了设备却投不了屏」。
+>
+> **事件侧（第 10 段）**
+> ⑦ **订阅了却永远收不到事件**。原实现的 `SUBSCRIBE` 是「回个 200 + SID 就完事」，
+>    从不推 `NOTIFY` —— 而且 `RenderingControl` 的 SCPD 里**一张 stateVariable
+>    表都没有**，控制点订阅到的是空事件集。对只发指令不回读的控制点没影响，
+>    对依赖事件同步的那些（BubbleUPnP、各种遥控类 App）等于坏了一半：
+>    手机上的播放进度条、播放/暂停按钮会一直停在旧状态。
+>    这里有两个必须写进注释的坑：**① `HttpURLConnection.setRequestMethod("NOTIFY")`
+>    会抛 `ProtocolException: Invalid HTTP method`** —— 它只认白名单里的方法，
+>    所以 NOTIFY 必须用原始 socket 手写请求行；**② 初始事件必须晚于 200 响应** ——
+>    控制点是拿响应里的 SID 认事件的，NOTIFY 早到会被当成未知 SID 直接丢掉
+>    （Cling 等协议栈就是这么干的）。为此把「注册订阅」和「推初始事件」拆成
+>    `subscribe()` / `fireInitial()` 两个方法，由 HTTP 层在 `out.flush()` **之后**调用后者。
+> ⑧ **音量回读恒为 100**。`GetVolume` 的实现就是 `return 100;` ——
+>    控制点拖完音量条再读一次，看到的是跳回 100。这不是「少个功能」，
+>    是**对着控制点撒谎**：它会把音量条重新画到 100%。
+>    根因是 `MediaPlayer.getVolume()` 是 API 23 才有的，代码里干脆没记这个值。
+>    修法是自己在 `MediaPlayerController` 里维护音量（**先记再下发**），
+>    并在重连重建播放器实例后**把音量重放一遍** —— 否则一次断流就把音量拉回满格。
+> ⑨ **测试靶机比真机宽容**（这条是测试自己的问题，但值得记）。靶机的 `onPlay()`
+>    无条件置 `PLAYING`，而真机上 `MediaPlayerController.stop()` 会把 `currentUrl`
+>    清成 null，之后再 `Play` 是**空操作**、不会进 `PLAYING`。于是靶机被驱动到了
+>    真机到不了的状态，下游自检脚本据此报出一条根本不存在的「不一致」。
+>    **测试替身比被测对象宽容，就会制造假故障** —— 已按真机语义收紧。
 
 > **这些断言做过反向验证**：把 `getCurrentUri()` 临时改成恒返回空串，
-> 测试从 95/95 掉到 91/95，失败项正好是那 4 条"有媒体时必须有地址"的断言。
-> 一个只会说"通过"的断言是没有价值的。
+> 测试从 95/95 掉到 91/95，失败项正好是那 4 条「有媒体时必须有地址」的断言。
+>
+> 事件那一段也证伪过：把 `fireInitial()` 改成空操作（也就是退回旧的
+> 「只应答不推送」），4 条断言立刻变红（`订阅后收到初始事件`、
+> `第二个事件 SEQ 递增到 1`、以及 RenderingControl / ConnectionManager 的初始事件）。
+> 一个只会说「通过」的断言是没有价值的。
 
 **自检脚本自己也要被测**
 
@@ -334,7 +414,7 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 
 ```
 ── 用同一靶机验证 tools/dlna-probe.py（控制点视角自检）──
-  控制点自检：32 / 32 通过
+  控制点自检：33 / 33 通过
 ```
 
 这条自查立刻抓到过一个**脚本自身的 bug**：它拿「状态 ≠ `NO_MEDIA_PRESENT`」
@@ -418,7 +498,8 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 挪回 `onPrepared`，`PlaybackPolicy` 本身没变，所以 **26 条断言依然全绿** ——
 熔断却整体失效了。
 
-所以 `run.sh` 里额外做了一层源码检查，把不变量钉在代码结构上：
+所以 `run.sh` 里额外做了一层源码检查，把不变量钉在代码结构上。
+它的判据取「够精确但不脆」：只认结构性事实，不认排版。
 
 ```
 [PASS] onPrepared 里不出现 stallCount（否则熔断失效）
@@ -428,6 +509,38 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 [PASS] pendingRetry 被持有并可取消
 [PASS] 块注释定界符配平（/* 与 */ 数量一致）
 ```
+
+后面几组是这一轮补的，守的都是**没法用网络断言测、又属于静默回归**的东西：
+
+```
+[PASS] SUBSCRIBE 走真订阅（调 events.subscribe）
+[PASS] UNSUBSCRIBE 走真退订（调 events.unsubscribe）
+[PASS] 请求头解析读到了 callback: / sid: / timeout:
+[PASS] 先 flush 响应、再推初始事件
+[PASS] shutdown() 里关掉了事件线程池
+[PASS] DlnaRendererService 实现了 EventSource
+[PASS] 事件里的 Volume 取自 getVolume0to100()
+[PASS] 音量回读不是硬编码常量
+[PASS] 音乐层排在 SurfaceView 之后（否则被画面盖住）
+[PASS] 音乐层背景完全不透明（挡住 SurfaceView 的黑）
+[PASS] 音乐层只在 MODE_AUDIO 时可见
+[PASS] 界面依据 service.isAudioOnly() 判形态
+```
+
+**为什么「初始事件必须晚于 200 响应」不进网络断言**：那要求比较两条不同 socket
+的到达时刻，而主线程读完响应与事件线程连上回调是**两个独立调度**，
+谁先谁后本质上是竞态的 —— 测出来会是「偶尔红」的假信号，比不测更糟。
+所以它只钉在源码上（比较 `out.flush()` 与 `events.fireInitial(` 的位置）。
+
+**为什么音乐模式那几条必须钉源码**：把音乐层的背景改成透明、或者把它挪到
+`SurfaceView` 前面，代码照样编译、照样运行、日志里一个字都不多 ——
+**只是电视又变回一片黑**。而「声音在放、画面全黑」恰恰是用户最容易
+误判成「投屏坏了」的现象，也是这一轮专门要修的东西。
+
+> 这几条也全部证伪过：把 `getVolume0to100()` 改回 `return 100;`、
+> 把初始事件挪到 `flush()` 之前、把音乐层背景改成
+> `@android:color/transparent` 并挪到 `SurfaceView` 之前、把
+> `music.setVisibility(...)` 改成恒 `VISIBLE` —— 每一条都精准变红。
 
 > 最后一条是踩出来的：一次编辑漏掉了类注释的 `*/`，整个类被注释吞掉，
 > 报错指向「第一个字段声明处」，而真实原因在几十行之前。
@@ -442,8 +555,8 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 - **AirPlay 未实现**。iOS 侧目前只能用支持 DLNA 的 App 投。要做 AirPlay 接收需要移植 UxPlay（C/C++，GPLv3），是独立的一大块工作。
 - **镜像（Miracast）不做**。老盒子 Wi-Fi Direct 驱动不稳，正是断联根因，不值得修。
 - **从未在真机上运行过**。已通过九项桌面核验（编译 / lint `NewApi` 零命中 /
-  API 引用 181 项全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
-  DLNA 协议 95 项通过 / 播放策略 26 项通过 / 控制点自检脚本 32 项通过 /
+  API 引用 213 项全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
+  DLNA 协议 145 项通过 / 播放策略 26 项通过 / 控制点自检脚本 33 项通过 /
   真机验收脚本管道自测 6 项通过），
   但真机上的组播收发、MediaPlayer 硬解、断联恢复都还没实测 ——
   `./tools/verify-on-device.sh` 已经就绪，插上盒子跑一条命令即可验。
@@ -452,7 +565,7 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 
 ## 真机验收
 
-前面四道闸全是**桌面端**跑的。它们能证明「代码自洽」，证明不了「盒子真的收得到投屏」。
+前面五道闸全是**桌面端**跑的。它们能证明「代码自洽」，证明不了「盒子真的收得到投屏」。
 真机上只有三件事必须真机验，而且都验不了于桌面：
 
 1. **SSDP 组播收不收得到** —— 受 `MulticastLock`、网卡选择、路由器 IGMP 影响

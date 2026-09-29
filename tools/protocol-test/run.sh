@@ -47,6 +47,7 @@ if ! "$JAVAC" -nowarn -encoding UTF-8 -d "$OUT/classes" \
         "$HERE/android/util/Log.java" \
         app/src/main/java/com/juping/cast/dlna/NetUtil.java \
         app/src/main/java/com/juping/cast/dlna/UpnpHttpServer.java \
+        app/src/main/java/com/juping/cast/dlna/EventDispatcher.java \
         app/src/main/java/com/juping/cast/dlna/SsdpResponder.java \
         "$HERE/ProtocolTestServer.java" 2>"$OUT/javac.err"; then
     echo "编译失败：" >&2

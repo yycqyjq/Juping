@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """生成聚屏的全部位图资源（纯标准库，不需要 Pillow / ImageMagick）。
 
-产出三样东西：
+产出四样东西：
   1. ic_launcher.png —— 应用图标（深色圆角底 + 白屏幕 + 绿播放三角）
   2. ic_notify.png   —— 通知栏小图标，**必须纯白剪影**
   3. ic_banner.png   —— Android TV 启动器横幅（320×180）
+  4. ic_music.png    —— 音乐投屏界面上的音符（纯音频时电视不能是一片黑）
 
 为什么通知图标要单独做一张纯白的：
   从 Android 5.0 起，系统会把通知小图标里所有非透明像素强制涂成白色。
@@ -191,11 +192,46 @@ def _banner_shade(x, y):
     return bg
 
 
+def _music_shade(x, y):
+    """音符：实心符头 + 符干 + 符尾，透明底。
+
+    为什么要画这个：纯音频投屏走的是同一个 SurfaceView，上面什么都没有 ——
+    电视就是**一片黑**，只留一条状态栏。声音明明在放，看着却像投屏失败。
+    音乐是主要用途之一，这个误判代价很高。
+
+    用几何函数画而不是塞位图，是为了跟其它资源一样由脚本生成：
+    想调形状改几个数字就行，不必去开图形编辑器。
+    """
+    ink = (PLAY[0], PLAY[1], PLAY[2], 255)
+
+    # 符头：椭圆
+    dx = (x - 0.335) / 0.225
+    dy = (y - 0.735) / 0.175
+    if dx * dx + dy * dy <= 1.0:
+        return ink
+
+    # 符干
+    if 0.505 <= x <= 0.605 and 0.10 <= y <= 0.76:
+        return ink
+
+    # 符尾：从符干顶端甩向右下、逐渐收细的一条带子
+    if 0.585 <= x <= 0.935:
+        u = (x - 0.585) / 0.35
+        y_outer = 0.10 + 0.40 * (u ** 1.8)
+        y_inner = y_outer - (0.20 * (1.0 - u) + 0.02)
+        if y_inner <= y <= y_outer:
+            return ink
+
+    return CLEAR
+
+
 # --------------------------------------------------------------- 输出清单
 
 LAUNCHER_DENSITIES = [('mdpi', 48), ('hdpi', 72), ('xhdpi', 96), ('xxhdpi', 144)]
 # 通知图标基准 24dp
 NOTIFY_DENSITIES = [('mdpi', 24), ('hdpi', 36), ('xhdpi', 48), ('xxhdpi', 72)]
+# 音符基准 96dp —— 界面里就是按 96dp 摆的
+MUSIC_DENSITIES = [('mdpi', 96), ('hdpi', 144), ('xhdpi', 192), ('xxhdpi', 288)]
 
 
 def _write(path, data):
@@ -225,6 +261,12 @@ def main():
     path = os.path.join(res, 'drawable-xhdpi', 'ic_banner.png')
     _write(path, _encode_png(_rasterize(bw, bh, _banner_shade), bw, bh))
     print("  xhdpi    %dx%d  %s" % (bw, bh, path))
+
+    print("=== 音乐投屏音符 ===")
+    for density, size in MUSIC_DENSITIES:
+        path = os.path.join(res, 'drawable-' + density, 'ic_music.png')
+        _write(path, _encode_png(_rasterize(size, size, _music_shade), size, size))
+        print("  %-8s %3dpx  %s" % (density, size, path))
 
     print("全部位图资源生成完成")
 
