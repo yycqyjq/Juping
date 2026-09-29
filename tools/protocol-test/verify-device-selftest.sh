@@ -36,13 +36,16 @@ ok()  { echo "  [PASS] $1"; }
 bad() { echo "  [FAIL] $1"; FAIL=1; }
 
 # ── 假 logcat ──
-# 「接收端已就绪」那一行是 verify-on-device.sh 唯一的地址来源，
-# 格式必须与 DlnaRendererService 里真正打印的一致。
+# verify-on-device.sh 现在等的是 **SsdpResponder 绑定成功**那一行，
+# 并从里面的 LOCATION= 抠出盒子地址 —— 因为设备描述地址由 SSDP 在
+# 绑上实际网卡之后才算出来，「接收端已就绪」那条早于绑定、没有地址。
+# 两行格式都必须与源码里真正打印的一致，否则这个自测就是在测一个假世界。
 cat > "$OUT/logcat.txt" <<EOF
 D/DlnaRendererService( 1234): 服务创建
 I/DlnaRendererService( 1234): MulticastLock 已获取
 I/DlnaRendererService( 1234): WifiLock 已获取
-I/DlnaRendererService( 1234): 接收端已就绪：名称=聚屏-MT5880 地址=http://127.0.0.1:$HTTP_PORT/upnp/device.xml
+I/DlnaRendererService( 1234): 接收端已就绪：名称=聚屏-MT5880 HTTP 端口=${HTTP_PORT}（设备描述地址等 SSDP 绑上网卡后确定）
+I/SsdpResponder( 1234): SSDP 已加入组播组 239.255.255.250:1900，网卡=eth0（候选 1 张），LOCATION=http://127.0.0.1:$HTTP_PORT/upnp/device.xml
 D/UpnpHttpServer( 1234): UPnP HTTP 服务已启动，端口 $HTTP_PORT
 EOF
 

@@ -213,10 +213,10 @@ public class ProtocolTestServer {
         SERVER = server;
         server.start();
 
-        // LOCATION 必须指向真实可达的设备描述地址 —— 驱动会顺着它去抓 device.xml，
-        // 这一步正是「搜到了却投不了屏」的典型断点所在。
-        String location = "http://127.0.0.1:" + port + "/upnp/device.xml";
-        SsdpResponder ssdp = new SsdpResponder(UUID, location, "Android/4.0.4", ssdpPort);
+        // 只把 HTTP 端口交给 SSDP —— LOCATION 由响应器在**绑上组播之后**
+        // 用实际绑定的那张网卡的 IPv4 拼出来（和真实服务完全一致）。
+        // 驱动会顺着它去抓 device.xml，这一步正是「搜到了却投不了屏」的典型断点。
+        SsdpResponder ssdp = new SsdpResponder(UUID, port, "Android/4.0.4", ssdpPort);
         ssdp.start();
 
         // 等两个服务真的起来，再告诉驱动可以开始了
@@ -228,8 +228,13 @@ public class ProtocolTestServer {
                 Thread.sleep(50);
             }
         }
-        // 给 SSDP 线程一点时间完成 bind + joinGroup
-        Thread.sleep(300);
+        // 给 SSDP 线程一点时间完成 bind + joinGroup。
+        // 它现在带重试，正常情况下第一次就成；这里多等一会儿是为了让
+        // 「第一次失败、第二次成功」这种平台差异不会把测试变成偶发红。
+        long ssdpDeadline = System.currentTimeMillis() + 5000;
+        while (System.currentTimeMillis() < ssdpDeadline && !ssdp.isBound()) {
+            Thread.sleep(50);
+        }
 
         // 驱动需要知道实际绑上的 SSDP 端口（传 0 时由系统分配）
         int actualSsdpPort = ssdp.getBoundPort();
@@ -239,7 +244,21 @@ public class ProtocolTestServer {
             System.exit(3);
         }
 
-        System.out.println("READY " + port + " " + actualSsdpPort + " " + location);
+        String location = ssdp.getLocation();
+        if (location == null || location.length() == 0) {
+            System.err.println("SSDP 绑上了但没算出 LOCATION");
+            System.err.flush();
+            System.exit(3);
+        }
+
+        // READY <http端口> <实际ssdp端口> <location> <绑定网卡> <绑定网卡的IPv4>
+        //
+        // 后两列是**新增**的，加在末尾是为了不破坏 run.sh 里按 $3 取 SSDP 端口的解析。
+        // 驱动靠它们核对 LOCATION 里的 IP 真的来自**实际绑定的那张网卡** ——
+        // 而不是另一张。这正是「组播从 eth0 收、却告诉手机去 wlan0 取描述」
+        // 那个「搜到了却投不了屏」的故障点。
+        System.out.println("READY " + port + " " + actualSsdpPort + " " + location
+                + " " + ssdp.getBoundInterfaceName() + " " + ssdp.getBoundIp());
         System.out.flush();
 
         Thread.sleep(Long.MAX_VALUE);

@@ -25,6 +25,10 @@ PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 49152
 CALL_LOG = sys.argv[2] if len(sys.argv) > 2 else '/tmp/juping-calls.log'
 # SSDP 用临时端口，由服务端实际绑上后回传（见 run.sh 解析 READY 行）
 SSDP_PORT = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+# SSDP 实际绑定的那张网卡的地址与名字。LOCATION 里的 IP 必须由它算出来 ——
+# 用另一个网卡的 IP 就会变成「组播从 A 收、告诉手机去 B 取描述」。
+BOUND_IP = sys.argv[4] if len(sys.argv) > 4 else ''
+BOUND_IFACE = sys.argv[5] if len(sys.argv) > 5 else ''
 
 NS_SOAP = '{http://schemas.xmlsoap.org/soap/envelope/}'
 SVC_AVT = 'urn:schemas-upnp-org:service:AVTransport:1'
@@ -642,6 +646,18 @@ else:
     check('LOCATION 是 http:// 开头的绝对地址',
           first.get('location', '').startswith('http://'), first.get('location', '(缺失)'))
 
+    # LOCATION 里的 IP 必须来自**实际绑定的那张网卡**。
+    # 用另一个网卡的地址就是「组播从 eth0 收搜索请求、却告诉手机去 wlan0
+    # 取设备描述」—— 手机搜得到设备、点进去却拉不到描述。
+    #
+    # 刻意不再单列一条「IP 不是 0.0.0.0」：那是这一条的**前提**，
+    # 删掉那一行会让两条一起红 —— 而"红了多条"说明判据重叠，反而定位不出问题。
+    loc_host = re.sub(r'^http://([^:/]+).*$', r'\1', first.get('location', ''))
+    check('LOCATION 的 IP 就是 SSDP 实际绑定网卡的地址',
+          bool(BOUND_IP) and loc_host == BOUND_IP,
+          'LOCATION 里是 %s；实际绑定的是 %s（%s）'
+          % (loc_host or '(缺失)', BOUND_IP or '(未知)', BOUND_IFACE or '?'))
+
     # --- ST 必须原样回给控制点，否则控制点会丢弃这条应答 ---
     #     这是「有的 App 搜得到、有的搜不到」的典型来源
     for st_val, usn_expect in (
@@ -683,6 +699,12 @@ loc_path = '/' + loc.split('/', 3)[3] if loc.count('/') >= 3 else '/upnp/device.
 
 st_line, _, dev_xml = raw_request('GET', loc_path)
 check('顺着 LOCATION 抓得到设备描述', st_line.startswith('HTTP/1.1 200'), '%s → %s' % (loc_path, st_line))
+
+# 刻意**不**在这里再按 LOCATION 的 host:port 连一次：
+# 「这个地址真的可达」已经由 tools/dlna-probe.py 端到端覆盖了（同一个闸门里跑，
+# 见 run.sh 第 5 步），而它给的失败提示比这里能给的详细得多
+# （直接点出「盒子同时插网线和 Wi-Fi 时最容易错」）。
+# 同一个语义写两遍的代价是：一处坏了两条一起红，反而定位不出问题。
 
 NSD = '{urn:schemas-upnp-org:device-1-0}'
 try:
@@ -1135,6 +1157,103 @@ check('请求行多余空格也能取到设备描述', b'200 OK' in data,
 data = raw_line('GET /upnp/device.xml?cache=1 HTTP/1.1')
 check('带查询串也能取到设备描述', b'200 OK' in data,
       data.split(b'\r\n')[0].decode('iso-8859-1', 'replace'))
+
+
+# ══════════════════════════════════════════════════════════════ 资源上限
+
+print('\n── 12. 三处「无上限」的防御 ──')
+print('   这一节刻意用畸形 / 异常请求去打，验的是「不被打死」，不是「正常请求能过」。')
+print('   这台盒子只有 0.6GB 内存，三处里任何一处没上限都够让整个进程消失 ——')
+print('   而它一消失，SSDP 一起陪葬，表现是「投着投着设备就没了」。')
+
+# --- ① 请求体上限 ---
+# 声明的长度远超上限，而且**一个字节的 body 都不发**。
+# 原来的实现会先 new byte[contentLength] —— 声明这么大就当场分配，
+# 而这台盒子只有 0.6GB。所以「检查必须在分配之前」是这个断言的真正内容。
+#
+# 长度取 100MB 而不是 Integer.MAX_VALUE：真的去 new 一个 2GB 数组的话，
+# 桌面 JVM 上有可能**分配成功**，于是这台开发机被拖去读 2GB 的 body。
+# 100MB 足够说明问题，又不会把跑测试的机器搭进去。
+_big = socket.create_connection((HOST, PORT), timeout=8)
+_big_resp = b''
+try:
+    _big.sendall(('POST /upnp/control/AVTransport HTTP/1.1\r\n'
+                  'Host: %s:%d\r\n'
+                  'SOAPAction: "urn:x#y"\r\n'
+                  'Content-Length: 104857600\r\n\r\n' % (HOST, PORT)).encode())
+    _big_resp = _big.recv(4096)
+except Exception:
+    # 没回响应（连接被关 / 超时）也当成"没被拒" —— 断言本来就是红的。
+    # 不 catch 的话，这个异常会把整个驱动脚本带崩，后面所有用例都不跑了。
+    _big_resp = b''
+finally:
+    _big.close()
+check('超大 Content-Length 被拒（413），没有照着它去分配内存',
+      b'413' in _big_resp,
+      _big_resp.split(b'\r\n')[0].decode('iso-8859-1', 'replace') or '(无响应)')
+
+# 服务必须还活着。这一条比上面那条更重要：
+# 「拒绝了，但进程也被打死了」等于没防住。
+_st, _, _ = raw_request('GET', '/upnp/device.xml')
+check('被拒之后服务照常工作（没有被打死）', _st.startswith('HTTP/1.1 200'), _st)
+
+# 反面对照：正常大小的 body 必须照常受理。
+# 不做这一条的话，一个「把上限写成 0」的实现照样能让上面两条变绿。
+_st, _, _ = soap_post('GetTransportInfo', SVC_AVT, '')
+check('反面对照：正常大小的 body 照常受理', _st.startswith('HTTP/1.1 200'), _st)
+
+# --- ② 并发连接上限 ---
+# 开一批连接但**一个字都不发**：服务端每条都会占住一个线程（阻塞在 read 上）。
+# 无上限的话，一个端口扫描就能把 1MB/线程的栈吃光。
+_idle = []
+try:
+    for _ in range(24):
+        try:
+            _c = socket.create_connection((HOST, PORT), timeout=5)
+            _c.settimeout(3)
+            _idle.append(_c)
+        except Exception:
+            break
+    time.sleep(0.8)   # 让 accept 循环把该收的都收进去
+    _served = 0
+    for _c in _idle:
+        try:
+            _c.sendall(b'GET /upnp/device.xml HTTP/1.1\r\nHost: h\r\n\r\n')
+            if b'200 OK' in _c.recv(4096):
+                _served += 1
+        except Exception:
+            pass
+    check('并发连接有上限：多余的连接被直接关掉，不是来者不拒',
+          _served < len(_idle),
+          '开了 %d 条空闲连接，其中 %d 条拿到了响应 ——'
+          '全都拿到就说明一个上限都没有' % (len(_idle), _served))
+    check('并发到顶的同时服务仍在正常工作（不是把自己锁死）', _served >= 1,
+          '%d 条拿到了响应' % _served)
+finally:
+    for _c in _idle:
+        try:
+            _c.close()
+        except Exception:
+            pass
+
+# --- ③ 订阅表上限 ---
+# 连着订阅超过上限：最老的那条必须被淘汰，否则这张表可以无限涨。
+_first_sid = None
+_last_sid = None
+for _i in range(40):
+    _st, _hd, _ = raw_request('SUBSCRIBE', '/upnp/event/AVTransport',
+                              {'CALLBACK': '<http://127.0.0.1:9/cb%d>' % _i,
+                               'NT': 'upnp:event'})
+    if not _st.startswith('HTTP/1.1 200'):
+        break
+    if _first_sid is None:
+        _first_sid = _hd.get('sid', '')
+    _last_sid = _hd.get('sid', '')
+
+_st, _, _ = raw_request('UNSUBSCRIBE', '/upnp/event/AVTransport', {'SID': _first_sid})
+check('订阅表有上限：最旧的订阅被淘汰（已不认这个 SID）', '412' in _st, _st)
+_st, _, _ = raw_request('UNSUBSCRIBE', '/upnp/event/AVTransport', {'SID': _last_sid})
+check('订阅表有上限：最新的订阅仍然有效', _st.startswith('HTTP/1.1 200'), _st)
 
 
 # ══════════════════════════════════════════════════════════════ 汇总

@@ -68,6 +68,21 @@ public class EventDispatcher {
     /** 连续失败这么多次就丢弃订阅 —— 控制点可能已经退出了。 */
     private static final int MAX_FAIL = 3;
 
+    /**
+     * 订阅表上限。
+     *
+     * <p>每个订阅占一条 SID + 一个回调地址列表。控制点异常、或者有人拿脚本刷，
+     * 都能让它无限增长 —— 而 0.6GB 的盒子上这同样是致命的：
+     * 撑爆的是整个进程，SSDP 一起陪葬。
+     *
+     * <p>32 的依据：真实场景里同一时刻只有一两个控制点在订阅（手机上那个投屏 App），
+     * 32 已经远超正常用量。到顶时淘汰**最旧的**一条 —— {@link #subs} 是
+     * LinkedHashMap，迭代顺序就是插入顺序；而续订走 {@link #renew}（复用原 SID），
+     * 不会插新条目，所以被挤掉的永远是那些本该过期、却因为时钟或实现问题
+     * 没被清掉的老订阅。
+     */
+    private static final int MAX_SUBS = 32;
+
     private static final class Sub {
         final String sid;
         final String service;
@@ -132,6 +147,13 @@ public class EventDispatcher {
         String sid;
         synchronized (this) {
             pruneLocked();
+            // 到顶就淘汰最旧的一条。不设上限的话，异常控制点能把它撑到 OOM ——
+            // 而这台盒子只有 0.6GB，撑爆的是整个进程。
+            if (subs.size() >= MAX_SUBS) {
+                String victim = subs.keySet().iterator().next();
+                subs.remove(victim);
+                Log.w(TAG, "订阅表已达上限 " + MAX_SUBS + "，淘汰最旧的 SID=" + victim);
+            }
             sid = "uuid:" + uuid + "-" + (++sidCounter);
             Sub s = new Sub(sid, service);
             s.callbacks.addAll(callbacks);

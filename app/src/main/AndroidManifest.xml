@@ -24,6 +24,19 @@
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
     <uses-feature android:name="android.software.leanback" android:required="false" />
 
+    <!--
+      hardwareAccelerated="false" 是**刻意**关的，不是漏配。
+
+      targetSdk >= 14 时系统默认开启硬件加速，所以这里必须显式关掉。
+      理由：这台盒子（MediaTek MT5880 / Android 4.0.4）的 GPU 驱动是
+      2012 年前后的版本，硬件加速的合成路径与 MediaPlayer 的视频层叠加时
+      出过花屏 / 蓝色画面 —— 而 SurfaceView 本来就是独立图层，
+      视频画面根本不经过应用的硬件加速通道，开了也只是让那层 UI 走 GPU。
+
+      而界面本身只有几个 TextView 和两个 LinearLayout，软件渲染绰绰有余；
+      换成硬件加速反而要在 0.6GB 内存上多养一块 GPU 显存。
+      收益为零、风险为正，所以关掉。
+    -->
     <application
         android:allowBackup="false"
         android:banner="@drawable/ic_banner"

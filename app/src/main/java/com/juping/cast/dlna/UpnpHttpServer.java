@@ -11,6 +11,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * UPnP 的 HTTP + SOAP 服务端。
@@ -97,6 +98,34 @@ public class UpnpHttpServer extends Thread {
     private ServerSocket serverSocket;
 
     /**
+     * 请求体上限（字节）。
+     *
+     * <p>为什么必须有：{@code Content-Length} 是**控制点说了算**的。原来直接
+     * {@code new byte[contentLength]} —— 声明 2GB 就当场 OutOfMemoryError。
+     * 这台盒子只有 0.6GB 内存，一次就够把整个进程干掉，SSDP 一起陪葬。
+     * 一个畸形的（或恶意的）请求就能做到，不需要什么高深攻击。
+     *
+     * <p>256KB 的依据：DLNA 的 body 只有 SOAP 指令和 DIDL-Lite 元数据，
+     * 中文片名再多也就几 KB。UPnP 规范里也没有大 body 的用法。
+     */
+    private static final int MAX_BODY_BYTES = 256 * 1024;
+
+    /**
+     * 同时在处理的连接数上限。
+     *
+     * <p>每个连接一个线程，而线程默认栈 1MB —— 0.6GB 的盒子上，
+     * 无上限的话一个端口扫描器（或一个卡住的异常控制点）就能把内存吃光，
+     * 连累的是整个进程：SSDP 也一起死。
+     *
+     * <p>16 足够：控制点并发量本来就极低（同一时刻通常 1~2 条），
+     * 留了一个数量级的余量。
+     */
+    private static final int MAX_CONNECTIONS = 16;
+
+    /** 当前活跃连接数。加一在 {@link #run()}，减一在 {@link #handleConnection} 的 finally */
+    private final AtomicInteger activeConnections = new AtomicInteger();
+
+    /**
      * 端口是否已经真正绑上。
      *
      * <p>存在的理由：SSDP 和 HTTP 是两条独立的链路，**死一条另一条照活**。
@@ -177,12 +206,35 @@ public class UpnpHttpServer extends Thread {
                     continue;
                 }
                 // 每个连接一个线程。控制点并发量很低，这样足够且实现最简单。
-                new Thread(new Runnable() {
-                    @Override
-                    public void run() {
-                        handleConnection(socket);
+                //
+                // 但必须**有上限**：线程默认栈 1MB，而老盒子只有 0.6GB 内存。
+                // 无上限的话一个端口扫描就能把内存吃光，整个进程（连带 SSDP）一起死。
+                // 到顶时直接关掉连接 —— 比排一个无限长的队、最后 OOM 强得多。
+                if (activeConnections.get() >= MAX_CONNECTIONS) {
+                    Log.w(TAG, "并发连接已达上限 " + MAX_CONNECTIONS + "，拒绝新连接");
+                    try {
+                        socket.close();
+                    } catch (IOException ignored) {
                     }
-                }, "upnp-conn").start();
+                    continue;
+                }
+                activeConnections.incrementAndGet();
+                boolean started = false;
+                try {
+                    new Thread(new Runnable() {
+                        @Override
+                        public void run() {
+                            handleConnection(socket);
+                        }
+                    }, "upnp-conn").start();
+                    started = true;
+                } finally {
+                    // 线程没起来就把计数还回去 —— 不然几次失败之后计数永远顶在上限，
+                    // HTTP 层从此一个连接都不接，表现为「搜得到设备却投不了屏」。
+                    if (!started) {
+                        activeConnections.decrementAndGet();
+                    }
+                }
             }
         } catch (Exception e) {
             Log.e(TAG, "HTTP 服务异常退出", e);
@@ -271,6 +323,25 @@ public class UpnpHttpServer extends Thread {
                 }
             }
 
+            // ---- 先卡住 body 上限，再分配内存 ----
+            //
+            // 顺序是硬要求：先 new byte[contentLength] 再检查的话，
+            // 检查本身就已经 OOM 了。Content-Length 完全由控制点决定，
+            // 一个畸形请求声明 2GB 就够把 0.6GB 的盒子当场打死。
+            if (contentLength < 0) {
+                // 负的 Content-Length 不是合法值。当 0 处理 —— 直接拿去 new byte[]
+                // 会抛 NegativeArraySizeException，白打一条吓人的异常日志。
+                contentLength = 0;
+            }
+            if (contentLength > MAX_BODY_BYTES) {
+                Log.w(TAG, "Content-Length=" + contentLength + " 超过上限 "
+                        + MAX_BODY_BYTES + "，拒绝（畸形或异常请求）");
+                OutputStream reject = socket.getOutputStream();
+                writeSimple(reject, "413 Request Entity Too Large", "text/plain", "");
+                reject.flush();
+                return;
+            }
+
             // ---- 按字节精确读 body：一个字节不多、一个字节不少 ----
             byte[] bodyBytes = new byte[contentLength];
             int read = 0;
@@ -310,6 +381,9 @@ public class UpnpHttpServer extends Thread {
         } catch (Exception e) {
             Log.w(TAG, "处理连接出错", e);
         } finally {
+            // 计数必须在这里还 —— 和 run() 里的 incrementAndGet 配对。
+            // 漏掉的话计数只增不减，十几次之后 HTTP 层就再也不接连接了。
+            activeConnections.decrementAndGet();
             try {
                 socket.close();
             } catch (IOException ignored) {

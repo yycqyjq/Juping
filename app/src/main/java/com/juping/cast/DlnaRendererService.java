@@ -101,15 +101,20 @@ public class DlnaRendererService extends Service
         startForegroundNotification();
 
         localIp = NetUtil.pickLocalIp();
-        String location = "http://" + localIp + ":" + HTTP_PORT + "/upnp/device.xml";
 
         httpServer = new UpnpHttpServer(HTTP_PORT, uuid, friendlyName, this, this);
         httpServer.start();
 
-        ssdp = new SsdpResponder(uuid, location, "Android/" + android.os.Build.VERSION.RELEASE);
+        // 只把 HTTP 端口交给 SSDP，不传拼好的 LOCATION ——
+        // 设备描述地址里的 IP 必须等组播真的绑上某张网卡之后才知道。
+        // 提前在外面拼一个，就等于把「组播绑哪张网卡」和「告诉手机去哪取描述」
+        // 拆成两次独立选择：第一张候选网卡 joinGroup 失败时，组播会绑到第二张上，
+        // 而 LOCATION 还指着第一张 —— 手机搜得到设备、点进去却拉不到描述。
+        ssdp = new SsdpResponder(uuid, HTTP_PORT, "Android/" + android.os.Build.VERSION.RELEASE);
         ssdp.start();
 
-        Log.i(TAG, "接收端已就绪：名称=" + friendlyName + " 地址=" + location);
+        Log.i(TAG, "接收端已就绪：名称=" + friendlyName + " HTTP 端口=" + HTTP_PORT
+                + "（设备描述地址等 SSDP 绑上网卡后确定）");
     }
 
     /**
@@ -491,6 +496,20 @@ public class DlnaRendererService extends Service
     }
 
     public String getLocalIp() {
+        // 优先用 SSDP **实际绑上的那张网卡**的地址。
+        //
+        // 不能只返回 localIp：那是 onCreate 时按「候选列表第一张网卡」猜的，
+        // 而 joinGroup 有可能换到第二张（第一张没有 IPv4、或是隧道接口）。
+        // 两者一旦分叉，界面显示的地址和控制点拿到的 LOCATION 就是两个 IP ——
+        // 排障时照着界面上的地址去 curl，怎么都复现不了用户的问题。
+        SsdpResponder s = ssdp;
+        if (s != null) {
+            String ip = s.getBoundIp();
+            if (ip != null) {
+                return ip;
+            }
+        }
+        // 还没绑上（开机 Wi-Fi 未就绪、正在退避重试）才退回猜测值。
         return localIp;
     }
 
@@ -565,6 +584,21 @@ public class DlnaRendererService extends Service
     @Override
     public void onDestroy() {
         Log.i(TAG, "服务销毁，释放资源");
+        // 先撤掉前台通知，再拆服务。
+        //
+        // 不撤的话：startForeground 挂上去的那条常驻通知**不会**跟着服务一起消失，
+        // 它会一直留在通知栏里，点一下还会去拉起一个已经死掉的服务 ——
+        // 用户看到的是「投屏早断了，通知栏里却还说正在投屏」。
+        // 老设备上通知栏本来就不宽裕，一条僵尸通知很显眼。
+        //
+        // 顺序放在最前：后面几行会关 socket、释放播放器，那些都可能抛异常，
+        // 万一抛在中间，通知就永远撤不掉了。
+        try {
+            stopForeground(true);
+        } catch (Exception e) {
+            Log.w(TAG, "撤前台通知失败（继续销毁）", e);
+        }
+
         if (ssdp != null) {
             ssdp.shutdown();
         }

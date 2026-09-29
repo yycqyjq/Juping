@@ -92,12 +92,15 @@ if ! grep -q READY "$OUT/server.out" 2>/dev/null; then
     exit 2
 fi
 
-# READY <http端口> <实际ssdp端口> <location>
+# READY <http端口> <实际ssdp端口> <location> <绑定网卡> <绑定网卡的IPv4>
 READY_LINE="$(grep READY "$OUT/server.out" | head -1)"
 ACTUAL_SSDP_PORT="$(echo "$READY_LINE" | awk '{print $3}')"
+READY_IFACE="$(echo "$READY_LINE" | awk '{print $5}')"
+READY_BOUND_IP="$(echo "$READY_LINE" | awk '{print $6}')"
 
 # ── 4. 驱动 ──
-python3 "$HERE/drive.py" "$HTTP_PORT" "$CALL_LOG" "$ACTUAL_SSDP_PORT"
+python3 "$HERE/drive.py" "$HTTP_PORT" "$CALL_LOG" "$ACTUAL_SSDP_PORT" \
+    "$READY_BOUND_IP" "$READY_IFACE"
 RC=$?
 
 # ── 5. 拿同一个靶机验证 dlna-probe.py 自身 ──

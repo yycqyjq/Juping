@@ -21,7 +21,11 @@ import java.util.Locale;
  * </ul>
  * 如果两边各挑各的，就可能出现「组播从 eth0 收，却告诉手机去 wlan0 取设备描述」——
  * 手机搜得到设备、但拉不到描述，表现为「搜到了却投不了屏」。
- * 把选择逻辑收在一处，两者必然一致。
+ *
+ * <p>现在这两条链路的收口方式是：{@link #pickInterfaces()} 是**候选名单**的
+ * 唯一出处；而「最终是哪一张」由 SSDP 的 {@code joinGroup} 结果定下来，
+ * LOCATION 直接由那张网卡的地址拼出（见 {@code SsdpResponder#tryBindOnce()}）。
+ * 名单只算一次、结论只算一次，两者不可能分叉。
  *
  * <h3>筛选条件是怎么定下来的（踩过坑）</h3>
  * 最初只认 {@code eth*} / {@code wlan*} / {@code ap*} 三种前缀，认不出就放弃 ——
@@ -179,10 +183,16 @@ public final class NetUtil {
     }
 
     /**
-     * 本机在局域网里的 IPv4 地址 —— 设备描述 URL 用它。
+     * 本机在局域网里的 IPv4 地址 —— **还没绑上组播时的猜测值**。
      *
-     * <p>刻意与 {@link #pickInterface()} 走同一套选择逻辑，保证
-     * 「组播从哪张网卡收」和「告诉手机去哪取描述」指向同一张网卡。
+     * <p>注意它只是猜测：真正的设备描述地址（LOCATION）由 {@link SsdpResponder}
+     * 在**绑上某张网卡之后**用那张网卡的地址算出来。两者可能不是同一张网卡 ——
+     * 第一张候选网卡 {@code joinGroup} 失败时，组播会绑到第二张上。
+     *
+     * <p>所以界面取地址要走 {@code DlnaRendererService.getLocalIp()}，
+     * 它会优先用 {@link SsdpResponder#getBoundIp()}，只在还没绑上时才退回这里。
+     * 直接用这个方法就等于把「组播绑哪张」和「告诉手机去哪取描述」
+     * 拆成两次独立选择，分叉的后果是「搜得到设备却投不了屏」。
      */
     public static String pickLocalIp() {
         String ip = pickIpv4(pickInterface());

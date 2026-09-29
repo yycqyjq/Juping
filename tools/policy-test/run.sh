@@ -33,6 +33,7 @@ trap 'rm -rf "$OUT"' EXIT INT TERM
 POLICY="app/src/main/java/com/juping/cast/player/PlaybackPolicy.java"
 CTRL="app/src/main/java/com/juping/cast/player/MediaPlayerController.java"
 HTTP="app/src/main/java/com/juping/cast/dlna/UpnpHttpServer.java"
+ED="app/src/main/java/com/juping/cast/dlna/EventDispatcher.java"
 SVC="app/src/main/java/com/juping/cast/DlnaRendererService.java"
 ACT="app/src/main/java/com/juping/cast/MainActivity.java"
 LAYOUT="app/src/main/res/layout/activity_main.xml"
@@ -789,15 +790,29 @@ PY
 #   ·「手机上断开连接 → 电视直接蓝屏，不回投屏之前的界面」
 #     SurfaceView 从不隐藏、而 panel 是透明的 —— 停止之后那层已经没有内容的
 #     surface 还压在面板底下。
-python3 - "$CTRL" "$SVC" "$ACT" "$LAYOUT" "$HTTP" "$POLICY" <<'PY' || RC=1
+#
+# 后面又补了两组同样「编译运行都正常、只是悄悄坏掉」的：
+#
+#   ·「开机后怎么都搜不到设备，重启一下 App 就好了」
+#     服务是开机自启的，而开机广播到达时 Wi-Fi 往往还没连上 ——
+#     那一刻候选网卡为空，原来的 run() 直接 return，SSDP 线程永久结束。
+#     而 startService() 对已在跑的服务不会再触发 onCreate，手动打开 App 也救不回来。
+#     现在改成带退避的重试，并把「失败原因」写进日志。
+#
+#   ·「搜得到设备，点进去却投不了屏」
+#     组播绑的是哪张网卡、LOCATION 里写哪个 IP，原来是两次独立选择 ——
+#     第一张候选网卡 joinGroup 失败时会分叉。现在 LOCATION 由实际绑定的
+#     那张网卡算出，两条链路不可能再不一致。
+python3 - "$CTRL" "$SVC" "$ACT" "$LAYOUT" "$HTTP" "$POLICY" "$ED" <<'PY' || RC=1
 import re, sys, pathlib
-ctrl_path, svc_path, act_path, layout_path, http_path, policy_path = sys.argv[1:7]
+ctrl_path, svc_path, act_path, layout_path, http_path, policy_path, ed_path = sys.argv[1:8]
 ctrl = pathlib.Path(ctrl_path).read_text(encoding='utf-8')
 svc = pathlib.Path(svc_path).read_text(encoding='utf-8')
 act = pathlib.Path(act_path).read_text(encoding='utf-8')
 layout = pathlib.Path(layout_path).read_text(encoding='utf-8')
 http = pathlib.Path(http_path).read_text(encoding='utf-8')
 policy = pathlib.Path(policy_path).read_text(encoding='utf-8')
+ed = pathlib.Path(ed_path).read_text(encoding='utf-8')
 ssdp = pathlib.Path('app/src/main/java/com/juping/cast/dlna/SsdpResponder.java'
                     ).read_text(encoding='utf-8')
 failed = []
@@ -862,6 +877,7 @@ ctrl_c = strip_comments(ctrl)
 svc_c = strip_comments(svc)
 act_c = strip_comments(act)
 http_c = strip_comments(http)
+ed_c = strip_comments(ed)
 
 # ---- ① 网易云搜不到：必须有**主动**广播，而不只是应答 ----
 aa = body_of(ssdp_c, 'private void announceAlive()')
@@ -881,12 +897,76 @@ run = body_of(ssdp_c, 'public void run()')
 report('SsdpResponder.run 方法体已找到', run is not None, '锚点：public void run()')
 if run:
     report('加入组播成功之后才广播 alive',
-           re.search(r'boundPort\s*=\s*actualPort[\s\S]*?announceAlive\(\)',
-                     run) is not None,
+           re.search(r'bindUntilReady\(\)[\s\S]*?announceAlive\(\)', run) is not None,
            '必须发生在 joinGroup 成功之后 —— 早于它的话组播还没通，发出去没人收得到')
     report('有定期重播，不是只发一轮',
            'startAnnouncer()' in run,
            'UDP 会丢包、控制点缓存也会过期；只发一轮的话"在线却搜不到"会反复出现')
+    report('run 里不再自己做网卡选择与「放弃」判断',
+           re.search(r'pickInterfaces\(\)|isEmpty\(\)', run) is None,
+           '在 run() 里直接 return 就是"永久失效"本身：这个服务是开机自启的，'
+           '开机广播到达时 Wi-Fi 往往还没连上，那一刻候选网卡是空的。'
+           '而 startService() 对已在跑的服务不会再触发 onCreate ——'
+           '用户后来手动打开 App 也救不回来，只能重启服务。'
+           '网卡选择和放弃判断都必须交给 bindUntilReady() / tryBindOnce()')
+
+# ---- 绑定失败必须带退避重试 ----
+bur = body_of(ssdp_c, 'private boolean bindUntilReady()')
+report('SsdpResponder.bindUntilReady 方法体已找到', bur is not None,
+       '锚点：private boolean bindUntilReady()')
+if bur:
+    report('bindUntilReady 是循环重试，不是失败一次就返回',
+           re.search(r'while\s*\(\s*running\s*\)', bur) is not None
+           and 'tryBindOnce()' in bur,
+           '没有循环的话，"开机时 Wi-Fi 还没连上"就变成永久失败')
+    report('重试之间有退避等待（不是忙等）',
+           'Thread.sleep(' in bur,
+           '不退避的话失败会变成每秒几千次的忙循环，把 0.6GB 的老盒子 CPU 吃满')
+    report('退避有上限（不会越等越久到不可接受）',
+           re.search(r'Math\.min\([\s\S]{0,60}?RETRY_MAX_MS', bur) is not None,
+           '不封顶的话，失败几次之后下一次重试要等好几分钟 ——'
+           '网络早就好了，用户却还是搜不到。'
+           '注意判据必须是 Math.min(..., RETRY_MAX_MS) 这个**封顶动作**本身：'
+           '只查"方法体里出现过 RETRY_MAX_MS"的话，日志节流那一行也含这个常量，'
+           '把封顶去掉它照样绿 —— 这条断言就是这么被证伪抓出来的')
+    report('重试日志有节流',
+           'RETRY_LOG_EVERY' in bur,
+           '没网时挂一整夜就是几千条失败日志，会把真正有用的日志冲掉；'
+           '而排障恰恰要靠那些日志')
+
+tbo = body_of(ssdp_c, 'private String tryBindOnce()')
+report('SsdpResponder.tryBindOnce 方法体已找到', tbo is not None,
+       '锚点：private String tryBindOnce()')
+if tbo:
+    report('失败路径会关掉自己建的 socket（不泄漏 fd）',
+           re.search(r'reason\s*!=\s*null[\s\S]{0,200}?closeSocket\(', tbo) is not None,
+           '不关的话每次重试漏一个 fd，几十次之后就是 Too many open files ——'
+           '而那时报错的是**别的**模块，根本联想不到 SSDP 在重试')
+    report('boundPort 在 location 之后赋值（绑上 ⇒ 地址已可用）',
+           re.search(r'location\s*=[\s\S]{0,600}?boundPort\s*=\s*actualPort',
+                     tbo) is not None,
+           'isBound() 判的就是 boundPort。先赋它会出现'
+           '「isBound() 已经是 true、LOCATION 还是 null」的窗口，'
+           '而调用方（界面、协议测试）拿到 isBound() 就会立刻去读地址')
+    report('LOCATION 由实际绑定的网卡算出（不是外部传进来的 IP）',
+           re.search(r'NetUtil\.pickIpv4\(\s*bound\s*\)', tbo) is not None,
+           '用外部传进来的 IP 就等于把「组播绑哪张网卡」和「告诉手机去哪取描述」'
+           '拆成两次独立选择 —— 第一张网卡 joinGroup 失败时两者会分叉，'
+           '表现为「搜得到设备却投不了屏」')
+    report('构造函数收的是 HTTP 端口，不是拼好的 LOCATION 字符串',
+           'public SsdpResponder(String uuid, int httpPort, String serverName)' in ssdp_c,
+           'LOCATION 里的 IP 必须等组播真的绑上某张网卡之后才知道。'
+           '从外面传进来，就等于让「绑哪张网卡」和「告诉手机去哪取描述」各自算一次')
+
+# ---- 主动广播间隔必须不超过 max-age 的一半（UPnP DA 1.0 §1.2.2）----
+m_cache = re.search(r'CACHE_MAX_AGE_SEC\s*=\s*(\d+)L', ssdp_c)
+m_ann = re.search(r'ANNOUNCE_INTERVAL_SEC\s*=\s*(\d+)L', ssdp_c)
+report('ANNOUNCE_INTERVAL_SEC * 2 <= CACHE_MAX_AGE_SEC',
+       bool(m_cache and m_ann) and int(m_ann.group(1)) * 2 <= int(m_cache.group(1)),
+       '间隔超过 max-age/2 的话，控制点会在两次广播之间把设备判为过期 ——'
+       '表现为「设备明明在线却从列表里消失」。'
+       '读到的是 max-age=%s、interval=%s'
+       % (m_cache.group(1) if m_cache else '?', m_ann.group(1) if m_ann else '?'))
 
 an = body_of(ssdp_c, 'private void startAnnouncer()')
 report('SsdpResponder.startAnnouncer 方法体已找到', an is not None,
@@ -927,6 +1007,13 @@ if sd:
            re.search(r'announceByeBye\(\)[\s\S]*?closeQuietly\(\)', sd) is not None,
            '顺序反了就发不出去（socket 已经关了）。不发 byebye 的话，'
            '控制点会把设备一直留在列表里直到 max-age 过期，最长 30 分钟')
+    report('shutdown 会叫醒绑定重试的退避 sleep',
+           re.search(r'closeQuietly\(\)[\s\S]{0,500}?this\.interrupt\(\)', sd) is not None,
+           '绑定重试最多睡 30 秒，不叫醒的话服务都销毁了、线程还挂着不退出')
+    report('shutdown 会叫醒重播线程（不白等一整个间隔）',
+           re.search(r'announcer[\s\S]{0,300}?t\.interrupt\(\)', sd) is not None,
+           '重播间隔是 120 秒。不持有线程引用、不 interrupt 的话，'
+           '服务销毁后这个线程还要挂着睡满一轮才退出')
 
 # ---- ② 拖拽蓝屏：play() 必须幂等 ----
 pl = body_of(ctrl_c, 'public synchronized boolean play(String url)')
@@ -1102,6 +1189,92 @@ if cs:
                      cs) is not None,
            '不对齐的话，"seek 期间位置没动"这段静止会被下一轮检查直接算成卡死 ——'
            '于是超时兜底反而制造出一次多余的重连')
+
+# ---- ⑤ 三处「无上限」的防御 ----
+# 0.6GB 内存上，任何一处没上限都能让整个进程消失（连带 SSDP 一起）。
+# 行为由协议测试第 12 节端到端覆盖（真发畸形请求去打），这里守的是**形状**：
+# 常量在不在、检查的位置对不对、计数配不配对。
+hc = body_of(http_c, 'private void handleConnection(Socket socket)')
+report('UpnpHttpServer.handleConnection 方法体已找到', hc is not None,
+       '锚点：private void handleConnection(Socket socket)')
+if hc:
+    # 顺序就是这一条的全部内容。先分配再检查的话，检查那一句自己就跑不到了 ——
+    # 因为 OOM 已经发生在上一条语句。
+    alloc = hc.find('new byte[contentLength]')
+    guard = hc.find('MAX_BODY_BYTES')
+    report('Content-Length 的上限检查发生在 new byte[] 之前',
+           alloc >= 0 and guard >= 0 and guard < alloc,
+           'Content-Length 完全由控制点决定：声明 2GB 就当场 OutOfMemoryError。'
+           '先 new 再检查，等于检查永远执行不到')
+    report('handleConnection 结束时把连接计数还回去',
+           re.search(r'finally[\s\S]{0,200}?activeConnections\.decrementAndGet\(\)',
+                     hc) is not None,
+           '漏掉的话计数只增不减，十几次之后 HTTP 层再也不接连接 ——'
+           '表现为「搜得到设备却投不了屏」，而且只有重启服务才能恢复')
+
+hcr = body_of(http_c, 'public void run()')
+report('UpnpHttpServer.run 方法体已找到', hcr is not None, '锚点：public void run()')
+if hcr:
+    report('accept 之后先查并发上限，再开线程',
+           re.search(r'activeConnections\.get\(\)\s*>=\s*MAX_CONNECTIONS[\s\S]{0,400}?'
+                     r'activeConnections\.incrementAndGet\(\)', hcr) is not None,
+           '每个连接一个线程、默认栈 1MB。无上限的话一个端口扫描就能把内存吃光，'
+           '连累整个进程 —— 而进程一死，SSDP 也一起没了')
+    report('线程没起来时把计数还回去',
+           re.search(r'if\s*\(\s*!\s*started\s*\)[\s\S]{0,150}?'
+                     r'activeConnections\.decrementAndGet\(\)', hcr) is not None,
+           '不还的话，几次 Thread 创建失败之后计数永远顶在上限，'
+           'HTTP 层从此一个连接都不接')
+
+sub_b = body_of(ed_c, 'public String subscribe(String service, String callbackHeader, '
+                      'String timeoutHeader)')
+report('EventDispatcher.subscribe 方法体已找到', sub_b is not None,
+       '锚点：public String subscribe(String service, String callbackHeader, String timeoutHeader)')
+if sub_b:
+    report('订阅表到顶时淘汰最旧的一条',
+           re.search(r'subs\.size\(\)\s*>=\s*MAX_SUBS[\s\S]{0,400}?subs\.remove\(',
+                     sub_b) is not None,
+           '不设上限的话，异常控制点（或有人拿脚本刷）能把这表撑到 OOM ——'
+           '0.6GB 的盒子上撑爆的是整个进程')
+
+# ---- ⑥ 服务销毁时的收尾 ----
+# 前台通知不撤的话会变成一条僵尸通知：投屏早就断了，通知栏里却还挂着，
+# 点一下还会去拉起一个已经死掉的服务。
+od = body_of(svc_c, 'public void onDestroy()')
+report('DlnaRendererService.onDestroy 方法体已找到', od is not None,
+       '锚点：public void onDestroy()')
+if od:
+    # 只留一条：**顺序**里已经含了「有没有撤通知」这件事。
+    # 拆成两条的话，删掉 stopForeground 那一行会让两条同时红 ——
+    # 而"红了多条"说明判据重叠，反而定位不出到底哪儿坏了。同第 ② 节的做法。
+    od_stop = od.find('stopForeground(')
+    teardowns = [x for x in (od.find('ssdp.shutdown()'), od.find('httpServer.shutdown()'),
+                             od.find('player.release()')) if x >= 0]
+    od_first_teardown = min(teardowns) if teardowns else -1
+    report('onDestroy 先撤前台通知，再拆服务',
+           od_stop >= 0 and 0 <= od_stop < od_first_teardown,
+           '不撤通知的话，通知栏会留一条僵尸通知：投屏早就断了，'
+           '却还写着"正在投屏"，点一下还会去拉起一个已经死掉的服务。'
+           '撤得太晚同样不行 —— 后面关 socket / 释放播放器都可能抛异常，'
+           '抛在中间这条通知就永远撤不掉了')
+
+# ---- ⑦ 界面显示的地址，必须就是控制点拿到的那个 ----
+# 界面上的地址是排障时唯一能照着去 curl 的东西。它要是来自"候选列表第一张网卡"，
+# 而 LOCATION 来自 joinGroup 真正成功的那张，两者一分叉：
+# 照着界面地址怎么都复现不了用户的问题 —— 而且看起来还像"盒子没问题"。
+# 这条只能钉源码：它是"哪个值流到界面"的问题，行为层看不见。
+gli = body_of(svc_c, 'public String getLocalIp()')
+report('DlnaRendererService.getLocalIp 方法体已找到', gli is not None,
+       '锚点：public String getLocalIp()')
+if gli:
+    gli_bound = gli.find('getBoundIp()')
+    gli_fallback = gli.rfind('return localIp')
+    report('界面取地址优先用实际绑定的网卡，兜底才退回猜测值',
+           gli_bound >= 0 and gli_bound < gli_fallback,
+           '只返回 localIp 的话，joinGroup 换到第二张网卡（第一张没有 IPv4、'
+           '或是隧道接口）时，界面显示的 IP 和 SSDP 告诉手机的 LOCATION 就不是同一个。'
+           '判据是**顺序**：先 getBoundIp()，兜底才 return localIp ——'
+           '反过来的话（先 return localIp）这段代码就永远走不到后面那句')
 
 sys.exit(1 if failed else 0)
 PY

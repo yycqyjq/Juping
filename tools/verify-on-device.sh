@@ -3,7 +3,8 @@
 # verify-on-device.sh — 一条命令完成真机验收
 # ---------------------------------------------------------------
 # 为什么要有这个脚本：
-#   前面四道闸（签名 / API 引用 / 协议一致性 / 播放策略）全都是**桌面端**跑的。
+#   前面五道闸（签名 / API 引用 / 协议一致性 / 播放策略 / R8 dex 入口点）
+#   全都是**桌面端**跑的。
 #   它们能证明"代码自洽"，但证明不了"盒子真的收得到投屏"。真机上只有三件事
 #   必须真机验，且都验不了于桌面：
 #     ① SSDP 组播收不收得到 —— 受 MulticastLock、网卡选择、路由器 IGMP 影响
@@ -35,7 +36,14 @@ cd "$ROOT"
 ADB="${ADB:-adb}"
 PKG="com.juping.cast"
 ACTIVITY="$PKG/.MainActivity"
-TAG_READY="接收端已就绪"
+# 等的是 **SSDP 绑上组播**那一行，不是「接收端已就绪」。
+#
+# 为什么换了：LOCATION 现在由 SsdpResponder 在绑上网卡之后算出来并打进日志，
+# 「接收端已就绪」那条早于绑定完成，拿它当就绪信号会读到空地址。
+# 而且「绑上了」才是用户真正在意的状态 —— 绑不上就是手机搜不到设备。
+# 绑定失败现在会自动带退避重试（见 SsdpResponder.bindUntilReady），
+# 所以这里等不到就说明是**持续**失败，日志里能直接看到原因。
+TAG_READY="SSDP 已加入组播组"
 
 TARGET=""
 PLAY_URL=""
@@ -138,17 +146,18 @@ sh_get "am force-stop $PKG" >/dev/null 2>&1 || true
 sh_get "am start -n $ACTIVITY" | sed 's/^/  /'
 
 # ─────────────────────────────────────────── 4. 从 logcat 抠出真实地址
-# 不去猜盒子在哪个网卡上：服务自己会把选定地址打进日志。
-# 这比解析 netcfg / ip addr 可靠 —— 它反映的正是 NetUtil 实际选中的那个接口。
+# 不去猜盒子在哪个网卡上：SsdpResponder 会把**实际绑定的那张网卡**算出的
+# 设备描述地址打进日志。这比解析 netcfg / ip addr 可靠 ——
+# 它反映的正是组播真正绑上的那个接口，也就是手机唯一能访问到的那个。
 echo
-echo "── ③ 等接收端就绪（最多 30 秒）──"
+echo "── ③ 等 SSDP 绑上组播（最多 30 秒）──"
 LOCATION=""
 for _ in $(seq 1 60); do
     LOG="$("$ADB" logcat -d -v brief 2>/dev/null || true)"
     LINE="$(printf '%s\n' "$LOG" | grep "$TAG_READY" | tail -1 || true)"
     if [ -n "$LINE" ]; then
-        # 形如：... 地址=http://192.168.1.9:49152/upnp/device.xml
-        LOCATION="$(printf '%s' "$LINE" | sed -n 's|.*\(http://[0-9.]*:[0-9]*/[^ ]*\).*|\1|p')"
+        # 形如：... 网卡=eth0（候选 2 张），LOCATION=http://192.168.1.9:49152/upnp/device.xml
+        LOCATION="$(printf '%s' "$LINE" | sed -n 's|.*LOCATION=\(http://[0-9.]*:[0-9]*/[^ ]*\).*|\1|p')"
         [ -n "$LOCATION" ] && break
     fi
     sleep 0.5
@@ -156,13 +165,15 @@ done
 
 if [ -z "$LOCATION" ]; then
     echo "  [×] 30 秒内没等到「${TAG_READY}」。" >&2
-    echo
+    echo >&2
     echo "  ── 相关日志 ──" >&2
     printf '%s\n' "$LOG" | grep -E "DlnaRenderer|SsdpResponder|UpnpHttpServer|NetUtil" | tail -30 >&2
     echo >&2
-    echo "  重点看有没有这两类行：" >&2
-    echo "    · 所有候选网卡都无法加入组播组 —— 网卡选择失败" >&2
+    echo "  重点看这几类行：" >&2
+    echo "    · 「第 N 次绑定 SSDP 失败：...」—— 正在重试。若一直重试，看它给的原因：" >&2
+    echo "      找不到网卡 = 盒子还没连上网；所有候选网卡都无法加入组播组 = 网卡本身不行" >&2
     echo "    · MulticastLock —— 没拿到锁就收不到任何 SSDP 搜索" >&2
+    echo "    · 1900 端口被占（BindException）—— 盒子自带的投屏服务在抢" >&2
     exit 1
 fi
 
