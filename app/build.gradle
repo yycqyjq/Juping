@@ -1,0 +1,46 @@
+apply plugin: 'com.android.application'
+
+android {
+    namespace 'com.juping.cast'
+    compileSdkVersion 33
+
+    defaultConfig {
+        applicationId "com.juping.cast"
+        // 目标就是 Android 4.0（API 14/15）。如果你实测盒子是 4.2/4.4，
+        // 可以把它调高到 17/19 —— 但先别急着调，低 minSdk 不会有坏处。
+        minSdkVersion 14
+        // 刻意压低 targetSdk：避免 Android 5.0+ 的运行时权限模型、
+        // 后台服务限制等新行为落到这个老设备上。
+        targetSdkVersion 19
+        versionCode 1
+        versionName "0.1.0"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    lintOptions {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
+
+dependencies {
+    // 刻意保持「零第三方依赖」：
+    //   1) Android 4.0 设备内存普遍只有 512MB~1GB，多一个库就多一分被 LMK 杀的风险
+    //   2) 不能用 AndroidX —— 新版 AndroidX 组件普遍要求 minSdk 19+，会直接编译不过
+    //   3) SSDP / HTTP / SOAP 全部自实现，链路完全自控，方便针对稳定性做优化
+    //
+    // 如果你更想快速验证可行性、不想手写 UPnP，可以改用 Cling 2.1.2（注意不能用 3.x，它要 Java 8）：
+    //   implementation('org.fourthline.cling:cling-core:2.1.2') { exclude module: 'servlet-api' }
+    //   implementation('org.fourthline.cling:cling-support:2.1.2')
+    // 代价是包体积增加约 1MB，且需要自己补一个 Android 版的 UpnpServiceConfiguration。
+}

@@ -1,0 +1,39 @@
+# Gradle
+.gradle/
+build/
+gradle-app.setting
+.gradletasknamecache
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+local.properties
+captures/
+
+# 构建产物
+*.apk
+*.aab
+*.aar
+*.ap_
+*.dex
+*.class
+bin/
+gen/
+out/
+release/
+
+# 签名文件 —— 绝对不要入库
+*.jks
+*.keystore
+keystore.properties
+signing.properties
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 日志与临时文件
+*.log
+*.tmp
+*.bak

@@ -1,0 +1,27 @@
+// 顶层构建脚本
+//
+// 工具链版本说明（重要）：
+//   AGP 7.4.2 + Gradle 7.5 + JDK 11 是能稳定支持 minSdkVersion 14 的一组组合。
+//   AGP 8.x 也能编，但会持续告警且部分默认行为对老 targetSdk 不友好。
+//   如果你想用更新的 AGP，请先确认它仍然允许 minSdk 14。
+
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:7.4.2'
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+tasks.register('clean', Delete) {
+    delete rootProject.buildDir
+}
