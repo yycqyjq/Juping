@@ -256,9 +256,29 @@ public class DlnaRendererService extends Service
 
     @Override
     public void onSeek(long positionMs) {
-        if (player != null) {
-            player.seekTo((int) positionMs);
+        if (player == null) {
+            return;
         }
+        long duration = player.getDuration();
+        // 越界保护：目标超出总时长时**忽略，不要下发**。
+        //
+        // 为什么必须挡：MediaPlayer.seekTo() 一旦越过末尾，位置会直接落到结尾
+        // 并触发播放完成 —— 用户看到的就是「拖了一下进度条，电视上进度直接满了、
+        // 声音也没了」。而越界值往往不是控制点算错，是**我们把 Target 解析错了**
+        // （单位、格式、小数位）：错得越大，越像"跳到了结尾"。
+        //
+        // 留 1 秒容差：控制点按百分比算目标时会有取整误差，
+        // 而"正好拖到末尾"本身是合法操作，不该被拦。
+        if (duration > 0 && positionMs > duration + 1000L) {
+            Log.w(TAG, "Seek 目标越界，已忽略：target=" + positionMs
+                    + "ms, duration=" + duration + "ms（超出 "
+                    + (positionMs - duration) + "ms）");
+            return;
+        }
+        // 两个数一起打。这一行是「进度满了」这类问题的第一现场 ——
+        // 只打 target 看不出它是不是被解析错了，必须和 duration 对着看。
+        Log.i(TAG, "Seek：target=" + positionMs + "ms, duration=" + duration + "ms");
+        player.seekTo((int) Math.max(0L, positionMs));
     }
 
     @Override
@@ -382,6 +402,16 @@ public class DlnaRendererService extends Service
 
     @Override
     public void onPrepared(int durationMs, boolean hasVideo) {
+        // 播放已经真的就绪了 —— 把之前那条错误清掉。
+        //
+        // 不清的话会出一个很别扭的现象：一次**已经自愈**的断流（onError → 重连 →
+        // prepare 成功），那句"播放卡死，正在重连"会一直挂在 lastError 里，
+        // 而顶部状态条正是靠它判断"要不要出现"—— 于是画面好好的，
+        // 屏幕上却一直压着一条报错。
+        //
+        // 这和「谎报军情比失败更糟」是同一条纪律：状态字段必须反映**现在**，
+        // 而不是"曾经出过事"。真要报故障，下一次 onError 会重新写上。
+        lastError = "";
         // 元数据说了算的时候听元数据的；元数据没说，就用 MediaPlayer 报的
         // 真实视频尺寸定论。两个信号都用上，比只看一个稳。
         if (kindFromMetadata == KIND_AUDIO) {
@@ -440,6 +470,18 @@ public class DlnaRendererService extends Service
      */
     public boolean isDiscoveryReady() {
         return ssdp != null && ssdp.isBound();
+    }
+
+    /**
+     * HTTP 服务是否真的在监听。
+     *
+     * <p>和 {@link #isDiscoveryReady()} 是**两件独立的事，必须分开报**：
+     * SSDP 与 HTTP 是两条链路，死一条另一条照活。搜得到设备（SSDP 正常）
+     * 但 HTTP 没起来时，症状是「手机能看到这台设备、一点投屏就失败」——
+     * 只看组播状态的话，界面会显示一切正常，等于谎报军情。
+     */
+    public boolean isHttpReady() {
+        return httpServer != null && httpServer.isBound();
     }
 
     public String getBoundInterfaceName() {

@@ -341,6 +341,59 @@ if new:
     detail = 'got=%s' % f
 check('Seek 00:10:30 → 630000ms', seek_ok, detail)
 
+# 下面几条守同一个根因：**Target 的小数部分是合法的**。
+# DLNA 规范里 REL_TIME 的定义就是 `H+:MM:SS[.F+]`，安卓侧不少投屏 SDK
+# 会老老实实带上 ".000"。而解析器遇到 "." 会 NumberFormatException，
+# 被 `catch (Exception ignored)` 吞掉后 return 0 —— 也就是**静默跳到开头**。
+# 用户看到的是"拖了进度条，位置反而回去了"，而日志里一个字都没有。
+for target, want_ms, label in (
+        ('00:10:30.000', 630000, '带小数 .000'),
+        ('00:10:30.5',   630500, '带小数 .5'),
+        ('0:10:30',      630000, '单数字小时'),
+        ('01:00:00',     3600000, '整一小时'),
+):
+    before = len(read_calls())
+    soap_post('Seek', SVC_AVT,
+              '<Unit>REL_TIME</Unit><Target>%s</Target>' % target)
+    calls = read_calls()
+    new = calls[before:]
+    ok = False
+    detail = '没有记录'
+    if new:
+        f = unrec(new[0])
+        ok = f[0] == 'Seek' and len(f) > 1 and f[1] == str(want_ms)
+        detail = 'got=%s' % f
+    check('Seek %s（%s）→ %dms' % (target, label, want_ms), ok, detail)
+
+# 解析不了的 Target **必须被忽略**，绝不能退化成"跳到 0"。
+# "什么都不做"和"跳回开头"对用户是两件完全不同的事。
+for bad in ('', 'abc', '1', '00:xx:30'):
+    before = len(read_calls())
+    soap_post('Seek', SVC_AVT, '<Unit>REL_TIME</Unit><Target>%s</Target>' % bad)
+    calls = read_calls()
+    new = calls[before:]
+    ok = True
+    detail = '未记录（正确：忽略）'
+    if new:
+        f = unrec(new[0])
+        ok = f[0] == 'Seek' and len(f) > 1 and f[1] != '0'
+        detail = 'got=%s  ← 不该退化成跳到 0' % f
+    check('非法 Target %r 被忽略而不是跳到 0' % bad, ok, detail)
+
+# Unit=TRACK_NR 时 Target 是**曲目号**，不是时刻。
+# 老实现把它当时间解析（"1" 拆不出三段 → 0），于是「切下一曲」变成「跳回开头」。
+before = len(read_calls())
+soap_post('Seek', SVC_AVT, '<Unit>TRACK_NR</Unit><Target>1</Target>')
+calls = read_calls()
+new = calls[before:]
+ok = True
+detail = '未记录（正确：忽略）'
+if new:
+    f = unrec(new[0])
+    ok = f[0] == 'Seek' and len(f) > 1 and f[1] != '0'
+    detail = 'got=%s  ← 不该退化成跳到 0' % f
+check('Seek Unit=TRACK_NR 被忽略（Target 是曲目号不是时刻）', ok, detail)
+
 soap_post('Stop', SVC_AVT, '')
 st, hd, body = soap_post('GetTransportInfo', SVC_AVT, '')
 check('Stop 之后状态是 STOPPED',

@@ -32,7 +32,21 @@ import android.widget.Toast;
  */
 public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
-    private static final long REFRESH_INTERVAL_MS = 1500L;
+    /**
+     * 空闲时的刷新间隔。面板上的信息几乎不变，刷快了纯属浪费 ——
+     * 这台设备只有 0.6GB 内存。
+     */
+    private static final long REFRESH_INTERVAL_IDLE_MS = 1500L;
+
+    /**
+     * 播放中的刷新间隔。
+     *
+     * <p>比空闲时快三倍，是**为了拖动进度条之后的观感**：屏幕上那个
+     * {@code 01:23 / 03:45} 是用户唯一能拿来对照手机进度条的东西，
+     * 1.5 秒才跳一次的话，拖完总要愣一下才跟上 —— 看起来就像"没同步"。
+     * 0.5 秒是「跟得上」与「不浪费」之间的折中：一次 tick 不过是几次 setText。
+     */
+    private static final long REFRESH_INTERVAL_PLAYING_MS = 500L;
 
     /**
      * 界面三态。
@@ -51,6 +65,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private LinearLayout rowSource;
     private LinearLayout music;
     private View statusDot;
+    /** 顶部状态条左边那个点。它必须能变颜色 —— 见 applyTopBar 里的说明。 */
+    private View overlayDot;
 
     private TextView infoDevice;
     private TextView infoAddress;
@@ -88,7 +104,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         @Override
         public void run() {
             refresh();
-            handler.postDelayed(this, REFRESH_INTERVAL_MS);
+            handler.postDelayed(this, lastMode == MODE_IDLE
+                    ? REFRESH_INTERVAL_IDLE_MS
+                    : REFRESH_INTERVAL_PLAYING_MS);
         }
     };
 
@@ -103,6 +121,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         rowSource = (LinearLayout) findViewById(R.id.row_source);
         music = (LinearLayout) findViewById(R.id.music);
         statusDot = findViewById(R.id.status_dot);
+        overlayDot = findViewById(R.id.overlay_dot);
 
         infoDevice = (TextView) findViewById(R.id.info_device);
         infoAddress = (TextView) findViewById(R.id.info_address);
@@ -157,24 +176,42 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             infoState.setText(R.string.state_starting);
             applyStatusDot(false);
             applyModeIfChanged(MODE_IDLE);
+            applyTopBar(MODE_IDLE);
             return;
         }
 
-        infoDevice.setText(service.getFriendlyName());
-        infoAddress.setText(getString(R.string.fmt_address,
-                service.getLocalIp(), service.getHttpPort()));
-        infoNetwork.setText(service.getBoundInterfaceName());
-        infoState.setText(describeState());
-
         int mode = currentMode();
-        applyStatusDot(mode != MODE_IDLE);
         applyModeIfChanged(mode);
+        // 顶部条与「形态」无关：同一个形态里，播放 ↔ 暂停 ↔ 出错随时会变。
+        // 所以它必须每个 tick 重算一次，不能只在形态切换时算。
+        applyTopBar(mode);
 
-        if (mode == MODE_IDLE || service.getPlayer() == null) {
+        // 面板（含它那个状态圆点）只有 idle 时才看得见。
+        // 播放期间每 0.5 秒重刷一遍这些文字和背景是白费力气 ——
+        // 它们在此期间根本不会变，而面板此时本来就是隐藏的。
+        // 0.6GB 的设备上，这点开销正好抵掉"播放期提速三倍"那部分。
+        if (mode == MODE_IDLE) {
+            // idle 就意味着没在播放，所以这里恒传 false
+            applyStatusDot(false);
+            infoDevice.setText(service.getFriendlyName());
+            infoAddress.setText(getString(R.string.fmt_address,
+                    service.getLocalIp(), service.getHttpPort()));
+            infoNetwork.setText(service.getBoundInterfaceName());
+            infoState.setText(describeState());
+            return;
+        }
+
+        if (service.getPlayer() == null) {
             return;
         }
         int pos = service.getPlayer().getPosition() / 1000;
         int dur = service.getPlayer().getDuration() / 1000;
+        // 位置可能短暂越过总时长 —— HTTP 流的分段时长估算是会浮动的，
+        // seek 也可能正好落在边界上。不钳的话会显示成 "10:30 / 03:45"
+        // 这种越界数字，在电视上看着就像进度"满了"。
+        if (dur > 0 && pos > dur) {
+            pos = dur;
+        }
         // 时长恒为 0 的是 HLS 直播 —— 拿不到总时长就报"正在播放"，
         // 别显示一个 00:00 的总时长把人看懵。
         String progress = dur > 0
@@ -183,12 +220,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (mode == MODE_AUDIO) {
             musicSource.setText(shortName(service.getCurrentUri()));
             musicProgress.setText(progress);
-            // 顶部状态条只报「音乐投屏」，进度数字归音乐卡片。
-            // 同一个值在屏幕上出现两遍，三米外看着很吵。
-            playingText.setText(getString(R.string.music_title));
-        } else {
-            playingText.setText(dur > 0 ? progress : shortName(service.getCurrentUri()));
         }
+        // 顶部条现在只在暂停 / 出错 / 缓冲时出现，那些时刻用户要的正是
+        // 「放到哪儿了」，所以两种形态都报进度。原来音频时这里固定写
+        // 「音乐投屏」是因为状态条常驻、和音乐卡片的大标题重复了 ——
+        // 条子不再常驻，那个理由也就不成立了。
+        playingText.setText(dur > 0 ? progress : shortName(service.getCurrentUri()));
     }
 
     private boolean isPlaying() {
@@ -233,7 +270,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // 音乐层与画面层互斥。两者同时可见时，不透明的那层会盖住另一层，
         // 表面看"正常"，但底下还在渲染 —— 0.6GB 的盒子上不该浪费这份开销。
         music.setVisibility(mode == MODE_AUDIO ? View.VISIBLE : View.GONE);
-        overlay.setVisibility(idle ? View.GONE : View.VISIBLE);
+        applyTopBar(mode);
 
         String uri = service == null ? null : service.getCurrentUri();
         boolean hasSource = uri != null && uri.length() > 0;
@@ -246,6 +283,49 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (!idle) {
             bindSurfaceIfReady();
         }
+    }
+
+    /**
+     * 顶部状态条的可见性 —— **只在「有话说」的时候出现**。
+     *
+     * <p>它原来是一进入播放就常显的。于是看视频时画面上永远压着一条半透明黑带，
+     * 而用户要的是「全屏就是画面，顶上什么都别挡」。
+     *
+     * <p>但它也不能直接删掉：暂停和出错的时候，屏幕上恰好没有任何反馈，
+     * 那一刻它是唯一的线索 —— 黑屏卡住时要是没有它，就只能去连电脑抓 logcat。
+     * 所以规则是：
+     * <ul>
+     *   <li><b>暂停</b> → 报位置，让用户知道停在哪</li>
+     *   <li><b>出错</b> → 报错因，这是电视端唯一的排障出口</li>
+     *   <li><b>缓冲 / 重连中</b>（TRANSITIONING）→ 说明画面为什么还没出来</li>
+     * </ul>
+     * 正常播放中一律隐藏。
+     *
+     * <p>注意它**不能只写在 {@link #applyMode(int)} 里**：暂停与出错是同一个形态
+     * 内部的变化，形态没切换，那些代码根本不会被走到。
+     */
+    private void applyTopBar(int mode) {
+        boolean show = false;
+        int dot = R.drawable.dot_online;
+        if (mode != MODE_IDLE && service != null) {
+            String err = service.getLastError();
+            String ts = service.getTransportState();
+            boolean error = (err != null && err.length() > 0);
+            show = error || "PAUSED_PLAYBACK".equals(ts) || "TRANSITIONING".equals(ts);
+            if (error) {
+                // 出错就亮红点。
+                // 这个点原来是**写死的绿色**，而顶部条现在恰恰只在
+                // 「暂停 / 出错 / 缓冲」时出现 —— 出错时左边一个绿点、
+                // 右边写着「出错：…」，自己跟自己打架。
+                // 三米外先被看见的是颜色而不是那行小字，所以颜色必须说实话。
+                dot = R.drawable.dot_error;
+            } else if ("TRANSITIONING".equals(ts)) {
+                // 缓冲 / 重连中：蓝点表示"还在动"，而不是"已经好了"
+                dot = R.drawable.dot_playing;
+            }
+        }
+        overlayDot.setBackgroundResource(dot);
+        overlay.setVisibility(show ? View.VISIBLE : View.GONE);
     }
 
     /**
@@ -265,6 +345,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             dot = R.drawable.dot_error;
         } else if (!service.isDiscoveryReady()) {
             // 组播没就绪 —— 手机搜不到设备，这是最该被一眼看见的状态
+            dot = R.drawable.dot_error;
+        } else if (!service.isHttpReady()) {
+            // 组播活着、HTTP 死了。这个状态比"搜不到设备"**更隐蔽**：
+            // 手机能搜到这台设备、能显示它的名字，一点投屏就失败 ——
+            // 用户会以为是手机或片源的问题，而电视这边看起来一切正常。
             dot = R.drawable.dot_error;
         } else if (playing) {
             dot = R.drawable.dot_playing;
@@ -296,6 +381,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         String uri = service.getCurrentUri();
         if (uri != null && uri.length() > 0) {
             return getString(R.string.state_playing);
+        }
+        // HTTP 服务没起来时，手机**搜得到设备却投不上去**。
+        // 这时显示"等待投屏"是在误导用户 —— 他会一直等，而设备根本接不了活。
+        if (!service.isHttpReady()) {
+            return getString(R.string.state_service_down);
         }
         return getString(R.string.state_waiting);
     }

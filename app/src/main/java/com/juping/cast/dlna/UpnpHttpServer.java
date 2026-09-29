@@ -82,6 +82,16 @@ public class UpnpHttpServer extends Thread {
     private volatile boolean running = true;
     private ServerSocket serverSocket;
 
+    /**
+     * 端口是否已经真正绑上。
+     *
+     * <p>存在的理由：SSDP 和 HTTP 是两条独立的链路，**死一条另一条照活**。
+     * HTTP 没绑上时，手机搜得到设备（SSDP 正常应答），却取不到 device.xml、
+     * 一条 SOAP 指令都发不进来 —— 表现就是「搜得到但投不上去」。
+     * 界面必须能把这种情况如实报出来，而不是一律显示"已就绪"。
+     */
+    private volatile boolean bound;
+
     public UpnpHttpServer(int port, String uuid, String friendlyName, CommandHandler handler,
                           EventDispatcher.EventSource eventSource) {
         super("upnp-http");
@@ -108,10 +118,38 @@ public class UpnpHttpServer extends Thread {
         return events;
     }
 
+    /**
+     * HTTP 服务是否真的在监听。
+     *
+     * <p>没绑上 = 手机取不到设备描述、发不进 SOAP 指令，投屏必然失败。
+     * 界面据此如实显示状态 —— 只看 SSDP 是发现不了这个故障的，
+     * 而它的症状（搜得到设备却投不上去）恰恰最容易被误判成"手机的问题"。
+     */
+    public boolean isBound() {
+        return bound && serverSocket != null && !serverSocket.isClosed();
+    }
+
     @Override
     public void run() {
         try {
             serverSocket = new ServerSocket(port);
+            // bind 成功之后必须**立刻**复查 running。
+            //
+            // 竞态：shutdown() 可能正好落在「构造 ServerSocket」与「这一句」之间。
+            // 那一刻 serverSocket 字段还是 null，shutdown 里那句 close 被跳过，
+            // 而这个线程紧接着就把 49152 绑上了 —— 端口被永久占住。
+            // 下次服务启动时 bind 直接 EADDRINUSE，HTTP 层彻底死掉，
+            // 而 SSDP 还活着 —— 表现就是「手机搜得到设备，但一点投屏就失败」，
+            // 且重启 App 也救不回来（端口一直占着）。
+            if (!running) {
+                try {
+                    serverSocket.close();
+                } catch (IOException ignored) {
+                }
+                Log.i(TAG, "启动途中已被要求关闭，端口 " + port + " 已释放");
+                return;
+            }
+            bound = true;
             Log.i(TAG, "UPnP HTTP 服务已启动，端口 " + port);
             while (running) {
                 final Socket socket;
@@ -522,7 +560,21 @@ public class UpnpHttpServer extends Thread {
         } else if ("Stop".equals(action)) {
             handler.onStop();
         } else if ("Seek".equals(action)) {
-            handler.onSeek(parseTimeToMs(get(args, "Target")));
+            // Unit 不是时间轴时（TRACK_NR 之类），Target 是**曲目号**而不是时刻。
+            // 当成时刻去解析会把「切下一曲」变成「跳回开头」，所以直接忽略。
+            String unit = get(args, "Unit");
+            if (unit.length() != 0 && !"REL_TIME".equals(unit) && !"ABS_TIME".equals(unit)) {
+                Log.i(TAG, "Seek Unit=" + unit + " 不是时间轴，已忽略");
+            } else {
+                long ms = parseTimeToMs(get(args, "Target"));
+                if (ms >= 0) {
+                    handler.onSeek(ms);
+                } else {
+                    // 解析不出来就**什么都不做**。
+                    // 绝不能把 -1 当成 0 下发 —— 那是「跳回开头」，比不动作糟得多。
+                    Log.w(TAG, "Seek Target 无法解析，已忽略: " + get(args, "Target"));
+                }
+            }
         } else if ("SetVolume".equals(action)) {
             handler.onSetVolume(parseInt(get(args, "DesiredVolume"), 100));
         }
@@ -767,17 +819,72 @@ public class UpnpHttpServer extends Thread {
         }
     }
 
-    /** UPnP 时间格式 HH:MM:SS → 毫秒 */
+    /**
+     * 解析 UPnP 的时长字符串为毫秒。**解析不出来时返回 -1，而不是 0。**
+     *
+     * <p>规范里 {@code REL_TIME} 的格式是 {@code H+:MM:SS[.F+]} ——
+     * **小数部分是合法的**，而且安卓侧不少投屏 SDK 就是按 {@code 00:10:30.000}
+     * 发的（ISO 8601 / java.time 的默认输出长这样）。
+     *
+     * <p>这里踩过一次真坑，必须写下来。原来的实现只认 {@code H:MM:SS}，
+     * 遇到 {@code "."} 抛 {@code NumberFormatException}，被
+     * {@code catch (Exception ignored)} 吞掉后 {@code return 0}。于是：
+     *
+     * <ul>
+     *   <li>用户在手机上把进度条拖到 10:30 → 电视**跳回开头**；</li>
+     *   <li>控制点接着回读 {@code GetPositionInfo}，拿到 {@code RelTime=00:00:00}，
+     *       于是手机自己的进度条也弹回 0 —— 用户看到的就是「拖拽不同步」；</li>
+     *   <li>而日志里一个字都没有，因为异常被吞了。</li>
+     * </ul>
+     *
+     * <p><b>教训：任何「解析失败」都必须与「解析出 0」区分开。</b>
+     * 对时刻来说 0 是一个完全合法、且语义极重的值（跳到开头），
+     * 把它当兜底值等于把"看不懂"翻译成"从头开始"。
+     */
     private static long parseTimeToMs(String t) {
-        try {
-            String[] p = t.split(":");
-            if (p.length == 3) {
-                return (Long.parseLong(p[0]) * 3600 + Long.parseLong(p[1]) * 60
-                        + Long.parseLong(p[2])) * 1000L;
-            }
-        } catch (Exception ignored) {
+        if (t == null) {
+            return -1L;
         }
-        return 0L;
+        String s = t.trim();
+        if (s.length() == 0) {
+            return -1L;
+        }
+        // 小数部分按毫秒折算：.5 → 500ms，.25 → 250ms，.125 → 125ms。
+        // 全程整数运算 —— 这里刻意不用 Double.parseDouble：
+        // 它会接受 "NaN" / "Infinity"，而 NaN 转成 long 是 0，
+        // 于是又绕回「看不懂 → 跳到开头」那个坑里。
+        int dot = s.indexOf('.');
+        long fracMs = 0L;
+        if (dot >= 0) {
+            String frac = s.substring(dot + 1);
+            s = s.substring(0, dot);
+            for (int i = 0; i < frac.length() && i < 3; i++) {
+                char c = frac.charAt(i);
+                if (c < '0' || c > '9') {
+                    return -1L;             // 小数位里混了非数字 → 整条都不合法
+                }
+                fracMs = fracMs * 10 + (c - '0');
+            }
+            for (int i = frac.length(); i < 3; i++) {
+                fracMs *= 10;               // 补零到毫秒位
+            }
+        }
+        String[] p = s.split(":");
+        if (p.length != 3) {
+            return -1L;
+        }
+        try {
+            long h = Long.parseLong(p[0].trim());
+            long m = Long.parseLong(p[1].trim());
+            long sec = Long.parseLong(p[2].trim());
+            if (h < 0 || m < 0 || sec < 0) {
+                return -1L;
+            }
+            return (h * 3600L + m * 60L + sec) * 1000L + fracMs;
+        } catch (NumberFormatException e) {
+            Log.w(TAG, "Seek Target 无法解析: " + t);
+            return -1L;
+        }
     }
 
     /**
@@ -829,6 +936,9 @@ public class UpnpHttpServer extends Thread {
 
     public void shutdown() {
         running = false;
+        // 先撤"已就绪"标志、再关 socket：反过来的话，close 与 isBound()
+        // 之间有一个瞬间是"端口已经关了，状态却还说在监听"。
+        bound = false;
         // 事件分发器有自己的线程池，必须一并关掉，否则它会挂着不放。
         events.shutdown();
         try {

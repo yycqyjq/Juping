@@ -106,4 +106,78 @@ public final class PlaybackPolicy {
     public static long stallDetectionUpperBoundMs(int durationMs) {
         return stallThresholdMs(durationMs) + WATCHDOG_INTERVAL_MS;
     }
+
+    // ------------------------------------------------------- Play 指令该怎么落地
+
+    /** Play 到达时的处置方式，见 {@link #playAction}。 */
+    public static final int PLAY_NONE = 0;
+    public static final int PLAY_START = 1;
+    public static final int PLAY_PREPARE = 2;
+    public static final int PLAY_WAIT = 3;
+
+    /**
+     * 收到 Play 时该怎么做。
+     *
+     * <p><b>为什么需要这个决策，而不是"有 URL 就重启"</b>：
+     * DLNA 控制点（腾讯视频 / B站 这类）投屏时是把
+     * {@code SetAVTransportURI} 和 {@code Play} <b>连着发</b>的，间隔只有几十毫秒，
+     * 而 {@code prepareAsync()} 是异步的、要几百毫秒到几秒。
+     *
+     * <p>于是 Play 到达时十有八九还在准备中。这时候如果按「有 URL 就
+     * {@code startInternal()}」处理，就会把<b>正在准备的那个 MediaPlayer 释放掉重建</b> ——
+     * 两条指令互相拆台，谁先谁后全看 prepare 的快慢。
+     * 用户看到的就是「有时候投得上、有时候投不上」。
+     *
+     * <p>而 {@code onPrepared} 回调里本来就会 {@code start()}，
+     * 所以「准备中」的正确处置是<b>什么都不做</b>，让这一次准备自己走完。
+     *
+     * @param prepared 是否已经就绪
+     * @param preparing 是否正在 prepare（prepareAsync 已发、回调未到）
+     * @param hasUrl 当前是否有片源地址
+     * @return {@link #PLAY_START} / {@link #PLAY_PREPARE} / {@link #PLAY_WAIT} / {@link #PLAY_NONE}
+     */
+    public static int playAction(boolean prepared, boolean preparing, boolean hasUrl) {
+        if (prepared) {
+            return PLAY_START;
+        }
+        if (preparing) {
+            return PLAY_WAIT;
+        }
+        return hasUrl ? PLAY_PREPARE : PLAY_NONE;
+    }
+
+    // ------------------------------------------------------- Seek 的"待决"判定
+
+    /**
+     * seek 落地的判定容差。
+     *
+     * <p>{@code MediaPlayer.seekTo()} 是**异步**的：调用返回时位置还没变，
+     * 而老芯片上 seek 到未缓冲的位置要几百毫秒到几秒。这期间
+     * {@code getCurrentPosition()} 返回的还是<b>旧位置</b> ——
+     * 手机轮询 {@code GetPositionInfo} 拿到旧值，进度条会被拉回去。
+     *
+     * <p>所以这段时间对外报「目标位置」。什么时候算落地？真实位置追到目标附近即可。
+     * 留 2 秒容差：seek 的落点本来就有精度误差，控制点按百分比算目标也有取整误差。
+     */
+    public static final long SEEK_SETTLE_TOLERANCE_MS = 2000L;
+
+    /**
+     * seek 待决的最长时限。
+     *
+     * <p>兜底用：万一这次 seek 永远落不了地（流本身有问题、目标点不可达），
+     * 不能一直对外报乐观值 —— 那是**谎报军情**。超时后老老实实报真实位置，
+     * 让控制点和用户看到"它确实没动"。
+     */
+    public static final long SEEK_PENDING_TIMEOUT_MS = 15000L;
+
+    /** 真实位置是否已经追到目标附近 —— 到了就说明这次 seek 落地了 */
+    public static boolean isSeekSettled(int rawPositionMs, long targetMs) {
+        // 转成 long 再减：int 溢出会让差值翻号，settled 判定跟着反掉
+        return Math.abs((long) rawPositionMs - targetMs) <= SEEK_SETTLE_TOLERANCE_MS;
+    }
+
+    /** seek 待决是否已超时（超时就放弃乐观值，报真实的） */
+    public static boolean isSeekExpired(long elapsedSinceSeekMs) {
+        return elapsedSinceSeekMs > SEEK_PENDING_TIMEOUT_MS;
+    }
 }

@@ -66,11 +66,46 @@ public class MediaPlayerController {
 
     private String currentUrl;
     private boolean prepared;
+
+    /**
+     * 是否正在 prepare（{@code prepareAsync} 已发出、回调还没到）。
+     *
+     * <p><b>必须和 {@link #prepared} 分开</b>：这两者的正确处置完全相反。
+     * {@code prepared} → 直接 {@code start()}；
+     * {@code preparing} → 什么都不做，等 onPrepared 自己 {@code start()}。
+     *
+     * <p>合成一个布尔值就区分不出「准备中」和「还没开始」，于是 prepare 期间的
+     * Play 会把正在准备的实例掐掉重建 —— 见 {@link #resume} 里的详细说明。
+     */
+    private boolean preparing;
+
     private boolean userPaused;
     private int retryCount;
     private int stallCount;
     private long lastPosition = -1L;
     private long lastProgressAt;
+
+    /**
+     * 已下发但还没落地的 seek 目标（毫秒）；-1 表示当前没有待决的 seek。
+     *
+     * <p>它一次解决三件事，三者都指向同一个用户现象「拖完进度条两边不同步」：
+     * <ol>
+     *   <li><b>未 prepare 时的 seek 不丢</b>：投屏刚起来就拖进度条时，
+     *       prepareAsync 还没回来，此时 seekTo 是无效的。暂存下来，
+     *       onPrepared 之后补发 —— 否则电视一动不动，手机却显示已经拖过去了。</li>
+     *   <li><b>落地前报目标值</b>：{@code seekTo()} 是异步的，位置在真正落地前
+     *       读到的还是旧值。这期间对外报目标位置，手机轮询到的就和它自己显示的一致。</li>
+     *   <li><b>看门狗不误杀</b>：seek 未落地时位置本来就不动，不豁免的话
+     *       会被判成「卡死」并触发重连 —— 而重连把播放拉回开头。</li>
+     * </ol>
+     *
+     * <p>{@code volatile}：seekTo 在主线程（Play 指令线程），
+     * getPosition 在 HTTP 连接线程，两个线程都要看得到。
+     */
+    private volatile long pendingSeekMs = -1L;
+
+    /** 下发这次 seek 的时刻，用于超时兜底（见 {@link PlaybackPolicy#isSeekExpired}） */
+    private volatile long pendingSeekAtMs;
 
     /**
      * 当前音量，0.0 ~ 1.0。
@@ -136,6 +171,9 @@ public class MediaPlayerController {
         retryCount = 0;
         stallCount = 0;
         userPaused = false;
+        // 换了片源，上一次的 seek 目标立刻作废 ——
+        // 不清的话，新片子的「当前位置」会先报成上一部片子拖到的进度。
+        pendingSeekMs = -1L;
         startInternal();
     }
 
@@ -158,6 +196,9 @@ public class MediaPlayerController {
                 @Override
                 public void onPrepared(MediaPlayer mp) {
                     prepared = true;
+                    // 准备完成 —— 复位。不复位的话播放器会永远停在"准备中"，
+                    // 之后每一个 Play 都会被 playAction 判成 PLAY_WAIT 而吞掉。
+                    preparing = false;
                     // 这里只清「错误重连」计数。
                     // 卡死计数**绝对不能**在这儿清 —— 见下方 checkStall 里的说明：
                     // 「能 prepare 但立刻卡死」的流每一轮都会走到这个回调，
@@ -166,6 +207,20 @@ public class MediaPlayerController {
                     lastPosition = -1L;
                     lastProgressAt = System.currentTimeMillis();
                     hasVideo = detectVideo(mp);
+
+                    // prepare 期间攒下的 seek 到这里补发。
+                    // 不补的话，投屏刚起来（画面还没出来）时拖的进度条会被
+                    // 永久丢弃 —— 手机显示已经拖过去了，电视一动不动。
+                    if (pendingSeekMs >= 0) {
+                        try {
+                            mp.seekTo((int) pendingSeekMs);
+                            pendingSeekAtMs = System.currentTimeMillis();
+                            Log.i(TAG, "prepare 完成，补发暂存的 seek " + pendingSeekMs + "ms");
+                        } catch (Exception e) {
+                            Log.w(TAG, "补发 seek 失败", e);
+                        }
+                    }
+
                     mp.start();
                     notifyState("PLAYING");
                     if (listener != null) {
@@ -187,6 +242,9 @@ public class MediaPlayerController {
                 public boolean onError(MediaPlayer mp, int what, int extra) {
                     // 返回 true 表示「已处理」，避免系统弹出错误对话框
                     Log.w(TAG, "播放错误 what=" + what + " extra=" + extra + " url=" + currentUrl);
+                    // prepare 失败也要复位，否则重连之后 Play 会被误判成
+                    // "准备中"而永远不生效 —— 表现是投不上去，而且点播放键没反应。
+                    preparing = false;
                     if (listener != null) {
                         listener.onError("播放错误 what=" + what + " extra=" + extra);
                     }
@@ -195,10 +253,17 @@ public class MediaPlayerController {
                 }
             });
 
+            // 置位必须在 prepareAsync **之前**。onPrepared 是异步回调，
+            // 放在后面虽然大概率也来得及，但那是在赌时序 —— 而这条路径
+            // 本来就只在"prepare 快慢"这个边界上出问题，赌不起。
+            preparing = true;
             player.prepareAsync();
             notifyState("PREPARING");
         } catch (Exception e) {
             Log.e(TAG, "启动播放失败", e);
+            // 起播就失败：复位准备状态，否则后面所有 Play 都会被当成
+            // "准备中"吞掉 —— 表现是投不上去，而且点播放键也没任何反应。
+            preparing = false;
             if (listener != null) {
                 listener.onError("启动失败: " + e.getMessage());
             }
@@ -264,6 +329,12 @@ public class MediaPlayerController {
         if (player == null || !prepared || userPaused) {
             return;
         }
+        // seek 待决期间位置本来就不会动 —— 那是 seek 还没落地，不是卡死。
+        // 不豁免的话，一次慢 seek（老芯片上要好几秒）会被判成卡死并触发重连，
+        // 而重连会把播放拉回开头。用户看到的就是"拖了一下，电视跳回去了"。
+        if (pendingSeekMs >= 0) {
+            return;
+        }
         try {
             if (!player.isPlaying()) {
                 return;
@@ -326,7 +397,9 @@ public class MediaPlayerController {
 
     public synchronized void resume() {
         userPaused = false;
-        if (player != null && prepared) {
+        int action = PlaybackPolicy.playAction(player != null && prepared, preparing,
+                currentUrl != null);
+        if (action == PlaybackPolicy.PLAY_START) {
             try {
                 player.start();
                 lastProgressAt = System.currentTimeMillis();
@@ -334,7 +407,20 @@ public class MediaPlayerController {
             } catch (Exception e) {
                 Log.w(TAG, "resume 失败", e);
             }
-        } else if (currentUrl != null) {
+        } else if (action == PlaybackPolicy.PLAY_WAIT) {
+            // 正在 prepare —— **什么都不做**。
+            //
+            // 这里原来是「有 URL 就 startInternal()」，而 startInternal() 第一句是
+            // releasePlayer()。于是 Play 一到就把正在 prepare 的那个实例释放重建。
+            //
+            // 控制点（腾讯视频 / B站 这类）是把 SetAVTransportURI 和 Play 连着发的，
+            // 间隔只有几十毫秒，而 prepare 要几百毫秒以上 —— 几乎必然撞上。
+            // 两条指令互相拆台，谁先谁后全看 prepare 快慢，所以表现成
+            // 「有时候投得上、有时候投不上」。
+            //
+            // 而 onPrepared 回调里本来就会 start()，Play 的意图已经被满足了。
+            Log.i(TAG, "Play 到达时仍在 prepare，已并入本次准备（不重建播放器）");
+        } else if (action == PlaybackPolicy.PLAY_PREPARE) {
             startInternal();
         }
     }
@@ -345,24 +431,63 @@ public class MediaPlayerController {
         stallCount = 0;
         cancelPendingRetry();
         handler.removeCallbacks(watchdog);
+        // 停了就没有"待决的 seek"可言。不清的话，下一次播放的当前位置
+        // 会先报成上一次拖到的那个位置。
+        pendingSeekMs = -1L;
         releasePlayer();
         notifyState("STOPPED");
     }
 
     public synchronized void seekTo(int ms) {
+        if (ms < 0) {
+            return;
+        }
+        // 无论能不能立刻下发，都先记下来 —— 这个目标值有三重作用，
+        // 见字段 pendingSeekMs 的注释。核心是：控制点拖了进度条之后，
+        // 它下次轮询必须看到"已经到那了"，否则就是不同步。
+        pendingSeekMs = ms;
+        pendingSeekAtMs = System.currentTimeMillis();
+
         if (player != null && prepared) {
             try {
                 player.seekTo(ms);
-                lastProgressAt = System.currentTimeMillis();
+                lastProgressAt = pendingSeekAtMs;
             } catch (Exception e) {
                 Log.w(TAG, "seek 失败", e);
             }
+        } else {
+            // 还没 prepare：暂存，等 onPrepared 之后补发。
+            //
+            // 原来这里是**直接丢弃** —— 用户在投屏刚起来（画面还没出来）时
+            // 拖一下进度条，电视端一动不动，而手机端显示已经拖过去了。
+            // 这是"拖拽不同步"的形态之一，而且它跟 seek 本身能不能用无关。
+            Log.i(TAG, "seek 请求早于 prepare，已暂存 " + ms + "ms");
         }
     }
 
     public int getPosition() {
         try {
-            return (player != null && prepared) ? player.getCurrentPosition() : 0;
+            if (player == null || !prepared) {
+                return 0;
+            }
+            int raw = player.getCurrentPosition();
+            long pending = pendingSeekMs;
+            if (pending < 0) {
+                return raw;
+            }
+            // seek 还没落地：位置读到的还是旧值，直接报出去会让控制点的
+            // 进度条被**拉回去**。这期间报目标位置 —— 控制点自己也是按
+            // "用户拖到哪"来算的，两边一致，用户看到的就是"同步"。
+            long elapsed = System.currentTimeMillis() - pendingSeekAtMs;
+            if (PlaybackPolicy.isSeekSettled(raw, pending)
+                    || PlaybackPolicy.isSeekExpired(elapsed)) {
+                // 落地了（真实位置追上来了）或超时了 → 交回真实位置。
+                // 超时这条是诚实兜底：万一这次 seek 永远落不了地，
+                // 不能一直报乐观值 —— 那是谎报军情。
+                pendingSeekMs = -1L;
+                return raw;
+            }
+            return (int) pending;
         } catch (Exception e) {
             return 0;
         }
@@ -427,6 +552,11 @@ public class MediaPlayerController {
 
     private void releasePlayer() {
         prepared = false;
+        // 实例都没了，"准备中"和"待决的 seek"也就失去了载体。
+        // 不清的话，下一次播放的「当前位置」会一直报上一次拖到的那个位置 ——
+        // 控制点看到的进度条是上一部片子的。
+        preparing = false;
+        pendingSeekMs = -1L;
         if (player != null) {
             try {
                 player.reset();

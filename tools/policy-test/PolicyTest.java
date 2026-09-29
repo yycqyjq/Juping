@@ -125,6 +125,77 @@ public class PolicyTest {
                 !PlaybackPolicy.shouldStopRetryingStalls(c),
                 "累计卡死 " + c + " 次，但中间恢复过，按「连续」定义不该停手");
 
+        System.out.println("\n── 7. Play 到达时的处置决策（「重投失败」的正解）──");
+        System.out.println("   控制点是把 SetAVTransportURI 和 Play 连着发的，间隔几十毫秒，");
+        System.out.println("   而 prepareAsync 要几百毫秒以上 —— Play 到达时几乎必然还在准备中。");
+
+        check("已就绪 → 直接 start",
+                PlaybackPolicy.playAction(true, false, true) == PlaybackPolicy.PLAY_START,
+                "prepared=true");
+        check("【关键】准备中 → 什么都不做（绝不重建播放器）",
+                PlaybackPolicy.playAction(false, true, true) == PlaybackPolicy.PLAY_WAIT,
+                "旧实现这里会 startInternal() → releasePlayer()，把正在 prepare 的"
+                + "实例掐掉重建 —— 两条指令互相拆台，表现为「有时候投不上去」");
+        check("还没开始、但已有地址 → 该重新 prepare",
+                PlaybackPolicy.playAction(false, false, true) == PlaybackPolicy.PLAY_PREPARE,
+                "prepared=false, preparing=false, hasUrl=true");
+        check("没地址也没在准备 → 什么都不做",
+                PlaybackPolicy.playAction(false, false, false) == PlaybackPolicy.PLAY_NONE,
+                "prepared=false, preparing=false, hasUrl=false");
+
+        check("prepared 与 preparing 同时为真时，按「已就绪」处理",
+                PlaybackPolicy.playAction(true, true, true) == PlaybackPolicy.PLAY_START,
+                "理论上不该同时为真；真出现了也绝不能去重建");
+        check("已就绪时，有没有地址都不重建",
+                PlaybackPolicy.playAction(true, false, false) == PlaybackPolicy.PLAY_START,
+                "地址可能刚被 stop() 清掉，但播放器还在 —— 直接 start 即可");
+        check("准备中时，没有地址也不重建",
+                PlaybackPolicy.playAction(false, true, false) == PlaybackPolicy.PLAY_WAIT,
+                "准备中的实例不能动，这是唯一的处置");
+        check("preparing 优先于「重新 prepare」",
+                PlaybackPolicy.playAction(false, true, true) == PlaybackPolicy.PLAY_WAIT,
+                "这一格就是重投失败的核心：有地址 + 准备中 ≠ 该重建");
+
+        System.out.println("\n── 8. Seek「待决」的收敛判定（「拖拽不同步」的正解）──");
+
+        check("真实位置 = 目标 → 已落地",
+                PlaybackPolicy.isSeekSettled(630500, 630500L), "raw=630500 target=630500");
+        check("差 1999ms → 容差内，算落地",
+                PlaybackPolicy.isSeekSettled(630500 - 1999, 630500L), "差 1999ms");
+        check("差 2000ms → 恰好边界，算落地",
+                PlaybackPolicy.isSeekSettled(630500 - 2000, 630500L), "差 2000ms");
+        check("差 2001ms → 超出容差，仍在待决",
+                !PlaybackPolicy.isSeekSettled(630500 - 2001, 630500L), "差 2001ms");
+        check("冲过目标但仍在容差内 → 算落地",
+                PlaybackPolicy.isSeekSettled(630500 + 1500, 630500L), "差 +1500ms");
+        check("位置还停在旧值 → 待决中（这正是要报乐观值的时刻）",
+                !PlaybackPolicy.isSeekSettled(120000, 630500L),
+                "seek 刚落地的瞬间就是这个状态：位置读到的还是旧的。"
+                + "此时若直接报 raw，手机上的进度条会被拉回去");
+
+        check("待决 14999ms → 还没超时",
+                !PlaybackPolicy.isSeekExpired(14999L), "elapsed=14999");
+        check("待决 15000ms → 恰好边界，还没超时（判定用严格大于）",
+                !PlaybackPolicy.isSeekExpired(15000L), "elapsed=15000");
+        check("待决 15001ms → 超时，交回真实位置",
+                PlaybackPolicy.isSeekExpired(15001L),
+                "超时后不能继续报乐观值 —— 那是谎报军情");
+
+        System.out.println("\n── 9. 反向验证：旧逻辑在「准备中」时确实会重建 ──");
+        System.out.println("   下面这组用旧实现的等价函数做对照。两条结论相反，");
+        System.out.println("   才说明上面的断言真的能区分新旧 —— 否则它可能是个恒真断言。");
+
+        check("【反向验证】旧逻辑（只看有没有地址）在「准备中 + 有地址」时会重建",
+                oldResumeWouldRebuild(false, true),
+                "旧代码：if (prepared) start(); else if (currentUrl != null) startInternal();");
+        check("【反向验证】新逻辑在同样输入下不重建（两者结论相反）",
+                PlaybackPolicy.playAction(false, true, true) != PlaybackPolicy.PLAY_PREPARE,
+                "新逻辑给的是 PLAY_WAIT。新旧不同 → 这条断言能区分对错，不是恒真");
+        check("【反向验证】旧逻辑在「没准备 + 有地址」时也重建（这一格两者一致）",
+                oldResumeWouldRebuild(false, true)
+                        && PlaybackPolicy.playAction(false, false, true) == PlaybackPolicy.PLAY_PREPARE,
+                "真的什么都没开始时，重建才是对的 —— 修的是「准备中」那一格，别误伤这一格");
+
         System.out.println();
         System.out.println("=".repeat(62));
         System.out.println("播放策略：" + passed + " / " + total + " 通过");
@@ -134,6 +205,24 @@ public class PolicyTest {
         }
         System.out.println("=".repeat(62));
         System.exit(passed == total ? 0 : 1);
+    }
+
+    /**
+     * 旧实现（修之前）的 resume 决策，**仅用于反向验证**。
+     *
+     * <p>旧代码是：
+     * <pre>if (player != null &amp;&amp; prepared) { player.start(); }
+     * else if (currentUrl != null) { startInternal(); }</pre>
+     * 它只看「有没有地址」，完全不知道「正在准备」这回事 ——
+     * 于是 Play 一到就把正在 prepare 的实例 release 掉重建。
+     *
+     * <p>留着它是为了让「新逻辑不重建」那条断言**能红**：
+     * 只有旧逻辑确实会重建、新旧结论确实相反，断言才有证伪力。
+     *
+     * @return true 表示旧逻辑会重建播放器
+     */
+    static boolean oldResumeWouldRebuild(boolean prepared, boolean hasUrl) {
+        return !prepared && hasUrl;
     }
 
     /**

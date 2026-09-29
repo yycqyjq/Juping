@@ -16,6 +16,7 @@
 
     <string name="state_starting">启动中…</string>
     <string name="state_waiting">等待投屏</string>
+    <string name="state_service_down">服务未就绪</string>
     <string name="state_playing">正在播放</string>
     <string name="state_paused">已暂停</string>
 

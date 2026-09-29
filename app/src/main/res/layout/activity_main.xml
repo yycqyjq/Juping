@@ -311,7 +311,12 @@
         android:paddingBottom="14dp"
         android:visibility="gone">
 
+        <!-- 这个点必须能被代码改颜色。原来是写死的 dot_online（绿），
+             而顶部条现在只在「暂停 / 出错 / 缓冲」时出现 —— 出错时
+             左边亮着一个绿点、右边写着「出错：…」，自己跟自己打架。
+             面板上那个点早就改成说实话了，这里当时漏了。 -->
         <View
+            android:id="@+id/overlay_dot"
             android:layout_width="10dp"
             android:layout_height="10dp"
             android:layout_gravity="center_vertical"
