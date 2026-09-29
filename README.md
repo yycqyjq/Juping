@@ -57,6 +57,7 @@ Juping/
 │   │   │   ├── SsdpResponder.java   组播监听 + 设备回应
 │   │   │   └── UpnpHttpServer.java  HTTP 服务 + SOAP 控制解析
 │   │   └── player/
+│   │       ├── PlaybackPolicy.java         重连策略：纯逻辑，零 Android 依赖
 │   │       └── MediaPlayerController.java  播放 + 看门狗 + 指数退避重连
 │   └── res/                         布局、配色、字符串、图标、banner
 └── tools/
@@ -66,11 +67,14 @@ Juping/
     ├── probe-tv.sh           adb 探测盒子真实硬件信息
     ├── apk_info.py           解析 APK 的包名 / minSdk
     ├── check_sources.py      无 JDK 环境下的源码结构检查
-    └── protocol-test/        DLNA 协议层端到端测试（桌面 JVM，不需要真机）
-        ├── run.sh            编译 → 起服务 → 驱动 → 收尾
-        ├── drive.py          85 项一致性检查（原始 socket 精确控字节）
-        ├── ProtocolTestServer.java  在桌面跑真实的 UpnpHttpServer
-        └── android/util/Log.java    android.util.Log 的桌面替身
+    ├── protocol-test/        DLNA 协议层端到端测试（桌面 JVM，不需要真机）
+    │   ├── run.sh            编译 → 起服务 → 驱动 → 收尾
+    │   ├── drive.py          85 项一致性检查（原始 socket 精确控字节）
+    │   ├── ProtocolTestServer.java  在桌面跑真实的 UpnpHttpServer + SsdpResponder
+    │   └── android/util/Log.java    android.util.Log 的桌面替身
+    └── policy-test/          播放重连策略测试（纯逻辑，不需要真机）
+        ├── run.sh            编译 + 断言 + 源码不变量守卫
+        └── PolicyTest.java   26 项断言 + 「卡死→重连→又卡死」循环模拟
 ```
 
 ---
@@ -86,21 +90,23 @@ Juping/
 ./tools/build.sh lint         # 跑 lint（API 兼容性检查）
 ./tools/build.sh checkapi     # 逐个核验平台 API 引用是否在目标版本里存在
 ./tools/build.sh protocol     # 跑 DLNA 协议层一致性测试（不需要真机）
+./tools/build.sh policy       # 跑播放重连策略测试（纯逻辑，不需要真机）
 ./tools/build.sh clean
 ```
 
 产物：
 
 ```
-dist/juping-0.1.0-release.apk   ← 装机用这个（44K，已签名）
+dist/juping-0.1.0-release.apk   ← 装机用这个（47K，已签名）
 dist/juping-0.1.0-debug.apk     ← 排障用（74K，带 debuggable 标记）
 ```
 
-`dist` 目标会在归集后**自动跑三项核验**，任何一项不过就报错退出 —— 免得把一个装不上的包交出去：
+`dist` 目标会在归集后**自动跑四道闸**，任何一道不过就报错退出 —— 免得把一个装不上的、投不进来的、或者断联后恢复不了的包交出去：
 
 1. **签名**：以 API 15 为目标验证（`apksigner verify --min-sdk-version 15`）
 2. **API 兼容性**：逐个核对 dex 里引用的每个平台成员在目标版本里是否真的存在
 3. **协议层**：把真实的 UPnP 服务编到桌面 JVM 上，发真实 DLNA 报文核对响应
+4. **播放策略**：退避表 / 卡死阈值 / 熔断边界 + 「卡死→重连→又卡死」循环模拟
 
 如果工具链已在 PATH 里，也可以直接用 wrapper：
 
@@ -189,6 +195,7 @@ adb install -r dist/juping-0.1.0-release.apk
 | **看门狗** | 播放卡死不动 —— 点播 20s、直播 60s 两档阈值 |
 | **指数退避重连** | 1s → 2s → 4s → 8s → 16s，最多 5 次 |
 | **卡死熔断** | 连续卡死 3 次就停手，避免无限重连反而打断播放 |
+| **旧重连可取消** | 换新视频时掐掉上一个视频排期的重连，免得把新画面顶掉 |
 
 看门狗为什么要两档阈值：点播流的 `getDuration()` 有值，位置 20 秒不动就是真卡了；而 HLS 直播的位置可能长时间不增长甚至恒为 0，用 20 秒判会把正常播放误杀成卡死。
 
@@ -205,7 +212,7 @@ adb install -r dist/juping-0.1.0-release.apk
 | `MediaCodec` | API 16 才有 —— 本项目全程不碰它 |
 | AndroidX 任何组件 | 普遍要求 minSdk 19+ → 直接编译不过 |
 
-### 三道独立的验证
+### 四道独立的验证
 
 光靠编译过是不够的 —— 对着新版 android.jar 编译，调用新 API 完全不会报错。
 
@@ -300,6 +307,74 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 > **反向验证**：把 `ST` 改回写死的旧写法，10 条断言立刻变红。
 > 一个只会说"通过"的测试是没有价值的。
 
+**第四道：播放重连策略**
+
+「不断联」是这个项目对用户的核心承诺，而它的实现全在几个数字上：
+退避多久、卡死多久算卡死、什么时候该放弃。这些逻辑原本埋在
+`MediaPlayerController` 里 —— 那个类要 `android.media.MediaPlayer` 和
+`android.view.Surface`，在桌面上跑不起来，于是**零验证**。
+
+现在抽成了 `PlaybackPolicy`：一段纯粹的 Java，零 Android 依赖，
+可以直接编译、跑断言，甚至把「反复卡死」这种在真机上要几分钟才走一轮的场景
+在毫秒内模拟完。
+
+```bash
+./tools/build.sh policy
+```
+
+```
+播放策略：26 / 26 通过
+```
+
+> **抓出的 bug：熔断机制形同虚设。**
+>
+> 代码注释写着「连续卡死 3 次就停手，避免无限重连反而打断播放」——
+> 但 `onPrepared` 里有 `stallCount = 0`。于是：
+>
+> ```
+> 卡死 → 计数 1 → 重连 → prepare 成功 → 计数清零 → 又卡死 → 计数 1 → 重连 → …
+> ```
+>
+> **计数永远到不了 3，熔断永不触发 → 无限重连。承诺和实现正好相反。**
+>
+> 而这条流是真实存在的：URL 合法、能拉到元数据，但 CDN 限速 / 分段缺失 /
+> 码率超出 MT5880 能力，画面就是不动。每一轮重连都会打断一次刚恢复的播放，
+> 用户体验比直接报错更差。
+>
+> 修法：卡死计数**只在播放有实际进展（位置真的前进了）时归零**。
+>
+> 测试里直接把这个循环跑了一遍：
+> ```
+> [PASS] 修好之后：会在有限次重连后停手      重连了 3 次后停手
+> [PASS] 【反向验证】旧写法 → 确认它无限重连  旧写法在 5000 轮内没有停手
+> ```
+>
+> 另外还发现一处**文档撒谎**：注释里写着「分辨率降级」是稳定性设计之一，
+> 但代码里一行都没有 —— 而且 DLNA 推的是手机指定的那个 URL，
+> 协议层面就换不了码率，这一条根本做不到。已删除该承诺。
+
+**为什么要额外加一道「源码级不变量守卫」**
+
+上面那个 bug，光靠单元测试**挡不住**回归。实测：把 `stallCount = 0`
+挪回 `onPrepared`，`PlaybackPolicy` 本身没变，所以 **26 条断言依然全绿** ——
+熔断却整体失效了。
+
+所以 `run.sh` 里额外做了一层源码检查，把不变量钉在代码结构上：
+
+```
+[PASS] onPrepared 里不出现 stallCount（否则熔断失效）
+[PASS] stallCount 清零点只落在 play / stop / checkStall
+[PASS] stallCount 清零点不在 onPrepared 里（熔断的命门）
+[PASS] 注释里没有未实现的「分辨率降级」承诺
+[PASS] pendingRetry 被持有并可取消
+[PASS] 块注释定界符配平（/* 与 */ 数量一致）
+```
+
+> 最后一条是踩出来的：一次编辑漏掉了类注释的 `*/`，整个类被注释吞掉，
+> 报错指向「第一个字段声明处」，而真实原因在几十行之前。
+> 现在 `run.sh` 还会拿 `android.jar` 把 `MediaPlayerController`
+> **单独编译一遍**做快速语法检查 —— 这类错误几秒钟就挡住了，不必等 gradle。
+
 ---
 
 ## 已知边界
@@ -307,8 +382,9 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 - **乐联（LeLink）协议不支持**。B站、抖音、部分腾讯视频走的是乐播的私有闭源协议，开源界没有实现，无法对接。能收的是标准 DLNA / UPnP 推送。
 - **AirPlay 未实现**。iOS 侧目前只能用支持 DLNA 的 App 投。要做 AirPlay 接收需要移植 UxPlay（C/C++，GPLv3），是独立的一大块工作。
 - **镜像（Miracast）不做**。老盒子 Wi-Fi Direct 驱动不稳，正是断联根因，不值得修。
-- **从未在真机上运行过**。已通过六项静态核验（编译 / lint `NewApi` 零命中 /
-  API 引用 180 项全命中 / DEX 版本 035 / 签名在 API 15 上有效 / DLNA 协议 85 项通过），
+- **从未在真机上运行过**。已通过七项静态核验（编译 / lint `NewApi` 零命中 /
+  API 引用 180 项全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
+  DLNA 协议 85 项通过 / 播放策略 26 项通过），
   但真机上的组播收发、MediaPlayer 硬解、断联恢复都还没实测。
 
 ---

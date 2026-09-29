@@ -12,6 +12,7 @@
 #   ./tools/build.sh lint         # 跑 lint（API 兼容性检查）
 #   ./tools/build.sh checkapi     # 逐个核验平台 API 引用是否在目标版本里存在
 #   ./tools/build.sh protocol     # 跑 DLNA 协议层一致性测试（桌面 JVM，不需要真机）
+#   ./tools/build.sh policy       # 跑播放重连策略测试（纯逻辑 + 源码不变量守卫）
 #   ./tools/build.sh clean        # 清理构建产物
 #
 # 产物：
@@ -134,9 +135,34 @@ verify_protocol() {
     rm -f "$out"; return 1
 }
 
+# 播放策略核验：退避表、卡死阈值、熔断边界，以及「卡死→重连→又卡死」
+# 这个循环到底会不会停。这些是「不断联」承诺的实现，但埋在要 MediaPlayer 的类里
+# 就没法验证 —— 所以抽成了 PlaybackPolicy（纯逻辑，零 Android 依赖）。
+# 另外附一道源码级不变量守卫：单元测试挡不住「有人把 stallCount 清零挪回
+# onPrepared」这种回归（策略函数本身会全绿，但熔断整体失效）。
+verify_policy() {
+    if [ ! -x tools/policy-test/run.sh ]; then
+        echo "  策略: 跳过（没有 tools/policy-test/run.sh）"
+        return 0
+    fi
+    local out
+    out="$(mktemp)"
+    if tools/policy-test/run.sh >"$out" 2>&1; then
+        echo "  策略: $(grep -oE '播放策略：.*' "$out" | head -1)"
+        rm -f "$out"; return 0
+    fi
+    echo "  !! 播放策略核验未通过 —— 断联后可能不会恢复，或无限重连：" >&2
+    tail -60 "$out" >&2
+    rm -f "$out"; return 1
+}
+
 case "${1:-debug}" in
     protocol)
         verify_protocol
+        ;;
+
+    policy)
+        verify_policy
         ;;
 
     clean)
@@ -212,6 +238,9 @@ PY
         done
         echo "=== 协议层（与芯片/系统版本无关，只需核一次）==="
         verify_protocol
+        echo
+        echo "=== 播放策略（同上，纯逻辑，不需要真机）==="
+        verify_policy
         echo
         echo "装机："
         echo "  $ANDROID_HOME/platform-tools/adb install -r dist/juping-$VER-release.apk"

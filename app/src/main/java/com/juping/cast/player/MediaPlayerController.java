@@ -19,32 +19,29 @@ import android.view.Surface;
  * <ol>
  *   <li><b>错误自动重连</b>：onError 返回 true 吞掉异常，按指数退避重建 MediaPlayer。
  *       注意必须 reset() 后重新 setDataSource，直接 start() 是无效的。</li>
- *   <li><b>看门狗</b>：卡住不动超过阈值（position 长时间不变且未暂停）就主动重连。</li>
- *   <li><b>分辨率降级</b>：老芯片解 1080p 会掉帧甚至黑屏，探测失败后回退重试。</li>
+ *   <li><b>看门狗</b>：卡住不动超过阈值（position 长时间不变且未暂停）就主动重连。
+ *       点播与直播用两档阈值 —— 直播的位置可能长时间不增长甚至恒为 0，
+ *       用点播阈值会把正常播放误杀成卡死。</li>
+ *   <li><b>卡死熔断</b>：连续卡死到上限就停手。重连不一定能救回本身有问题的流
+ *       （CDN 限速、分段缺失、码率超出老芯片能力），而每一轮重连都会打断一次
+ *       刚恢复的播放 —— 体验比直接报错更差。</li>
  *   <li><b>Surface 重建</b>：SurfaceView 被销毁重建时必须重新 setSurface，
  *       否则画面会黑但声音正常 —— 这个现象在老设备上非常常见。</li>
  * </ol>
+ *
+ * <p><b>明确没有做的</b>：分辨率降级。这里曾经写过这么一条，但代码里从来没有实现 ——
+ * 而 DLNA 推过来的是<b>手机指定的那个 URL</b>，我们无法换成低码率地址，
+ * 所以它在协议层面就做不到。注释里的假承诺比不写更糟，故删掉。
+ *
+ * <p>所有阈值与退避参数见 {@link PlaybackPolicy} —— 那边是纯逻辑，可在桌面上跑断言。
  */
 public class MediaPlayerController {
 
     private static final String TAG = "MediaPlayerController";
 
-    /** 看门狗轮询间隔 */
-    private static final long WATCHDOG_INTERVAL_MS = 5000L;
-    /** 点播流（时长已知）的卡死判定阈值：位置超过这么久没变就认定卡死 */
-    private static final long STALL_THRESHOLD_VOD_MS = 20000L;
-    /**
-     * 直播流 / 时长未知流的卡死判定阈值。
-     *
-     * <p>HLS 直播和部分分段流上 getCurrentPosition() 可能长时间不增长
-     * （甚至恒为 0）。若沿用点播的 20s 阈值，会把正常播放疯狂误判成卡死，
-     * 反复重连反而把播放打断。所以这里放宽到 60s。
-     */
-    private static final long STALL_THRESHOLD_LIVE_MS = 60000L;
-    /** 错误重连的最大次数，超过后放弃并回调失败 */
-    private static final int MAX_RETRY = 5;
-    /** 连续卡死重连的上限 —— 防止「卡死→重连→又卡死」无限循环 */
-    private static final int MAX_STALL_RETRY = 3;
+    // 阈值 / 退避 / 上限全部收在 PlaybackPolicy 里 —— 那边是纯逻辑、可在桌面上跑断言。
+    // 这里只引用，避免同一套数字散落在两处（改了一处忘了另一处是最难查的那种 bug）。
+    private static final long WATCHDOG_INTERVAL_MS = PlaybackPolicy.WATCHDOG_INTERVAL_MS;
 
     public interface Listener {
         void onStateChanged(String state);
@@ -67,6 +64,15 @@ public class MediaPlayerController {
     private int stallCount;
     private long lastPosition = -1L;
     private long lastProgressAt;
+
+    /**
+     * 已排期但还没执行的那次重连。
+     *
+     * <p>必须持引用才能取消。原来这里是匿名 Runnable 直接 postDelayed，
+     * 谁也拿不到它 —— 于是「换了个视频，却被上一个视频的旧重连打断」
+     * 这类问题就无从处理，表现是投屏偶发闪断。
+     */
+    private Runnable pendingRetry;
 
     private final Runnable watchdog = new Runnable() {
         @Override
@@ -97,6 +103,9 @@ public class MediaPlayerController {
         if (url == null || url.length() == 0) {
             return;
         }
+        // 先掐掉上一次排期的重连：否则它会在一两秒后拿**旧 URL** 再起一次播放，
+        // 把用户刚投上来的新视频顶掉。表现就是"投了新视频，画面跳回上一个"。
+        cancelPendingRetry();
         currentUrl = url;
         retryCount = 0;
         stallCount = 0;
@@ -120,8 +129,11 @@ public class MediaPlayerController {
                 @Override
                 public void onPrepared(MediaPlayer mp) {
                     prepared = true;
+                    // 这里只清「错误重连」计数。
+                    // 卡死计数**绝对不能**在这儿清 —— 见下方 checkStall 里的说明：
+                    // 「能 prepare 但立刻卡死」的流每一轮都会走到这个回调，
+                    // 一清就等于熔断永不触发，变成无限重连。
                     retryCount = 0;
-                    stallCount = 0;
                     lastPosition = -1L;
                     lastProgressAt = System.currentTimeMillis();
                     mp.start();
@@ -174,23 +186,37 @@ public class MediaPlayerController {
         if (currentUrl == null) {
             return;
         }
-        if (retryCount >= MAX_RETRY) {
-            Log.w(TAG, "重连次数已达上限，放弃");
+        long delay = PlaybackPolicy.retryDelayMs(retryCount);
+        if (delay < 0) {
+            Log.w(TAG, "重连次数已达上限（" + PlaybackPolicy.MAX_RETRY + " 次），放弃");
             notifyState("ERROR");
             return;
         }
-        long delay = 1000L << retryCount;   // 1s, 2s, 4s, 8s, 16s
         retryCount++;
+        // 同一时刻只允许有一次待执行的重连。否则 onError 与看门狗同时触发时
+        // 会叠出两个，各自 startInternal() 时把对方刚建的 MediaPlayer 释放掉，
+        // 播放来回闪断 —— 看起来像"网络不好"，其实是自己在打架。
+        cancelPendingRetry();
         Log.i(TAG, "第 " + retryCount + " 次重连，延迟 " + delay + "ms");
         notifyState("RECONNECTING");
-        handler.postDelayed(new Runnable() {
+        pendingRetry = new Runnable() {
             @Override
             public void run() {
+                pendingRetry = null;
                 if (!userPaused && currentUrl != null) {
                     startInternal();
                 }
             }
-        }, delay);
+        };
+        handler.postDelayed(pendingRetry, delay);
+    }
+
+    /** 取消已排期但还没执行的重连 */
+    private void cancelPendingRetry() {
+        if (pendingRetry != null) {
+            handler.removeCallbacks(pendingRetry);
+            pendingRetry = null;
+        }
     }
 
     private void startWatchdog() {
@@ -217,17 +243,22 @@ public class MediaPlayerController {
             if (pos != lastPosition) {
                 lastPosition = pos;
                 lastProgressAt = now;
+                // 位置真的动了，才算"这一轮卡死过去了"，把连续计数归零。
+                // 这里是卡死计数**唯一**该归零的地方 ——
+                // 放在 onPrepared 里会让「能 prepare 但立刻卡死」的流永远清空计数，
+                // 熔断失效、无限重连（PlaybackPolicy 里有详细说明）。
+                stallCount = 0;
                 return;
             }
+
             // 时长已知 → 点播流，用严格阈值；时长未知或为 0 → 直播/分段流，放宽
             int duration = player.getDuration();
-            long threshold = (duration > 0) ? STALL_THRESHOLD_VOD_MS : STALL_THRESHOLD_LIVE_MS;
-            if (now - lastProgressAt <= threshold) {
+            if (!PlaybackPolicy.isStalled(now - lastProgressAt, duration)) {
                 return;
             }
 
             stallCount++;
-            if (stallCount > MAX_STALL_RETRY) {
+            if (PlaybackPolicy.shouldStopRetryingStalls(stallCount)) {
                 Log.w(TAG, "连续卡死 " + stallCount + " 次，停止重连");
                 if (listener != null) {
                     listener.onError("播放持续卡死，已停止重试");
@@ -282,6 +313,7 @@ public class MediaPlayerController {
         userPaused = false;
         currentUrl = null;
         stallCount = 0;
+        cancelPendingRetry();
         handler.removeCallbacks(watchdog);
         releasePlayer();
         notifyState("STOPPED");
@@ -326,6 +358,7 @@ public class MediaPlayerController {
 
     public void release() {
         handler.removeCallbacksAndMessages(null);
+        pendingRetry = null;
         releasePlayer();
     }
 
