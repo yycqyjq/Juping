@@ -16,6 +16,12 @@
 #   ./tools/verify-on-device.sh 192.168.1.100         # 先局域网 adb connect
 #   ./tools/verify-on-device.sh 192.168.1.100 --play 'http://x/y.mp4?a=1&b=2'
 #
+# 可选参数：
+#   --play <URL>        顺带真投一个流（会改变盒子上的播放状态）
+#   --ssdp-port <N>     探测用的 SSDP 端口，默认 1900。
+#                       盒子上应用固定用 1900，一般不用动；它存在的意义是
+#                       让这个脚本自己也能被自测（见 verify-device-selftest.sh）。
+#
 # 前置：盒子已开 USB 调试（Android 4.0 路径：设置 → 开发者选项 → USB 调试）
 #
 # 退出码：0 = 全过；1 = 有失败项；2 = 环境问题（没 adb / 没设备 / 装不上）
@@ -33,10 +39,12 @@ TAG_READY="接收端已就绪"
 
 TARGET=""
 PLAY_URL=""
+SSDP_PORT=1900
 while [ $# -gt 0 ]; do
     case "$1" in
         --play) PLAY_URL="${2:-}"; shift 2 ;;
-        -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --ssdp-port) SSDP_PORT="${2:-1900}"; shift 2 ;;
+        -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) TARGET="$1"; shift ;;
     esac
 done
@@ -167,7 +175,7 @@ echo "  盒子 IP=$BOX_IP  HTTP 端口=$BOX_PORT"
 # ─────────────────────────────────────────── 5. 控制点视角自检
 echo
 echo "── ④ 控制点视角自检（dlna-probe.py）──"
-PROBE_ARGS=("$BOX_IP" --http-port "$BOX_PORT")
+PROBE_ARGS=("$BOX_IP" --http-port "$BOX_PORT" --ssdp-port "$SSDP_PORT")
 [ -n "$PLAY_URL" ] && PROBE_ARGS+=(--play "$PLAY_URL")
 python3 "$HERE/dlna-probe.py" "${PROBE_ARGS[@]}"
 PROBE_RC=$?

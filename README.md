@@ -70,9 +70,10 @@ Juping/
     ├── apk_info.py           解析 APK 的包名 / minSdk
     ├── check_sources.py      无 JDK 环境下的源码结构检查
     ├── protocol-test/        DLNA 协议层端到端测试（桌面 JVM，不需要真机）
-    │   ├── run.sh            编译 → 起服务 → 驱动 → 用同一靶机验证探测脚本
+    │   ├── run.sh            编译 → 起服务 → 驱动 → 验证两个自检脚本
     │   ├── drive.py          95 项一致性检查（原始 socket 精确控字节）
     │   ├── ProtocolTestServer.java  在桌面跑真实的 UpnpHttpServer + SsdpResponder
+    │   ├── verify-device-selftest.sh  用假 adb 验 verify-on-device.sh 的管道
     │   └── android/util/Log.java    android.util.Log 的桌面替身
     └── policy-test/          播放重连策略测试（纯逻辑，不需要真机）
         ├── run.sh            编译 + 断言 + 源码不变量守卫
@@ -338,6 +339,27 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 当作"有媒体"，而 `STOPPED` 同样是"没有内容"的合法状态（本实现 Stop 时会清空
 `CurrentURI`）—— 于是对着一台完全正常的设备报 FAIL。
 改成自洽性判据（`NrTracks` 与 `CurrentURI` 必须同进同退）后才对。
+
+同一个道理适用于 `verify-on-device.sh` —— 它才是真机上唯一要跑的那个脚本。
+所以还有一个 `verify-device-selftest.sh`：造一个**假 adb** 按真实输出格式回放，
+让整条管道（解析参数 → 比 minSdk → 装包 → 起服务 → 从 logcat 抠地址 →
+调 `dlna-probe.py` → 判结论）对着同一个真靶机完整跑一遍：
+
+```
+── 真机验收脚本自测（假 adb + 真靶机）──
+  [PASS] 退出码 0（靶机健康，脚本不该报错）
+  [PASS] 从 logcat 正确抠出 IP 与端口
+  [PASS] minSdk 闸门没误拦，装包走通
+  [PASS] dlna-probe.py 被真的调起
+  [PASS] 打印了「真机验收通过」结论
+  [PASS] 反面对照：API 13 < minSdk 14 时被拦住（退出码 2，且说清了差多少级）
+```
+
+最后一条是**反面对照** —— 不做它，就等于不知道那道 minSdk 闸门到底有没有在工作。
+
+> 这两个自测都做过证伪：把 `dlna-probe.py` 的状态判据改回旧写法、
+> 把 `verify-on-device.sh` 的地址抽取弄坏，各自都会变红并传出非零退出码。
+> **能红才算测过。**
 >
 > **反向验证**：把 `ST` 改回写死的旧写法，10 条断言立刻变红。
 > 一个只会说"通过"的测试是没有价值的。
@@ -417,9 +439,10 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 - **乐联（LeLink）协议不支持**。B站、抖音、部分腾讯视频走的是乐播的私有闭源协议，开源界没有实现，无法对接。能收的是标准 DLNA / UPnP 推送。
 - **AirPlay 未实现**。iOS 侧目前只能用支持 DLNA 的 App 投。要做 AirPlay 接收需要移植 UxPlay（C/C++，GPLv3），是独立的一大块工作。
 - **镜像（Miracast）不做**。老盒子 Wi-Fi Direct 驱动不稳，正是断联根因，不值得修。
-- **从未在真机上运行过**。已通过八项桌面核验（编译 / lint `NewApi` 零命中 /
+- **从未在真机上运行过**。已通过九项桌面核验（编译 / lint `NewApi` 零命中 /
   API 引用 181 项全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
-  DLNA 协议 95 项通过 / 播放策略 26 项通过 / 自检脚本 32 项通过），
+  DLNA 协议 95 项通过 / 播放策略 26 项通过 / 控制点自检脚本 32 项通过 /
+  真机验收脚本管道自测 6 项通过），
   但真机上的组播收发、MediaPlayer 硬解、断联恢复都还没实测 ——
   `./tools/verify-on-device.sh` 已经就绪，插上盒子跑一条命令即可验。
 

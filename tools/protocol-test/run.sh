@@ -120,7 +120,15 @@ else
     RC=1
 fi
 
-# ── 6. 失败时把服务端日志带出来 ──
+# ── 6. 再验一遍「真机验收脚本」自己 ──
+# 同一个道理：verify-on-device.sh 是二夜在盒子上唯一能用的工具，
+# 它坏了会把人引去查根本不存在的 SSDP bug。复用同一个靶机跑一遍管道。
+echo
+if ! "$HERE/verify-device-selftest.sh" "$HTTP_PORT" "$ACTUAL_SSDP_PORT"; then
+    RC=1
+fi
+
+# ── 7. 失败时把服务端日志带出来 ──
 if [ "$RC" -ne 0 ]; then
     echo
     echo "── 服务端日志（最后 40 行）──"
