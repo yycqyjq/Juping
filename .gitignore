@@ -41,3 +41,7 @@ desktop.ini
 *.log
 *.tmp
 *.bak
+
+# Python 字节码缓存（tools/ 下有探测与核验脚本，跑一次就会生成）
+__pycache__/
+*.pyc
