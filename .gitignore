@@ -45,3 +45,6 @@ desktop.ini
 # Python 字节码缓存（tools/ 下有探测与核验脚本，跑一次就会生成）
 __pycache__/
 *.pyc
+
+# 西瓜的本地待办/工作上下文，不进公开仓库
+.agent/
