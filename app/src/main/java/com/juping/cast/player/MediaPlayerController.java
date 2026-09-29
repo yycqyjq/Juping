@@ -187,7 +187,7 @@ public class MediaPlayerController {
         if (url == null || url.length() == 0) {
             return false;
         }
-        // ---- 幂等：控制点把同一个地址又发了一遍 ----
+        // 幂等：控制点把同一个地址又发了一遍。
         //
         // 这不是理论上的边角情况。腾讯视频这类控制点**拖拽进度条时**会重发
         // SetAVTransportURI（同一个 URL）再跟一条 Seek。而 startInternal()
@@ -195,12 +195,10 @@ public class MediaPlayerController {
         //   ① 释放 MediaPlayer → 视频层关闭 → 电视上闪一下蓝屏
         //   ② 重新 prepareAsync → 重新缓冲、位置归零 → 用户看到的"断开重连"
         //
-        // UPnP AVTransport:1 规范写得很明确：SetAVTransportURI 传入与 CurrentURI
-        // **相同**的地址时，设备不应改变传输状态。所以这里直接忽略。
-        //
-        // 判据是「同地址 **且** 播放器还在」：出过错、已经停掉的播放器必须允许
-        // 重建，否则重发同地址就再也救不回来了。
-        if (url.equals(currentUrl) && (prepared || preparing)) {
+        // 判定本身抽到了 PlaybackPolicy.shouldRebuild —— 那边是纯逻辑，
+        // 「同地址 × 各种播放器状态」的组合能在桌面上逐个跑断言，
+        // 而不是只能靠在真机上一遍遍试。
+        if (!PlaybackPolicy.shouldRebuild(url, currentUrl, prepared, preparing)) {
             Log.i(TAG, "收到与当前相同的地址，幂等忽略（不重建播放器）");
             return false;
         }

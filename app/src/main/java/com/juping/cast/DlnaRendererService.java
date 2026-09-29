@@ -302,6 +302,25 @@ public class DlnaRendererService extends Service
         return transportState;
     }
 
+    /**
+     * GetTransportInfo 的 CurrentTransportStatus —— 与事件里的
+     * {@code TransportStatus} 共用同一个判据。
+     *
+     * <p>抽成 {@link #hasTransportError()} 而不是两处各写一遍：
+     * 同一个语义写两份，迟早会有一份忘了跟着改，而"两个接口对同一台设备
+     * 给出相反答案"这种不一致，恰恰是最难排查的一类问题 —— 控制点自己都
+     * 不知道该信哪个。
+     */
+    @Override
+    public String getTransportStatus() {
+        return hasTransportError() ? "ERROR_OCCURRED" : "OK";
+    }
+
+    /** 「当前是否处于出错态」—— 事件与 GetTransportInfo 共用的唯一判据 */
+    private boolean hasTransportError() {
+        return lastError != null && lastError.length() > 0;
+    }
+
     @Override
     public void onSetVolume(int volume0to100) {
         if (player != null) {
@@ -350,8 +369,9 @@ public class DlnaRendererService extends Service
             // 而「状态字段必须反映现在」是这个项目一以贯之的纪律（见 onPrepared 里
             // 清 lastError 的那段说明）。控制点拿到 OK 就不会提示用户，
             // 于是一个正在反复重连的设备在它眼里是"一切正常"。
-            boolean failed = lastError != null && lastError.length() > 0;
-            vars.put("TransportStatus", failed ? "ERROR_OCCURRED" : "OK");
+            // 判据与 GetTransportInfo 的 CurrentTransportStatus 共用，
+            // 见 hasTransportError()。
+            vars.put("TransportStatus", getTransportStatus());
             vars.put("CurrentTrackURI", currentUri == null ? "" : currentUri);
             vars.put("CurrentTrackDuration",
                     UpnpHttpServer.formatTime(getDurationMs()));

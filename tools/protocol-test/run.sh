@@ -25,7 +25,7 @@ JAVAC="$JAVA_HOME/bin/javac"
 JAVA="$JAVA_HOME/bin/java"
 
 if [ ! -x "$JAVAC" ]; then
-    echo "找不到 javac —— 需要 JAVA_HOME 指向 JDK（当前: $JAVA_HOME）" >&2
+    echo "找不到 javac —— 需要 JAVA_HOME 指向 JDK（当前: ${JAVA_HOME}）" >&2
     exit 2
 fi
 
@@ -68,7 +68,7 @@ print(s.getsockname()[1]); s.close()")"
 CALL_LOG="$OUT/calls.log"
 
 # ── 3. 起服务（单条命令内起、用、收）──
-echo "── 启动 UpnpHttpServer（TCP $HTTP_PORT）+ SsdpResponder（UDP $SSDP_PORT）──"
+echo "── 启动 UpnpHttpServer（TCP ${HTTP_PORT}）+ SsdpResponder（UDP ${SSDP_PORT}）──"
 "$JAVA" -Dfile.encoding=UTF-8 -cp "$OUT/classes" ProtocolTestServer \
     "$HTTP_PORT" "$CALL_LOG" "$SSDP_PORT" \
     >"$OUT/server.out" 2>"$OUT/server.err" &

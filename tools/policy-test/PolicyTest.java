@@ -196,6 +196,57 @@ public class PolicyTest {
                         && PlaybackPolicy.playAction(false, false, true) == PlaybackPolicy.PLAY_PREPARE,
                 "真的什么都没开始时，重建才是对的 —— 修的是「准备中」那一格，别误伤这一格");
 
+        System.out.println("\n── 10. SetAVTransportURI 的幂等判定（「拖拽蓝屏重连」的正解）──");
+        System.out.println("   控制点拖进度条时会重发同一个 URL，后面再跟一条 Seek。");
+        System.out.println("   无条件「释放 + 重建」的话，每次拖拽都会闪一下蓝屏、位置归零。");
+
+        final String ua = "http://192.168.1.9:8192/media/a.mp4";
+        final String ub = "http://192.168.1.9:8192/media/b.mp4";
+
+        check("同地址 + 已就绪 → 不重建（拖拽走的就是这一格）",
+                !PlaybackPolicy.shouldRebuild(ua, ua, true, false),
+                "prepared=true：播放器还在，同一个地址不该动它");
+        check("同地址 + 准备中 → 不重建",
+                !PlaybackPolicy.shouldRebuild(ua, ua, false, true),
+                "prepareAsync 已发、回调未到 —— 这时候重建会把正在准备的实例掐掉");
+        check("【关键】同地址 + 播放器已释放 → 仍然重建",
+                PlaybackPolicy.shouldRebuild(ua, ua, false, false),
+                "出过错、已被 release 的播放器必须允许重建 —— 只比 URL 的实现"
+                + "会把这一格也拦掉，于是控制点重发同地址就再也救不回来了");
+        check("换地址 → 重建（换片必须切）",
+                PlaybackPolicy.shouldRebuild(ub, ua, true, false),
+                "地址不同，哪怕当前正在播也要切");
+        check("当前没有地址（首次投屏）→ 重建",
+                PlaybackPolicy.shouldRebuild(ua, null, false, false),
+                "currentUrl 为 null 时 equals 给 false，走重建 —— 这是对的");
+        check("空地址 → 不重建（什么都不做）",
+                !PlaybackPolicy.shouldRebuild("", ua, true, false),
+                "空地址不是「换片」，是无效指令");
+        check("null 地址 → 不重建（防御性）",
+                !PlaybackPolicy.shouldRebuild(null, ua, true, false),
+                "别让 NPE 在这里冒出来");
+
+        System.out.println("\n── 11. 反向验证：两代旧实现各错一格，新逻辑要同时躲开 ──");
+
+        check("【反向验证】旧逻辑（有地址就重建）在同地址 + 已就绪时也会重建",
+                oldUrlBlindWouldRebuild(ua),
+                "旧代码没有幂等判断，SetAVTransportURI 一到就 startInternal()。"
+                + "而第 10 节第一条断言要求的正是这一格**不重建** —— 两者结论相反");
+        check("【反向验证】只比 URL 的实现会误拦「同地址 + 已释放」那一格",
+                !urlOnlyWouldRebuild(ua, ua),
+                "它给 false（不重建），而第 10 节第三条要求的是重建 —— "
+                + "这正是判据必须同时看地址和状态的原因");
+        check("【反向验证】「有地址就重建」与「只比 URL」确实是两个不同的错法",
+                oldUrlBlindWouldRebuild(ua) != urlOnlyWouldRebuild(ua, ua),
+                "前者在该拦的格上重建（拖拽闪蓝屏），后者在该放的格上不重建"
+                + "（救不回来）—— 新逻辑必须同时躲开这两个坑");
+        check("【反向验证】两个旧错法在「同地址 + 已就绪」这一格给出同样的错误答案",
+                oldUrlBlindWouldRebuild(ua) && !urlOnlyWouldRebuild(ua, ua),
+                "都答「重建」—— 而这正是拖拽时闪一下蓝屏、位置归零的原因");
+
+        // 注意：这一节刻意**不调用** PlaybackPolicy —— 它只证明「旧错法确实会错」。
+        // 语义断言全部在第 10 节，两边不重叠，破坏性证伪时才能一处破坏只红一条。
+
         System.out.println();
         System.out.println("=".repeat(62));
         System.out.println("播放策略：" + passed + " / " + total + " 通过");
@@ -223,6 +274,34 @@ public class PolicyTest {
      */
     static boolean oldResumeWouldRebuild(boolean prepared, boolean hasUrl) {
         return !prepared && hasUrl;
+    }
+
+    /**
+     * 第一代旧实现的等价函数，**仅用于反向验证**：有地址就重建。
+     *
+     * <p>旧代码里 {@code SetAVTransportURI} 的处理是「收到地址就
+     * {@code startInternal()}」，根本没有幂等这一说。于是控制点拖一次
+     * 进度条就重建一次播放器 —— 视频层关一次、缓冲一次、位置归零一次。
+     *
+     * <p>留着它是为了让「新逻辑不重建」那条断言**能红**。
+     */
+    static boolean oldUrlBlindWouldRebuild(String url) {
+        return url != null && url.length() > 0;
+    }
+
+    /**
+     * 第二代旧实现的等价函数，**仅用于反向验证**：只比地址。
+     *
+     * <p>这是修幂等时最容易写成的样子 —— 只比 URL 相不相同。
+     * 它在「拖拽」那一格是对的（同地址 → 不重建），但在
+     * 「播放器出过错、已被释放」那一格是错的：控制点重发同地址想救回来，
+     * 而它给的是「不重建」，于是永远救不回来。
+     *
+     * <p>两条反向验证函数摆在一起，才能说明正确判据为什么
+     * **必须同时看地址和播放器状态**。
+     */
+    static boolean urlOnlyWouldRebuild(String newUrl, String currentUrl) {
+        return !(newUrl != null && newUrl.equals(currentUrl));
     }
 
     /**

@@ -52,6 +52,20 @@ public class UpnpHttpServer extends Thread {
         String getTransportState();
 
         /**
+         * GetTransportInfo 用 —— 传输状态是否出错（UPnP 标准串：
+         * {@code OK} / {@code ERROR_OCCURRED}）。
+         *
+         * <p>它必须和事件里的 {@code TransportStatus} 用<b>同一个判据</b>。
+         * 之前这里没有这个方法，GetTransportInfo 把 CurrentTransportStatus
+         * 写死成 {@code OK}，而事件那边已经改成如实报 —— 于是同一个设备、
+         * 同一个时刻，两个接口给出相反的答案：靠轮询的控制点以为一切正常，
+         * 靠事件的控制点知道在出错。排查时两边说法不一致，反而把线索搅浑。
+         *
+         * @return 非 null、非空的标准串
+         */
+        String getTransportStatus();
+
+        /**
          * GetMediaInfo / GetPositionInfo 用 —— 当前正在播放的媒体 URL。
          *
          * <p>这个方法之前漏在接口外面，导致 GetMediaInfo 永远回一个空的
@@ -603,8 +617,17 @@ public class UpnpHttpServer extends Thread {
     /** 各 action 需要回什么参数 */
     private String responseArgs(String action) {
         if ("GetTransportInfo".equals(action)) {
+            // CurrentTransportStatus 必须来自 handler，不能写死 ——
+            // 写死的话它就和事件里的 TransportStatus 各说各话。
+            String status = handler.getTransportStatus();
+            if (status == null || status.length() == 0) {
+                // 兜底成 OK：规范里这是常态，而一个空串会让控制点拿到非法值。
+                // 但真走到这里说明实现方漏了，日志留个痕迹。
+                Log.w(TAG, "handler 没给 TransportStatus，兜底成 OK");
+                status = "OK";
+            }
             return "<CurrentTransportState>" + handler.getTransportState() + "</CurrentTransportState>"
-                    + "<CurrentTransportStatus>OK</CurrentTransportStatus>"
+                    + "<CurrentTransportStatus>" + status + "</CurrentTransportStatus>"
                     + "<CurrentSpeed>1</CurrentSpeed>";
         }
         if ("GetPositionInfo".equals(action)) {

@@ -400,6 +400,37 @@ check('Stop 之后状态是 STOPPED',
       find_xml_text(body, 'CurrentTransportState') == 'STOPPED',
       'got=%r' % find_xml_text(body, 'CurrentTransportState'))
 
+# ---- CurrentTransportStatus 必须如实反映，不能写死 ----
+#
+# 它和 GENA 事件里的 TransportStatus 是**同一个语义**：出没出错。
+# 之前 GetTransportInfo 把它写死成 OK，而事件那边已经改成如实报 ——
+# 于是同一台设备、同一时刻，两个接口给出相反的答案：靠轮询的控制点
+# 以为一切正常，靠事件的控制点知道在出错。控制点自己都不知道该信哪个。
+#
+# 三条一起看才说明问题：正常 → 出错 → 复位。只测中间那条的话，
+# 一个"恒回 ERROR_OCCURRED"的实现也能通过。
+st, hd, body = soap_post('GetTransportInfo', SVC_AVT, '')
+check('正常态：CurrentTransportStatus = OK',
+      find_xml_text(body, 'CurrentTransportStatus') == 'OK',
+      'got=%r' % find_xml_text(body, 'CurrentTransportStatus'))
+
+# 靶机约定：片源地址里带 boom 就置成出错态（真实服务里由 onError 置 lastError）
+BOOM_URI = 'http://192.168.1.9:8080/boom.mp4'
+soap_post('SetAVTransportURI', SVC_AVT,
+          '<CurrentURI>%s</CurrentURI>\n'
+          '<CurrentURIMetaData></CurrentURIMetaData>' % BOOM_URI)
+st, hd, body = soap_post('GetTransportInfo', SVC_AVT, '')
+check('出错态：CurrentTransportStatus = ERROR_OCCURRED（不是写死的 OK）',
+      find_xml_text(body, 'CurrentTransportStatus') == 'ERROR_OCCURRED',
+      'got=%r  ← 写死 OK 的实现在这里露馅' % find_xml_text(body, 'CurrentTransportStatus'))
+
+soap_post('Stop', SVC_AVT, '')
+st, hd, body = soap_post('GetTransportInfo', SVC_AVT, '')
+check('Stop 之后错误态复位：CurrentTransportStatus = OK',
+      find_xml_text(body, 'CurrentTransportStatus') == 'OK',
+      'got=%r  ← 不复位的话，一次偶发错误会让设备永远"看起来在出错"'
+      % find_xml_text(body, 'CurrentTransportStatus'))
+
 
 # ══════════════════════════════════════════════════════════════ 6. 回读契约
 

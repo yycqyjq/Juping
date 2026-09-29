@@ -78,12 +78,12 @@ echo "    Build 号     : $(prop ro.build.display.id)"
 echo "    厂商 / 型号  : $(prop ro.product.manufacturer) / $(prop ro.product.model)"
 echo "    构建指纹     : $(prop ro.build.fingerprint)"
 case "${SDK:-0}" in
-  14|15) echo "    >> API $SDK：真正的 Android 4.0 —— 无 MediaCodec，硬解需走野路子" ;;
+  14|15) echo "    >> API ${SDK}：真正的 Android 4.0 —— 无 MediaCodec，硬解需走野路子" ;;
   16)    echo "    >> API 16：Android 4.1 —— 有 MediaCodec，但功能不全" ;;
   17)    echo "    >> API 17：Android 4.2 —— MediaCodec 基本可用" ;;
   18)    echo "    >> API 18：Android 4.3 —— MediaCodec 较完善" ;;
   19)    echo "    >> API 19：Android 4.4 —— 生态支持好很多" ;;
-  20|21) echo "    >> API $SDK：Android 5.x —— 主流方案都能跑" ;;
+  20|21) echo "    >> API ${SDK}：Android 5.x —— 主流方案都能跑" ;;
   *)     echo "    >> API ${SDK:-未知}：请对照版本表判断" ;;
 esac
 echo

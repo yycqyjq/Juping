@@ -38,6 +38,19 @@ public class ProtocolTestServer {
     private static volatile int volume = 42;
 
     /**
+     * 出错态模拟。
+     *
+     * <p>片源地址里带 {@code boom} 就置上，{@code Stop} 清掉 —— 驱动据此把靶机
+     * 推到「正在出错」这一格，验证 {@code GetTransportInfo} 的
+     * {@code CurrentTransportStatus} 与事件里的 {@code TransportStatus}
+     * <b>在出错时也一致</b>。
+     *
+     * <p>不这么做的话，两个接口都恒回 {@code OK}，那条「两边一致」的断言
+     * 在实现把其中一个写死时照样绿 —— 等于没测。
+     */
+    private static volatile String lastError = "";
+
+    /**
      * 业务回调里要能触发事件推送（和真实服务一样：状态一变就 notifyEvent）。
      * 服务对象本身在 handler 之后才构造出来，所以用个静态引用兜一下。
      */
@@ -81,6 +94,8 @@ public class ProtocolTestServer {
                 rec("SetAVTransportURI", uri, metadata);
                 // 和真实服务保持一致：收到 URI 就记下来，GetMediaInfo 要回读它
                 currentUri = uri == null ? "" : uri;
+                // 片源带 boom → 模拟一个播放错误（真实服务里是 onError 置的）
+                lastError = (uri != null && uri.contains("boom")) ? "模拟播放错误" : "";
                 transportState = "TRANSITIONING";
                 push("AVTransport");
             }
@@ -114,6 +129,7 @@ public class ProtocolTestServer {
             public void onStop() {
                 rec("Stop");
                 currentUri = "";
+                lastError = "";
                 transportState = "STOPPED";
                 push("AVTransport");
             }
@@ -136,6 +152,12 @@ public class ProtocolTestServer {
             @Override
             public String getTransportState() {
                 return transportState;
+            }
+
+            @Override
+            public String getTransportStatus() {
+                // 与事件里的 TransportStatus 共用同一个判据 —— 这正是被测点。
+                return lastError.length() > 0 ? "ERROR_OCCURRED" : "OK";
             }
 
             @Override
@@ -164,7 +186,10 @@ public class ProtocolTestServer {
                 Map<String, String> vars = new HashMap<String, String>();
                 if ("AVTransport".equals(service)) {
                     vars.put("TransportState", transportState);
-                    vars.put("TransportStatus", "OK");
+                    // 与 GetTransportInfo 的 CurrentTransportStatus **同源** ——
+                    // 真实服务里两边都走 DlnaRendererService.getTransportStatus()。
+                    // 靶机也这么写，驱动才能验证"两个接口说法一致"。
+                    vars.put("TransportStatus", handler.getTransportStatus());
                     vars.put("CurrentTrackURI", currentUri);
                     vars.put("CurrentTrackDuration", UpnpHttpServer.formatTime(FAKE_DURATION_MS));
                     return vars;

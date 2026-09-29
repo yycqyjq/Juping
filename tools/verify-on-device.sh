@@ -112,7 +112,7 @@ MIN_SDK="$(python3 "$HERE/apk_info.py" "$APK" 2>/dev/null \
            | sed -n 's/.*minSdkVersion *: *\([0-9]*\).*/\1/p' | head -1)"
 if [ -n "$MIN_SDK" ] && [ -n "$DEV_SDK" ] && [ "$MIN_SDK" -gt "$DEV_SDK" ] 2>/dev/null; then
     echo
-    echo "[×] 这个包装不上：minSdk=$MIN_SDK，设备 API=$DEV_SDK。" >&2
+    echo "[×] 这个包装不上：minSdk=${MIN_SDK}，设备 API=${DEV_SDK}。" >&2
     echo "    差 $((MIN_SDK - DEV_SDK)) 级。要么换低版本包，要么降 minSdk。" >&2
     exit 2
 fi
@@ -155,7 +155,7 @@ for _ in $(seq 1 60); do
 done
 
 if [ -z "$LOCATION" ]; then
-    echo "  [×] 30 秒内没等到「$TAG_READY」。" >&2
+    echo "  [×] 30 秒内没等到「${TAG_READY}」。" >&2
     echo
     echo "  ── 相关日志 ──" >&2
     printf '%s\n' "$LOG" | grep -E "DlnaRenderer|SsdpResponder|UpnpHttpServer|NetUtil" | tail -30 >&2

@@ -87,7 +87,7 @@ RC=$?
 # ① 靶机是健康的，脚本必须报通过 —— 这是最重要的一条
 [ "$RC" -eq 0 ] \
     && ok "退出码 0（靶机健康，脚本不该报错）" \
-    || bad "退出码 $RC，期望 0"
+    || bad "退出码 ${RC}，期望 0"
 
 # ② 地址抽取：全脚本最容易静默坏掉的一步
 grep -q "盒子 IP=127.0.0.1  HTTP 端口=$HTTP_PORT" "$LOG" \
@@ -118,7 +118,7 @@ NEG=$?
 if [ "$NEG" -eq 2 ] && grep -q "这个包装不上" "$OUT/neg.log"; then
     ok "反面对照：API 13 < minSdk 14 时被拦住（退出码 2，且说清了差多少级）"
 else
-    bad "反面对照失败：退出码 $NEG（期望 2），$(grep -m1 '装不上' "$OUT/neg.log" || echo '没打印拒绝原因')"
+    bad "反面对照失败：退出码 ${NEG}（期望 2），$(grep -m1 '装不上' "$OUT/neg.log" || echo '没打印拒绝原因')"
 fi
 
 if [ "$FAIL" -ne 0 ]; then

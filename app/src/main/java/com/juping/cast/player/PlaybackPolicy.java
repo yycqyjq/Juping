@@ -146,6 +146,44 @@ public final class PlaybackPolicy {
         return hasUrl ? PLAY_PREPARE : PLAY_NONE;
     }
 
+    // ------------------------------------------- SetAVTransportURI 该不该重建
+
+    /**
+     * 这次 {@code SetAVTransportURI} 要不要重建播放器。
+     *
+     * <p><b>为什么需要这个决策，而不是"收到地址就重建"</b>：
+     * 控制点（腾讯视频这类）**拖拽进度条时**会重发 {@code SetAVTransportURI}，
+     * 传的还是<b>同一个 URL</b>，后面再跟一条 Seek。无条件「释放 + 重建」的话，
+     * 每次拖拽都会：
+     * <ol>
+     *   <li>释放 MediaPlayer → 视频层关闭 → 电视上闪一下蓝屏</li>
+     *   <li>重新 {@code prepareAsync()} → 重新缓冲、位置归零 ——
+     *       用户看到的就是"断开重连"</li>
+     * </ol>
+     *
+     * <p>UPnP AVTransport:1 规范也站在这一边：传入与 {@code CurrentURI}
+     * <b>相同</b>的地址时，设备不应改变传输状态。
+     *
+     * <p><b>判据必须同时看地址和播放器状态</b>：只比 URL 的话，一个出过错、
+     * 已经被释放掉的播放器会永远重建不起来 —— 重发同地址就再也救不回来了。
+     *
+     * @param newUrl     这次要播的地址
+     * @param currentUrl 当前正在播 / 正在准备的地址
+     * @param prepared   播放器是否已就绪
+     * @param preparing  播放器是否正在准备
+     * @return true 表示需要重建播放器
+     */
+    public static boolean shouldRebuild(String newUrl, String currentUrl,
+                                        boolean prepared, boolean preparing) {
+        if (newUrl == null || newUrl.length() == 0) {
+            return false;   // 空地址什么都不做
+        }
+        if (newUrl.equals(currentUrl) && (prepared || preparing)) {
+            return false;   // 同地址、播放器还在 —— 幂等忽略
+        }
+        return true;
+    }
+
     // ------------------------------------------------------- Seek 的"待决"判定
 
     /**

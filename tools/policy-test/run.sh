@@ -23,7 +23,7 @@ JAVAC="$JAVA_HOME/bin/javac"
 JAVA="$JAVA_HOME/bin/java"
 
 if [ ! -x "$JAVAC" ]; then
-    echo "找不到 javac —— 需要 JAVA_HOME 指向 JDK（当前: $JAVA_HOME）" >&2
+    echo "找不到 javac —— 需要 JAVA_HOME 指向 JDK（当前: ${JAVA_HOME}）" >&2
     exit 2
 fi
 
@@ -56,7 +56,7 @@ echo "  通过（证明 PlaybackPolicy 确实不依赖 Android 运行时）"
 echo "── 编译 MediaPlayerController（对着 android.jar 快速语法检查）──"
 ANDROID_JAR="${ANDROID_HOME:-$TOOLCHAIN/sdk}/platforms/android-33/android.jar"
 if [ ! -f "$ANDROID_JAR" ]; then
-    echo "  跳过（找不到 $ANDROID_JAR）"
+    echo "  跳过（找不到 ${ANDROID_JAR}）"
 else
     mkdir -p "$OUT/ctrl"
     if "$JAVAC" -nowarn -encoding UTF-8 -cp "$ANDROID_JAR" -d "$OUT/ctrl" \
@@ -789,14 +789,15 @@ PY
 #   ·「手机上断开连接 → 电视直接蓝屏，不回投屏之前的界面」
 #     SurfaceView 从不隐藏、而 panel 是透明的 —— 停止之后那层已经没有内容的
 #     surface 还压在面板底下。
-python3 - "$CTRL" "$SVC" "$ACT" "$LAYOUT" "$HTTP" <<'PY' || RC=1
+python3 - "$CTRL" "$SVC" "$ACT" "$LAYOUT" "$HTTP" "$POLICY" <<'PY' || RC=1
 import re, sys, pathlib
-ctrl_path, svc_path, act_path, layout_path, http_path = sys.argv[1:6]
+ctrl_path, svc_path, act_path, layout_path, http_path, policy_path = sys.argv[1:7]
 ctrl = pathlib.Path(ctrl_path).read_text(encoding='utf-8')
 svc = pathlib.Path(svc_path).read_text(encoding='utf-8')
 act = pathlib.Path(act_path).read_text(encoding='utf-8')
 layout = pathlib.Path(layout_path).read_text(encoding='utf-8')
 http = pathlib.Path(http_path).read_text(encoding='utf-8')
+policy = pathlib.Path(policy_path).read_text(encoding='utf-8')
 ssdp = pathlib.Path('app/src/main/java/com/juping/cast/dlna/SsdpResponder.java'
                     ).read_text(encoding='utf-8')
 failed = []
@@ -932,27 +933,70 @@ pl = body_of(ctrl_c, 'public synchronized boolean play(String url)')
 report('MediaPlayerController.play 已改成返回 boolean（可幂等）', pl is not None,
        '锚点：public synchronized boolean play(String url)')
 if pl:
-    report('play 里比较了 URL',
-           'url.equals(currentUrl)' in pl,
-           '不比较 URL 的话，控制点重发同一个地址就会被当成"换片源"')
-    report('幂等判据要求播放器还在（prepared / preparing）',
-           'prepared' in pl and 'preparing' in pl,
+    # 判据本体已经抽到 PlaybackPolicy.shouldRebuild（纯逻辑、桌面可断言），
+    # 所以这里查的是**调用点**：真的调了它、参数传对、在 startInternal 之前拦下。
+    report('play 里调用了幂等判定（PlaybackPolicy.shouldRebuild）',
+           'PlaybackPolicy.shouldRebuild(' in pl,
+           '不判幂等的话，控制点重发同一个地址就会被当成"换片源"')
+    report('幂等判定传了地址与播放器状态两组参数',
+           re.search(r'shouldRebuild\(\s*url\s*,\s*currentUrl\s*,'
+                     r'\s*prepared\s*,\s*preparing\s*\)', pl) is not None,
            '只比 URL 不比状态的话，出错停掉的播放器会再也重建不起来 ——'
-           '重发同地址就彻底救不回来了')
+           '重发同地址就彻底救不回来了。四个参数缺一不可')
+    report('幂等判定取反使用（判据给 false 时才拦）',
+           re.search(r'if\s*\(\s*!\s*PlaybackPolicy\.shouldRebuild\(', pl) is not None,
+           '去掉这个 ! 的话语义正好反了：同地址时反而重建、换片时反而忽略')
     # 位置判据：幂等判断必须发生在 startInternal() **之前**。
-    # 只查"有没有 url.equals"是不够的 —— 放到 startInternal 之后的话，
+    # 只查"有没有调 shouldRebuild"是不够的 —— 放到 startInternal 之后的话，
     # 播放器已经重建完了才 return，等于什么都没拦。
-    idem = pl.find('url.equals(currentUrl)')
+    idem = pl.find('PlaybackPolicy.shouldRebuild(')
     start = pl.find('startInternal()')
     report('幂等判断发生在 startInternal 之前（否则拦不住）',
            idem >= 0 and start >= 0 and idem < start,
            '放到 startInternal() 之后的话，播放器已经重建完了才返回 ——'
-           '蓝屏和"重连"照样发生。而只看 URL 比较存不存在的断言，'
+           '蓝屏和"重连"照样发生。而只看调没调判定的断言，'
            '对这种写法完全无感')
     report('幂等分支真的 return，不是只打日志',
-           re.search(r'url\.equals\(currentUrl\)[\s\S]{0,400}?return\s+false',
+           re.search(r'PlaybackPolicy\.shouldRebuild\([\s\S]{0,400}?return\s+false',
                      pl) is not None,
            '只打日志不 return 等于没拦')
+
+# 判据本体抽到了 PlaybackPolicy：**语义**由桌面断言（PolicyTest 第 10 节）逐格覆盖 ——
+# 那边是纯函数，能穷举「同地址 × 播放器状态」的所有组合。
+# 这里只留一条**形状**检查：方法确实在、签名没变。
+# 刻意不在源码级重复语义断言 —— 同一个语义在两处各写一条，破坏性证伪时
+# 一处破坏会让两条一起红，反而定位不出到底哪儿坏了。
+sr = body_of(strip_comments(policy), 'public static boolean shouldRebuild(')
+report('PlaybackPolicy.shouldRebuild 方法体已找到（语义由桌面断言逐格覆盖）',
+       sr is not None,
+       '锚点：public static boolean shouldRebuild(')
+
+# ---- GetTransportInfo 的 CurrentTransportStatus 必须与事件里的 TransportStatus 同源 ----
+# 这两处是**同一个语义**（出没出错）。之前一处如实报、一处写死 OK，
+# 于是同一台设备、同一时刻，两个接口给出相反的答案 ——
+# 靠轮询的控制点以为一切正常，靠事件的控制点知道在出错。
+gi = body_of(http_c, 'private String responseArgs(String action)')
+report('UpnpHttpServer.responseArgs 方法体已找到', gi is not None,
+       '锚点：private String responseArgs(String action)')
+if gi:
+    report('CurrentTransportStatus 取自 handler，不是写死的 OK',
+           'handler.getTransportStatus()' in gi
+           and '<CurrentTransportStatus>OK</CurrentTransportStatus>' not in gi,
+           '写死的话，它就和事件里的 TransportStatus 各说各话：'
+           '同一台设备、同一时刻，两个接口给出相反的答案')
+
+gts = body_of(svc_c, 'public String getTransportStatus()')
+report('DlnaRendererService.getTransportStatus 方法体已找到', gts is not None,
+       '锚点：public String getTransportStatus()')
+if gts:
+    report('getTransportStatus 用 hasTransportError 判据（不是恒 OK）',
+           re.search(r'return\s+hasTransportError\(\)\s*\?', gts) is not None,
+           '恒回 OK 等于没改 —— 只是把写死的位置从协议层挪到了服务层')
+
+report('eventedVars 的 TransportStatus 与 getTransportStatus 同源',
+       'vars.put("TransportStatus", getTransportStatus())' in svc_c,
+       '两处各写一份判据的话，迟早有一份忘了跟着改 —— 而不一致'
+       '恰恰是最难排查的一类问题：控制点自己都不知道该信哪个')
 
 osu = body_of(svc_c, 'public void onSetUri(String uri, String metadata)')
 report('DlnaRendererService.onSetUri 方法体已找到', osu is not None,
@@ -1018,9 +1062,11 @@ if ev:
            'RelativeTimePosition' in ev,
            '一部分控制点（国产投屏 SDK 居多）不轮询 GetPositionInfo，'
            '只靠事件里的这个字段更新进度条 —— 不给就从头到尾不动')
-    report('TransportStatus 如实反映出错与否',
-           re.search(r'TransportStatus[\s\S]{0,200}?ERROR_OCCURRED', ev) is not None,
-           '写死 OK 的话，一个正在反复重连的设备在控制点眼里是"一切正常"')
+    # 这里原来还有一条「TransportStatus 如实反映出错与否」（在 ev 里找
+    # ERROR_OCCURRED 字面量）。判据挪进 getTransportStatus() 之后它就失效了，
+    # 而且它和上面那条「同源」守的是同一个语义 —— 留着只会让一处破坏红两条，
+    # 反而定位不出到底哪儿坏了。现在由「同源」+「getTransportStatus 用
+    # hasTransportError 判据」两条共同覆盖。
 
 scpd = re.search(r'SCPD_AV_TRANSPORT =[\s\S]*?</scpd>', http_c)
 report('SCPD_AV_TRANSPORT 找得到', scpd is not None, '锚点：SCPD_AV_TRANSPORT =')
@@ -1058,6 +1104,44 @@ if cs:
            '于是超时兜底反而制造出一次多余的重连')
 
 sys.exit(1 if failed else 0)
+PY
+
+# ── 10. 工具链脚本自身：变量名边界 ──
+#
+# `$VAR` 后面紧跟中文标点时，bash 在 **UTF-8 locale** 下会把多字节字符的字节
+# 一起吞进变量名，于是 `$HTTP_PORT）` 变成 `${HTTP_PORT）}` → unbound variable。
+# 而在 **C locale** 下 bash 逐字节判断、变量名恰好正确结束 —— 于是同一个脚本
+# 在本地跑得好好的，换台机器（或 CI）直接崩，而且报错信息里变量名带乱码，
+# 看着像文件损坏。
+#
+# 这不是假想：本项目 5 个脚本里有 12 处这种写法，一直没被发现，
+# 就是因为开发机的 shell 恰好是 C locale。
+echo
+echo "── 10. 工具链脚本自身：shell 变量名边界 ──"
+python3 - <<'PY' || RC=1
+import pathlib, re, sys
+# $VAR / $1 / $? 等紧跟一个非 ASCII 字节
+PAT = re.compile(r'\$([A-Za-z_][A-Za-z0-9_]*|[0-9]|[?*@#$!])([^\x00-\x7f])')
+scripts = sorted(pathlib.Path('tools').rglob('*.sh'))
+bad = []
+for p in scripts:
+    for i, line in enumerate(p.read_text(encoding='utf-8').splitlines(), 1):
+        # 跳过注释行：注释里的示例不会被执行，也就不是隐患。
+        # （上面那段说明里就举了 `$HTTP_PORT）` 这个例子 —— 不跳过的话，
+        #   检查器会把自己文档里的示例当成缺陷报出来。）
+        if line.lstrip().startswith('#'):
+            continue
+        for m in PAT.finditer(line):
+            bad.append((str(p), i, m.group(0)))
+print('  [%s] $VAR 后紧跟中文标点时都用花括号界定（扫了 %d 个脚本）'
+      % ('PASS' if not bad else 'FAIL', len(scripts)))
+if bad:
+    for f, i, frag in bad:
+        print('        %s:%d  %r' % (f, i, frag))
+    print('        bash 在 UTF-8 locale 下会把中文标点的字节吞进变量名 →'
+          ' unbound variable；C locale 下逐字节判断、恰好正常，'
+          '所以本地跑得好好的，换台机器就炸。改成 ${VAR} 即可。')
+    sys.exit(1)
 PY
 
 echo
