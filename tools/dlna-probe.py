@@ -384,6 +384,14 @@ def do_control(urls, base, play_url):
             if state == 'STOPPED':
                 hint('状态还是 STOPPED —— 多半是拉流失败。'
                      '看盒子上的界面「状态」和「片源」两栏，以及 logcat 里的播放错误。')
+            # 播放态回读 —— 「播放中却回空 URI」正是让部分控制点拒绝投屏的那个 bug。
+            # 这条**不能依赖 probe 启动时设备恰好在播**（那是在赌前面别的测试
+            # 留下了什么状态 —— 有一轮它因此整个没执行，33 条悄悄变成 32 条，
+            # 闸门还是绿的）。这里自己投了屏、自己确认过播放态，断言就在这儿执行。
+            status, body = http_soap(url, SVC['AVTransport'], 'GetMediaInfo', '')
+            cur_now = xml_text(body, 'CurrentURI')
+            check('播放态回读 CurrentURI 必须非空', cur_now not in (None, ''),
+                  '状态 %s，CurrentURI = %r' % (state, cur_now))
             http_soap(url, SVC['AVTransport'], 'Stop', '')
             check('Stop 返回 200', True, '已恢复停止状态')
         except Exception as e:
