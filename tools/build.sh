@@ -8,8 +8,9 @@
 # 用法：
 #   ./tools/build.sh              # 编译 debug APK
 #   ./tools/build.sh release      # 编译已签名的 release APK
-#   ./tools/build.sh dist         # 两个都编，并把成品归集到 dist/
+#   ./tools/build.sh dist         # 两个都编，跑全部核验，成品归集到 dist/
 #   ./tools/build.sh lint         # 跑 lint（API 兼容性检查）
+#   ./tools/build.sh checkapi     # 逐个核验平台 API 引用是否在目标版本里存在
 #   ./tools/build.sh clean        # 清理构建产物
 #
 # 产物：
@@ -67,7 +68,9 @@ verify_apk() {
     ls -lh "$apk" | awk '{print "  文件: " $9 "  " $5}'
     # --min-sdk-version 15 是关键：让 apksigner 按 Android 4.0.3+ 的规则校验，
     # 而不是按当前的默认规则。少了这个参数，"校验通过" 是没意义的。
-    if "$BT/apksigner" verify --min-sdk-version 15 "$apk" 2>/dev/null; then
+    # stderr 一起吞掉：AGP 往 META-INF 里塞的 app-metadata.properties 不在签名保护范围内，
+    # apksigner 每次都要为此警告一句，属于噪声。
+    if "$BT/apksigner" verify --min-sdk-version 15 "$apk" >/dev/null 2>&1; then
         echo "  签名: 在 API 15+ 上验证通过"
     else
         echo "  !! 签名在 API 15 上验证失败" >&2
@@ -82,6 +85,31 @@ collect() {
     mkdir -p dist
     cp -f app/build/outputs/apk/release/app-release.apk "dist/juping-$VER-release.apk"
     cp -f app/build/outputs/apk/debug/app-debug.apk     "dist/juping-$VER-debug.apk"
+}
+
+# API 兼容性核验：确认 dex 里引用的每个平台成员，在目标版本里真的存在。
+# 这是独立于 lint 的第二道判据 —— 不存在的成员在真机上就是 NoSuchMethodError，
+# 而编译期（对着新版 android.jar）完全不会报错。
+verify_api() {
+    local apk="$1" out
+    out="$(mktemp)"
+    local min
+    min="$(python3 tools/apk_info.py "$apk" 2>/dev/null | grep minSdkVersion | awk '{print $3}')"
+    if [ -z "$min" ]; then
+        echo "  API : 跳过（读不出 minSdkVersion）"
+        rm -f "$out"; return 0
+    fi
+    if [ ! -f "$ANDROID_HOME/platforms/android-$min/android.jar" ]; then
+        echo "  API : 跳过（缺 API $min 的基线 android.jar）"
+        rm -f "$out"; return 0
+    fi
+    if python3 tools/check_api_compat.py "$apk" "$min" >"$out" 2>&1; then
+        echo "  API : $(grep -oE '结论：.*' "$out" | head -1)"
+        rm -f "$out"; return 0
+    fi
+    echo "  !! API 越界 —— 目标版本里不存在这些成员，真机上必崩：" >&2
+    sed -n '/找不到/,$p' "$out" >&2
+    rm -f "$out"; return 1
 }
 
 case "${1:-debug}" in
@@ -112,6 +140,22 @@ PY
         echo "完整报告: app/build/reports/lint-results-debug.html"
         ;;
 
+    checkapi)
+        APK="app/build/outputs/apk/release/app-release.apk"
+        [ -f "$APK" ] || APK="app/build/outputs/apk/debug/app-debug.apk"
+        if [ ! -f "$APK" ]; then
+            echo "还没有编译产物，先跑 ./tools/build.sh" >&2
+            exit 1
+        fi
+        # 两个基线都核：minSdk 是最严格的（APK 声明支持它），
+        # 目标设备版本是实际要跑的。两个都过才算数。
+        MIN="$(python3 tools/apk_info.py "$APK" 2>/dev/null | grep minSdkVersion | awk '{print $3}')"
+        python3 tools/check_api_compat.py "$APK" "$MIN"
+        echo
+        echo "--- 再对实际设备版本（API 15）核一遍 ---"
+        python3 tools/check_api_compat.py "$APK" 15
+        ;;
+
     release)
         if [ ! -f keystore.properties ]; then
             echo "!! 缺少 keystore.properties，release 包会没有签名、装不上。" >&2
@@ -137,6 +181,7 @@ PY
         for f in dist/*.apk; do
             echo "$(basename "$f")"
             verify_apk "$f"
+            verify_api "$f"
             echo
         done
         echo "装机："

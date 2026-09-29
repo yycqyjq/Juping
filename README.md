@@ -59,11 +59,12 @@ Juping/
 │   │       └── MediaPlayerController.java  播放 + 看门狗 + 指数退避重连
 │   └── res/                         布局、配色、字符串、图标、banner
 └── tools/
-    ├── build.sh          一键构建
-    ├── make_icon.py      生成全部位图资源（纯标准库）
-    ├── probe-tv.sh       adb 探测盒子真实硬件信息
-    ├── apk_info.py       解析 APK 的包名 / minSdk
-    └── check_sources.py  无 JDK 环境下的源码结构检查
+    ├── build.sh              一键构建 + 出包前核验
+    ├── check_api_compat.py   逐个核验平台 API 引用是否在目标版本里存在
+    ├── make_icon.py          生成全部位图资源（纯标准库）
+    ├── probe-tv.sh           adb 探测盒子真实硬件信息
+    ├── apk_info.py           解析 APK 的包名 / minSdk
+    └── check_sources.py      无 JDK 环境下的源码结构检查
 ```
 
 ---
@@ -75,8 +76,9 @@ Juping/
 ```bash
 ./tools/build.sh              # 编译 debug APK
 ./tools/build.sh release      # 编译已签名的 release APK
-./tools/build.sh dist         # 两个都编，成品归集到 dist/
+./tools/build.sh dist         # 两个都编，跑全部核验，成品归集到 dist/
 ./tools/build.sh lint         # 跑 lint（API 兼容性检查）
+./tools/build.sh checkapi     # 逐个核验平台 API 引用是否在目标版本里存在
 ./tools/build.sh clean
 ```
 
@@ -87,7 +89,10 @@ dist/juping-0.1.0-release.apk   ← 装机用这个（43K，已签名）
 dist/juping-0.1.0-debug.apk     ← 排障用（49K，带 debuggable 标记）
 ```
 
-`dist` 目标会在归集后**自动验证签名**（以 API 15 为目标），签名不过就报错退出 —— 免得把一个装不上的包交出去。
+`dist` 目标会在归集后**自动跑两项核验**，任何一项不过就报错退出 —— 免得把一个装不上的包交出去：
+
+1. **签名**：以 API 15 为目标验证（`apksigner verify --min-sdk-version 15`）
+2. **API 兼容性**：逐个核对 dex 里引用的每个平台成员在目标版本里是否真的存在
 
 如果工具链已在 PATH 里，也可以直接用 wrapper：
 
@@ -102,6 +107,15 @@ dist/juping-0.1.0-debug.apk     ← 排障用（49K，带 debuggable 标记）
 | JDK | 17 (Temurin aarch64) | `~/.android-build/jdk/Contents/Home` |
 | Gradle | 7.5 | `~/.android-build/gradle` |
 | Android SDK | platform-33 + build-tools 33.0.0 | `~/.android-build/sdk` |
+| **基线 android.jar** | **API 14 与 15** | `~/.android-build/sdk/platforms/android-{14,15}` |
+
+最后一行是做 API 兼容性核验用的。没有它 `checkapi` 会跳过（不会失败，但也就等于没查）：
+
+```bash
+curl -o android-15.zip https://dl.google.com/android/repository/android-15_r05.zip
+curl -o android-14.zip https://dl.google.com/android/repository/android-14_r04.zip
+# 解压后把 android.jar 放到 sdk/platforms/android-{15,14}/
+```
 
 ---
 
@@ -181,7 +195,39 @@ adb install -r dist/juping-0.1.0-release.apk
 | `MediaCodec` | API 16 才有 —— 本项目全程不碰它 |
 | AndroidX 任何组件 | 普遍要求 minSdk 19+ → 直接编译不过 |
 
-**验证方式**：`./tools/build.sh lint` 后看 `NewApi` 有没有命中。当前为 **0 命中**，即没有任何 API 调用超出 API 14。
+### 两道独立的验证
+
+光靠编译过是不够的 —— 对着新版 android.jar 编译，调用新 API 完全不会报错。
+
+**第一道：lint 的 `NewApi` 检查**
+
+```bash
+./tools/build.sh lint
+```
+
+看 `NewApi` 有没有命中。当前为 **0 命中**，即没有任何 API 调用超出 API 14。
+
+**第二道：直接对着目标版本的 android.jar 核**
+
+```bash
+./tools/build.sh checkapi
+```
+
+`tools/check_api_compat.py` 会把 dex 里引用的每个平台成员抠出来，逐个到
+API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递归）。
+当前结果：
+
+```
+被引用的平台类 51 个 · 方法 161 个 · 字段 3 个
+结论：164 个平台引用全部命中，无 API 越界。
+```
+
+为什么要两道：lint 依赖内置数据库，而且本项目关掉了 8 项检查 ——
+万一其中某一项顺带掩盖了 API 问题，lint 不会吭声。第二道是**独立判据**。
+
+> **这个检查器做过反向验证**：临时在代码里插入一个 API 23 的调用
+> （`MediaPlayer.setPlaybackParams`），javac 编译毫无怨言，而检查器精准抓出了它。
+> 一个只会说"通过"的检查器是没有价值的。
 
 ---
 
@@ -190,7 +236,9 @@ adb install -r dist/juping-0.1.0-release.apk
 - **乐联（LeLink）协议不支持**。B站、抖音、部分腾讯视频走的是乐播的私有闭源协议，开源界没有实现，无法对接。能收的是标准 DLNA / UPnP 推送。
 - **AirPlay 未实现**。iOS 侧目前只能用支持 DLNA 的 App 投。要做 AirPlay 接收需要移植 UxPlay（C/C++，GPLv3），是独立的一大块工作。
 - **镜像（Miracast）不做**。老盒子 Wi-Fi Direct 驱动不稳，正是断联根因，不值得修。
-- **从未在真机上运行过**。代码已通过编译、lint、dex 校验，但真机验证还没做。
+- **从未在真机上运行过**。已通过五项静态核验（编译 / lint `NewApi` 零命中 /
+  API 引用 164 项全命中 / DEX 版本 035 / 签名在 API 15 上有效），
+  但真机上的组播收发、MediaPlayer 硬解、断联恢复都还没实测。
 
 ---
 
