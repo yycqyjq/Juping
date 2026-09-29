@@ -156,6 +156,27 @@ verify_policy() {
     rm -f "$out"; return 1
 }
 
+# 密钥核查：这个仓库是要公开的，而 release 签名密钥一旦泄漏，
+# 任何人都能伪造出「能覆盖升级到已装设备上」的 APK —— 比源码泄漏严重得多。
+# 所以把「密钥有没有混进被跟踪的文件」做成闸门，而不是靠人记得去翻。
+# 判据按值的性质分类（密码类必须零命中；路径/别名类只提示），
+# 否则会报一堆假阳性 —— 检查器喊狼来了，跟不检查一样糟。
+verify_secrets() {
+    if [ ! -f tools/check_no_secrets.py ]; then
+        echo "  密钥: 跳过（没有 tools/check_no_secrets.py）"
+        return 0
+    fi
+    local out
+    out="$(mktemp)"
+    if python3 tools/check_no_secrets.py >"$out" 2>&1; then
+        echo "  密钥: $(grep -oE '结论：.*' "$out" | head -1)"
+        rm -f "$out"; return 0
+    fi
+    echo "  !! 密钥核查未通过 —— 不要把仓库推公开：" >&2
+    tail -30 "$out" >&2
+    rm -f "$out"; return 1
+}
+
 case "${1:-debug}" in
     protocol)
         verify_protocol
@@ -163,6 +184,10 @@ case "${1:-debug}" in
 
     policy)
         verify_policy
+        ;;
+
+    secrets)
+        verify_secrets
         ;;
 
     clean)
@@ -241,6 +266,9 @@ PY
         echo
         echo "=== 播放策略（同上，纯逻辑，不需要真机）==="
         verify_policy
+        echo
+        echo "=== 密钥核查（这个仓库要公开）==="
+        verify_secrets
         echo
         echo "装机 + 真机验收（一条命令）："
         echo "  ./tools/verify-on-device.sh              # USB 连接的盒子"
