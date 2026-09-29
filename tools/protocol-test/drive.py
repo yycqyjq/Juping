@@ -333,6 +333,120 @@ else:
     check('中文请求的指令到达业务层', False, '一条记录都没有 —— 指令根本没送到')
 
 
+# ════════════════════════════════════════ 4b. 参数属性/前缀 + 版本贯通 + HEAD
+
+print('\n── 4b. SOAP 参数带 val 属性/带前缀（对齐 jUPnP）+ 版本贯通 + HEAD ──')
+
+# 参照 jUPnP（Cling 后继）SOAPActionProcessorImpl 的解析策略：按「剥前缀的
+# 标签名」匹配参数、完全无视属性。Platinum 系控制点会发带 val 属性的参数，
+# 之前只认 <Tag>value</Tag> 的解析会把它们静默丢弃 —— SetAVTransportURI
+# 缺 URI 投不上，日志里什么都看不出来。
+
+ATTR_URI = 'http://192.168.1.9:8080/attr.mp4'
+ATTR_META = PLAIN_META   # 复用上面那份转义好的 DIDL，语义不变
+
+# 1) val 属性形式 —— 最常见的不合规写法
+before = len(read_calls())
+st, hd, body = raw_request('POST', '/upnp/control/AVTransport', {
+    'Content-Type': 'text/xml; charset="utf-8"',
+    'SOAPAction': '"%s#SetAVTransportURI"' % SVC_AVT,
+}, soap_body('SetAVTransportURI', SVC_AVT,
+             '<CurrentURI val="%s">%s</CurrentURI>\n'
+             '<CurrentURIMetaData val="m">%s</CurrentURIMetaData>'
+             % (ATTR_URI, ATTR_URI, ATTR_META)))
+check('带 val 属性的 SetAVTransportURI 返回 200', st.startswith('HTTP/1.1 200'), st)
+new = read_calls()[before:]
+attr_uri_ok = False
+attr_meta_ok = False
+if new:
+    f = unrec(new[0])
+    attr_uri_ok = len(f) > 1 and f[1] == ATTR_URI
+    got = f[2] if len(f) > 2 else None
+    attr_meta_ok = got is not None and got.startswith('<DIDL-Lite')
+check('val 属性参数的 URI 送达（不被静默丢弃）', attr_uri_ok,
+      'got=%r' % (new[0][:90] if new else '没有记录'))
+check('val 属性参数的 Metadata 反转义正确', attr_meta_ok,
+      'got=%r' % (got[:60] if new and len(f) > 2 else None))
+
+# 2) 参数带命名空间前缀 —— jUPnP getUnprefixedNodeName 兼容的写法
+before = len(read_calls())
+st, hd, body = raw_request('POST', '/upnp/control/AVTransport', {
+    'Content-Type': 'text/xml; charset="utf-8"',
+    'SOAPAction': '"%s#SetAVTransportURI"' % SVC_AVT,
+}, soap_body('SetAVTransportURI', SVC_AVT,
+             '<u:CurrentURI>%s</u:CurrentURI>' % ATTR_URI))
+check('带前缀参数的 SetAVTransportURI 返回 200', st.startswith('HTTP/1.1 200'), st)
+new = read_calls()[before:]
+ok = False
+if new:
+    f = unrec(new[0])
+    ok = len(f) > 1 and f[1] == ATTR_URI
+check('带前缀参数的 URI 送达（剥前缀匹配）', ok,
+      'got=%r' % (new[0][:90] if new else '没有记录'))
+
+# 3) 自闭合 InstanceID + 普通 CurrentURI ——
+#    守「自闭合标签不能吞掉后面同名元素的内容」这个回归
+before = len(read_calls())
+st, hd, body = raw_request('POST', '/upnp/control/AVTransport', {
+    'Content-Type': 'text/xml; charset="utf-8"',
+    'SOAPAction': '"%s#SetAVTransportURI"' % SVC_AVT,
+}, '<?xml version="1.0" encoding="utf-8"?>\n'
+   '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+   's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">\n'
+   '<s:Body><u:SetAVTransportURI xmlns:u="%s">\n'
+   '<InstanceID val="0"/>\n'
+   '<CurrentURI>%s</CurrentURI>\n'
+   '</u:SetAVTransportURI></s:Body></s:Envelope>' % (SVC_AVT, ATTR_URI))
+new = read_calls()[before:]
+ok = False
+if new:
+    f = unrec(new[0])
+    ok = len(f) > 1 and f[1] == ATTR_URI
+check('自闭合 InstanceID 不吞 CurrentURI', ok,
+      'got=%r' % (new[0][:90] if new else '没有记录'))
+
+# 4) SetVolume 带 val 属性 —— 渲染侧同样要走这条路。
+#    值刻意用 42（靶机的初始音量）：若解析器丢了这个参数，parseInt 兜底成
+#    100，断言即红；用 42 还能保证这里不留脏状态 —— 后面 RenderingControl
+#    的订阅测试断言初始事件 Volume==42，依赖的就是这个值。
+before = len(read_calls())
+st, hd, body = raw_request('POST', '/upnp/control/RenderingControl', {
+    'Content-Type': 'text/xml; charset="utf-8"',
+    'SOAPAction': '"%s#SetVolume"' % SVC_RCS,
+}, soap_body('SetVolume', SVC_RCS,
+             '<DesiredVolume val="42">42</DesiredVolume>', instance_id='0'))
+new = read_calls()[before:]
+ok = False
+if new:
+    f = unrec(new[0])
+    ok = f[0] == 'SetVolume' and len(f) > 1 and f[1] == '42'
+check('val 属性的 SetVolume 送达（音量=42）', ok,
+      'got=%r' % (new[0][:90] if new else '没有记录'))
+
+# 5) 版本贯通：device.xml 的 modelNumber 必须等于测试喂入的版本号。
+#    之前写死 "1.0"，与实际版本脱节 —— 排障时对不上版本。
+TEST_VERSION = '9.9.9'
+st, hd, body = raw_request('GET', '/upnp/device.xml')
+check('device.xml 的 modelNumber 贯通构造参数',
+      b'<modelNumber>%s</modelNumber>' % TEST_VERSION.encode() in body,
+      'got=%r' % body[body.find(b'<modelNumber>'):body.find(b'</modelNumber>') + 15][:60])
+
+# 6) HEAD 与 GET 同源（RFC 7231 §4.3.2：除无 body 外必须一致）。
+#    之前 HEAD 一律回 200 + Content-Length: 0，不看路径。
+st_get, hd_get, body_get = raw_request('GET', '/upnp/device.xml')
+st_head, hd_head, body_head = raw_request('HEAD', '/upnp/device.xml')
+cl = int(hd_head.get('content-length', '0'))
+check('HEAD device.xml 状态与头正确（Content-Length>0）',
+      st_head.startswith('HTTP/1.1 200') and cl > 0,
+      'status=%r len=%r' % (st_head, hd_head.get('content-length')))
+check('HEAD 无 body 且长度与 GET 一致',
+      len(body_head) == 0 and cl == int(hd_get.get('content-length', '-1')),
+      'head_len=%d get_len=%r body=%d' % (cl, hd_get.get('content-length'), len(body_head)))
+st_head404, hd_head404, _ = raw_request('HEAD', '/upnp/不存在的路径')
+check('HEAD 未知路径回 404（与 GET 对齐）',
+      st_head404.startswith('HTTP/1.1 404'), st_head404)
+
+
 # ══════════════════════════════════════════════════════════════ 5. 状态机
 
 print('\n── 5. 播放状态机 ──')

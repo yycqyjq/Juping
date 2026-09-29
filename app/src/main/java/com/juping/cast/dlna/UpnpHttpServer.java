@@ -115,6 +115,16 @@ public class UpnpHttpServer extends Thread {
     private final int port;
     private final String uuid;
     private final String friendlyName;
+    /**
+     * 应用版本名（如 "0.1.4"）。
+     *
+     * <p>device.xml 的 {@code modelNumber} 与响应的 {@code Server} 头都来自它。
+     * 之前这里写死 "1.0"：排障时在 device.xml 里看到的版本号和实际装的不一致，
+     * 「对着版本号复现问题」就成了一句空话。由 {@code DlnaRendererService} 从
+     * {@code BuildConfig.VERSION_NAME} 传入 —— 构造注入而不是静态读，是为了
+     * 让协议测试能喂入自己的测试版本并断言它（见 drive.py 的 modelNumber 断言）。
+     */
+    private final String versionName;
     private final CommandHandler handler;
 
     /** GENA 事件分发。订阅状态、SEQ、超时都在这里面。 */
@@ -161,15 +171,28 @@ public class UpnpHttpServer extends Thread {
      */
     private volatile boolean bound;
 
-    public UpnpHttpServer(int port, String uuid, String friendlyName, CommandHandler handler,
-                          EventDispatcher.EventSource eventSource) {
+    public UpnpHttpServer(int port, String uuid, String friendlyName, String versionName,
+                          CommandHandler handler, EventDispatcher.EventSource eventSource) {
         super("upnp-http");
         setDaemon(true);
         this.port = port;
         this.uuid = uuid;
         this.friendlyName = friendlyName;
+        this.versionName = versionName;
         this.handler = handler;
         this.events = new EventDispatcher(uuid, eventSource);
+    }
+
+    /**
+     * Server / SERVER 头里的产品段。
+     *
+     * <p>之前 "Juping/1.0" 以字符串字面量散落在四处（两个响应头方法 +
+     * 两处 SSDP 相关拼装）—— 升版本时漏改任何一处，同一个设备在不同
+     * 协议路径上就报两个版本号。收口成一个方法，与 {@link #versionName}
+     * 单一来源。
+     */
+    private String serverProduct() {
+        return "Juping/" + versionName;
     }
 
     /**
@@ -393,7 +416,7 @@ public class UpnpHttpServer extends Thread {
             } else if ("UNSUBSCRIBE".equals(method)) {
                 handleUnsubscribe(sidHeader, out);
             } else if ("HEAD".equals(method)) {
-                writeSimple(out, "200 OK", "text/xml", "");
+                handleHead(path, out);
             } else {
                 writeSimple(out, "405 Method Not Allowed", "text/plain", "");
             }
@@ -454,28 +477,88 @@ public class UpnpHttpServer extends Thread {
         return target.startsWith("/") ? target : "/" + target;
     }
 
-    private void handleGet(String path, OutputStream out) throws IOException {
+    /**
+     * GET / HEAD 的静态资源解析结果。
+     *
+     * <p>HTTP 规范（RFC 7231 §4.3.2）要求 HEAD 与 GET **除了没有 body 之外
+     * 完全一致**——状态码、Content-Type、Content-Length 都必须相同。之前
+     * HEAD 一律回「200 + Content-Length: 0」：有控制点用 HEAD 探测
+     * device.xml / 图标，拿到长度 0 会把「0 字节的描述」当成有效结果，
+     * 或者干脆判定设备异常。路由逻辑必须与 GET 同源，不能写两份。
+     */
+    private static final class StaticResource {
+        final boolean found;
+        final String contentType;
+        final byte[] payload;
+
+        StaticResource(boolean found, String contentType, byte[] payload) {
+            this.found = found;
+            this.contentType = contentType;
+            this.payload = payload;
+        }
+    }
+
+    /** GET 与 HEAD 共用的路由判断。改动路由必须只改这一处。 */
+    private StaticResource resolveStatic(String path) {
         if (path.startsWith("/upnp/device.xml") || path.equals("/")) {
-            writeSimple(out, "200 OK", "text/xml; charset=\"utf-8\"", buildDeviceDescription());
-        } else if (path.contains("AVTransport.xml")) {
-            writeSimple(out, "200 OK", "text/xml; charset=\"utf-8\"", SCPD_AV_TRANSPORT);
-        } else if (path.contains("ConnectionManager.xml")) {
-            writeSimple(out, "200 OK", "text/xml; charset=\"utf-8\"", SCPD_CONNECTION_MANAGER);
-        } else if (path.contains("RenderingControl.xml")) {
-            writeSimple(out, "200 OK", "text/xml; charset=\"utf-8\"", SCPD_RENDERING_CONTROL);
-        } else if (ICON_PATH.equals(path)) {
+            return new StaticResource(true, "text/xml; charset=\"utf-8\"",
+                    utf8(buildDeviceDescription()));
+        }
+        if (path.contains("AVTransport.xml")) {
+            return new StaticResource(true, "text/xml; charset=\"utf-8\"", utf8(SCPD_AV_TRANSPORT));
+        }
+        if (path.contains("ConnectionManager.xml")) {
+            return new StaticResource(true, "text/xml; charset=\"utf-8\"", utf8(SCPD_CONNECTION_MANAGER));
+        }
+        if (path.contains("RenderingControl.xml")) {
+            return new StaticResource(true, "text/xml; charset=\"utf-8\"", utf8(SCPD_RENDERING_CONTROL));
+        }
+        if (ICON_PATH.equals(path)) {
             // 图标走字节，不走 String —— PNG 用 UTF-8 编一遍再解回来会被
             // 替换字符毁掉，控制点拿到的就不是一张图了。
             byte[] png = iconPng;
             if (png == null) {
                 // 没图标。**必须是 404**，不能回一个空 body 的 200 ——
                 // 后者会让控制点以为"图片是 0 字节"，行为比 404 更难预料。
-                writeSimple(out, "404 Not Found", "text/plain", "");
-            } else {
-                writeBinary(out, "200 OK", "image/png", png);
+                return new StaticResource(false, "text/plain", new byte[0]);
             }
-        } else {
-            writeSimple(out, "404 Not Found", "text/plain", "");
+            return new StaticResource(true, "image/png", png);
+        }
+        return new StaticResource(false, "text/plain", new byte[0]);
+    }
+
+    private static byte[] utf8(String s) {
+        try {
+            return s.getBytes("UTF-8");
+        } catch (java.io.UnsupportedEncodingException e) {
+            return s.getBytes();
+        }
+    }
+
+    private void handleGet(String path, OutputStream out) throws IOException {
+        writeStatic(out, resolveStatic(path), true);
+    }
+
+    private void handleHead(String path, OutputStream out) throws IOException {
+        writeStatic(out, resolveStatic(path), false);
+    }
+
+    /**
+     * 写 GET / HEAD 响应。{@code withBody=false} 时只写头 ——
+     * 但 Content-Length 保留 GET 的值，这正是 HEAD 语义的全部意义。
+     */
+    private void writeStatic(OutputStream out, StaticResource r, boolean withBody)
+            throws IOException {
+        StringBuilder sb = new StringBuilder();
+        sb.append("HTTP/1.1 ").append(r.found ? "200 OK" : "404 Not Found").append("\r\n");
+        sb.append("Content-Type: ").append(r.contentType).append("\r\n");
+        sb.append("Content-Length: ").append(r.payload.length).append("\r\n");
+        sb.append("Connection: close\r\n");
+        sb.append("Server: Android UPnP/1.0 ").append(serverProduct()).append("\r\n");
+        sb.append("\r\n");
+        out.write(sb.toString().getBytes("UTF-8"));
+        if (withBody && r.payload.length > 0) {
+            out.write(r.payload);
         }
     }
 
@@ -571,7 +654,8 @@ public class UpnpHttpServer extends Thread {
                 .append("    <manufacturerURL>").append(PROJECT_URL).append("</manufacturerURL>\n")
                 .append("    <modelDescription>DLNA/UPnP 投屏接收端</modelDescription>\n")
                 .append("    <modelName>Juping Receiver</modelName>\n")
-                .append("    <modelNumber>1.0</modelNumber>\n")
+                .append("    <modelNumber>").append(escapeXml(versionName))
+                .append("</modelNumber>\n")
                 .append("    <modelURL>").append(PROJECT_URL).append("</modelURL>\n")
                 // serialNumber 用设备自己的 UDN 值。它本来就是"这台设备在这个
                 // 网络里的唯一编号"，而且跨重启稳定（UUID 持久化在 SharedPreferences 里）。
@@ -737,7 +821,7 @@ public class UpnpHttpServer extends Thread {
                 + "TIMEOUT: Second-" + timeoutSec + "\r\n"
                 + "Content-Length: 0\r\n"
                 + "Connection: close\r\n"
-                + "Server: Android UPnP/1.0 Juping/1.0\r\n\r\n";
+                + "Server: Android UPnP/1.0 " + serverProduct() + "\r\n\r\n";
         out.write(resp.getBytes("UTF-8"));
     }
 
@@ -746,7 +830,7 @@ public class UpnpHttpServer extends Thread {
         String resp = "HTTP/1.1 " + status + "\r\n"
                 + "Content-Length: 0\r\n"
                 + "Connection: close\r\n"
-                + "Server: Android UPnP/1.0 Juping/1.0\r\n\r\n";
+                + "Server: Android UPnP/1.0 " + serverProduct() + "\r\n\r\n";
         out.write(resp.getBytes("UTF-8"));
     }
 
@@ -1092,7 +1176,27 @@ public class UpnpHttpServer extends Thread {
                 || c == '-' || c == '_' || c == '.' || c == ':';
     }
 
-    /** 朴素地抽出 &lt;Tag&gt;value&lt;/Tag&gt; 形式的参数 */
+    /**
+     * 抽出 SOAP 报文里的动作参数。
+     *
+     * <p>匹配策略<b>照抄成熟 UPnP 栈</b>（jUPnP / Cling 的
+     * {@code SOAPActionProcessorImpl#getMatchingNodes}）：按**剥掉命名空间
+     * 前缀后的标签名**匹配，<b>完全无视属性</b>，值取元素文本内容。理由：
+     * <ul>
+     *   <li>UPnP SOAP 参数允许带属性（Platinum 系控制点发
+     *       {@code <CurrentURI val="http://...">}），之前只认
+     *       {@code <Tag>value</Tag>}，带属性的参数被静默丢弃 ——
+     *       {@code SetAVTransportURI} 表现为缺 URI 投不上，日志看不出原因；</li>
+     *   <li>个别协议栈连参数都带前缀（{@code <u:CurrentURI>}），jUPnP 连这个
+     *       都兼容（{@code getUnprefixedNodeName}），照做没有坏处 ——
+     *       多出来的键（如动作包装元素 {@code u:Play} → "Play"）没人读，
+     *       dispatch 只认已知参数名。</li>
+     * </ul>
+     *
+     * <p>容错保持与旧版一致：自闭合 {@code <Tag/>}、找不到闭合标签的、
+     * 注释与声明，全部跳过；值里出现裸 {@code <}（正常不会发生 —— DIDL
+     * 元数据在 SOAP 里是转义过的）会找不到闭合而自然丢弃。
+     */
     private Map<String, String> extractArguments(String body) {
         Map<String, String> map = new HashMap<String, String>();
         if (body == null) {
@@ -1108,18 +1212,45 @@ public class UpnpHttpServer extends Thread {
             if (close < 0) {
                 break;
             }
-            String tag = body.substring(open + 1, close).trim();
-            if (tag.length() == 0 || tag.startsWith("/") || tag.startsWith("?")
-                    || tag.contains(":") || tag.startsWith("!")) {
-                idx = close + 1;
+            String raw = body.substring(open + 1, close).trim();
+            idx = close + 1;
+            // 声明 / 注释 / 闭合 / 自闭合：都不是参数
+            if (raw.length() == 0 || raw.startsWith("/") || raw.startsWith("?")
+                    || raw.startsWith("!") || raw.endsWith("/")) {
                 continue;
             }
-            int end = body.indexOf("</" + tag + ">", close);
+            // 剥属性：标签名取第一个空白符之前的部分
+            String name = raw;
+            for (int i = 0; i < raw.length(); i++) {
+                if (Character.isWhitespace(raw.charAt(i))) {
+                    name = raw.substring(0, i);
+                    break;
+                }
+            }
+            // 剥命名空间前缀（与 jUPnP getUnprefixedNodeName 一致）
+            int colon = name.indexOf(':');
+            if (colon >= 0) {
+                name = name.substring(colon + 1);
+            }
+            if (name.length() == 0) {
+                continue;
+            }
+            // 闭合标签：优先按原文找（带前缀），找不到再按剥后的名字找
+            int end = body.indexOf("</" + raw + ">", idx);
+            if (end < 0 && !raw.equals(name)) {
+                end = body.indexOf("</" + name + ">", idx);
+            }
             if (end < 0) {
-                idx = close + 1;
                 continue;
             }
-            map.put(tag, unescapeXml(body.substring(close + 1, end)));
+            String inner = body.substring(idx, end);
+            if (inner.indexOf('<') >= 0) {
+                // 容器元素（s:Envelope / s:Body / u:动作名）：里面还嵌着标签。
+                // **不能**把整个子树记成它的值，更不能把扫描位置跳到闭合标签之后
+                // —— 那样真正的参数（都在容器里面）会被整体吞掉。继续往里扫。
+                continue;
+            }
+            map.put(name, unescapeXml(inner));
             idx = end;
         }
         return map;
@@ -1164,30 +1295,10 @@ public class UpnpHttpServer extends Thread {
         sb.append("Content-Type: ").append(contentType).append("\r\n");
         sb.append("Content-Length: ").append(payload.length).append("\r\n");
         sb.append("Connection: close\r\n");
-        sb.append("Server: Android UPnP/1.0 Juping/1.0\r\n");
+        sb.append("Server: Android UPnP/1.0 " + serverProduct() + "\r\n");
         sb.append("\r\n");
         out.write(sb.toString().getBytes("UTF-8"));
         out.write(payload);
-    }
-
-    /**
-     * 带二进制 body 的响应（目前只有图标用）。
-     *
-     * <p>和 {@link #writeSimple} 的唯一区别是 body **不经过 String**：
-     * PNG 用 UTF-8 编一遍再解回来会被替换字符毁掉（0x80~0xFF 里大量字节
-     * 不是合法 UTF-8 序列），控制点收到的就是一张坏图。字节必须原样发出去。
-     */
-    private void writeBinary(OutputStream out, String status, String contentType, byte[] body)
-            throws IOException {
-        StringBuilder sb = new StringBuilder();
-        sb.append("HTTP/1.1 ").append(status).append("\r\n");
-        sb.append("Content-Type: ").append(contentType).append("\r\n");
-        sb.append("Content-Length: ").append(body.length).append("\r\n");
-        sb.append("Connection: close\r\n");
-        sb.append("Server: Android UPnP/1.0 Juping/1.0\r\n");
-        sb.append("\r\n");
-        out.write(sb.toString().getBytes("UTF-8"));
-        out.write(body);
     }
 
     // ------------------------------------------------------------ 小工具

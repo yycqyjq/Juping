@@ -1542,12 +1542,20 @@ if si:
            'png == null' in si and 'return' in si,
            '图标是纯装饰。参数不合法时若照收，device.xml 里就会出现一个'
            '宽高为 0 或取不到的 iconList')
-hg = body_of(http, 'private void handleGet(String path, OutputStream out)')
+hg = body_of(http, 'private StaticResource resolveStatic(String path)')
 if hg:
     report('图标走二进制出口，不经过 String',
-           'writeBinary' in hg and 'ICON_PATH' in hg,
+           'writeBinary' not in hg and 'iconPng' in hg and 'ICON_PATH' in hg,
            'PNG 用 UTF-8 编一遍再解回来会被替换字符毁掉（0x80~0xFF 里大量字节'
-           '不是合法 UTF-8 序列），控制点收到的就是一张坏图')
+           '不是合法 UTF-8 序列），控制点收到的就是一张坏图。'
+           '图标在 resolveStatic 里以 byte[] 原样返回，写入时不再过 String')
+ws = body_of(http, 'private void writeStatic(OutputStream out, StaticResource r, boolean withBody)')
+if ws:
+    report('静态资源写出时 body 字节原样透传',
+           "r.payload.length > 0" in ws and 'out.write(r.payload)' in ws
+           and 'payload.getBytes' not in ws,
+           'GET/HEAD 共用这一个出口。body 若在这里再过一次 String 编解码，'
+           '图标的二进制字节就被毁掉 —— 头部走 UTF-8 没问题，body 不行')
 
 # ---- (3) SCPD 的 relatedStateVariable 不能由参数名推出来 ----
 report('SCPD 的 relatedStateVariable 不再拿参数名当变量名',

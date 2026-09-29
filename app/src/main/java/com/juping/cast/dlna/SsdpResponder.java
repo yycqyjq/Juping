@@ -173,6 +173,9 @@ public class SsdpResponder extends Thread {
     private final String uuid;
     private final int httpPort;      // 设备描述 URL 里的端口（LOCATION 用）
     private final String serverName;
+
+    /** 应用版本名（如 "0.1.4"）—— SERVER 头产品段 "Juping/<版本>" 的来源 */
+    private final String versionName;
     private final int port;
 
     /**
@@ -215,6 +218,11 @@ public class SsdpResponder extends Thread {
         this(uuid, httpPort, serverName, SSDP_PORT);
     }
 
+    /** 生产入口：版本号随构造注入（SERVER 头产品段的来源），SSDP 端口用默认 1900。 */
+    public SsdpResponder(String uuid, int httpPort, String serverName, String versionName) {
+        this(uuid, httpPort, serverName, SSDP_PORT, versionName);
+    }
+
     /**
      * 可指定端口的构造函数。
      *
@@ -227,12 +235,19 @@ public class SsdpResponder extends Thread {
      * 拆成了两次独立选择，它们随时可能分叉。
      */
     public SsdpResponder(String uuid, int httpPort, String serverName, int port) {
+        this(uuid, httpPort, serverName, port, "0.0.0");
+    }
+
+    /** 带版本号的构造函数 —— SERVER 头的产品段来自它，与 device.xml 的 modelNumber 同源。 */
+    public SsdpResponder(String uuid, int httpPort, String serverName, int port,
+                         String versionName) {
         super("ssdp-responder");
         setDaemon(true);
         this.uuid = uuid;
         this.httpPort = httpPort;
         this.serverName = serverName;
         this.port = port;
+        this.versionName = versionName;
     }
 
     /** 当前绑定的网卡名，供 UI 显示和排障用 */
@@ -810,7 +825,7 @@ public class SsdpResponder extends Thread {
         if (alive) {
             sb.append("CACHE-CONTROL: max-age=").append(CACHE_MAX_AGE_SEC).append("\r\n");
             sb.append("LOCATION: ").append(location).append("\r\n");
-            sb.append("SERVER: ").append(serverName).append(" UPnP/1.0 Juping/1.0\r\n");
+            sb.append("SERVER: ").append(serverName).append(" UPnP/1.0 Juping/" + versionName + "\r\n");
         }
         sb.append("NT: ").append(nt).append("\r\n");
         sb.append("NTS: ").append(nts).append("\r\n");
@@ -827,7 +842,7 @@ public class SsdpResponder extends Thread {
                 + "CACHE-CONTROL: max-age=" + CACHE_MAX_AGE_SEC + "\r\n"
                 + "EXT:\r\n"
                 + "LOCATION: " + location + "\r\n"
-                + "SERVER: " + serverName + " UPnP/1.0 Juping/1.0\r\n"
+                + "SERVER: " + serverName + " UPnP/1.0 Juping/" + versionName + "\r\n"
                 + "ST: " + st + "\r\n"
                 + "USN: " + usnFor(st) + "\r\n"
                 + "BOOTID.UPNP.ORG: " + BOOT_ID + "\r\n"

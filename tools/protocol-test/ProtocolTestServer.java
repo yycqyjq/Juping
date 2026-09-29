@@ -30,6 +30,13 @@ public class ProtocolTestServer {
 
     private static final String UUID = "11111111-2222-3333-4444-555555555555";
 
+    /**
+     * 测试版本号。喂给 UpnpHttpServer / SsdpResponder，驱动据此断言
+     * device.xml 的 modelNumber 与响应的 Server 头 —— 与真实构建里
+     * BuildConfig.VERSION_NAME 的注入路径是同一个构造参数。
+     */
+    static final String TEST_VERSION = "9.9.9";
+
     /** 固定的返回値，测试驱动按这些值来断言 */
     private static final long FAKE_POSITION_MS = 123456L;   // 00:02:03
     private static final long FAKE_DURATION_MS = 7200000L;  // 02:00:00
@@ -311,7 +318,11 @@ public class ProtocolTestServer {
             }
         };
 
-        UpnpHttpServer server = new UpnpHttpServer(port, UUID, "聚屏-TESTBOX", handler, source);
+        // 版本号用 9.9.9 而不是照抄真实版本：drive.py 断言 device.xml 的
+        // modelNumber 与 SERVER 头就是这个值 —— 这能证明「版本号真的从
+        // 构造函数贯通到了协议层」，而不是两处碰巧都写着同一个常量。
+        UpnpHttpServer server = new UpnpHttpServer(port, UUID, "聚屏-TESTBOX", TEST_VERSION,
+                handler, source);
         SERVER = server;
 
         // 给一份真图标，让驱动能验"声明了就必须给得出"这条纪律：
@@ -327,7 +338,8 @@ public class ProtocolTestServer {
         // 只把 HTTP 端口交给 SSDP —— LOCATION 由响应器在**绑上组播之后**
         // 用实际绑定的那张网卡的 IPv4 拼出来（和真实服务完全一致）。
         // 驱动会顺着它去抓 device.xml，这一步正是「搜到了却投不了屏」的典型断点。
-        SsdpResponder ssdp = new SsdpResponder(UUID, port, "Android/4.0.4", ssdpPort);
+        SsdpResponder ssdp = new SsdpResponder(UUID, port, "Android/4.0.4", ssdpPort,
+                TEST_VERSION);
         ssdp.start();
 
         // 等两个服务真的起来，再告诉驱动可以开始了

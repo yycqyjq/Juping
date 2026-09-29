@@ -260,7 +260,7 @@ public class DlnaRendererService extends Service
 
         localIp = NetUtil.pickLocalIp();
 
-        httpServer = new UpnpHttpServer(HTTP_PORT, uuid, friendlyName, this, this);
+        httpServer = new UpnpHttpServer(HTTP_PORT, uuid, friendlyName, BuildConfig.VERSION_NAME, this, this);
         // 图标要在 start() 之前给 —— 设备描述是随请求现生成的，
         // 但早点给上可以让"第一台来搜的控制点"就看到图标。
         provideDeviceIcon();
@@ -271,7 +271,7 @@ public class DlnaRendererService extends Service
         // 提前在外面拼一个，就等于把「组播绑哪张网卡」和「告诉手机去哪取描述」
         // 拆成两次独立选择：第一张候选网卡 joinGroup 失败时，组播会绑到第二张上，
         // 而 LOCATION 还指着第一张 —— 手机搜得到设备、点进去却拉不到描述。
-        ssdp = new SsdpResponder(uuid, HTTP_PORT, serverName);
+        ssdp = new SsdpResponder(uuid, HTTP_PORT, serverName, BuildConfig.VERSION_NAME);
         ssdp.start();
 
         // 网络变化监听。放在两条链路都起来之后注册 —— 注册本身不做事，
@@ -474,7 +474,7 @@ public class DlnaRendererService extends Service
             // 不关就重建等于漏一个 socket + 一个调度器。
             s.shutdown();
         }
-        ssdp = new SsdpResponder(uuid, HTTP_PORT, serverName);
+        ssdp = new SsdpResponder(uuid, HTTP_PORT, serverName, BuildConfig.VERSION_NAME);
         ssdp.start();
         Log.i(TAG, "已重建 SSDP（" + reason + "）");
     }
@@ -491,7 +491,7 @@ public class DlnaRendererService extends Service
         if (h != null) {
             h.shutdown();
         }
-        httpServer = new UpnpHttpServer(HTTP_PORT, uuid, friendlyName, this, this);
+        httpServer = new UpnpHttpServer(HTTP_PORT, uuid, friendlyName, BuildConfig.VERSION_NAME, this, this);
         provideDeviceIcon();
         httpServer.start();
         Log.i(TAG, "已重建 HTTP 服务（" + reason + "）");
