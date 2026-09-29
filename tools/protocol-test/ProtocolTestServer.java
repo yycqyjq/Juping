@@ -33,9 +33,28 @@ public class ProtocolTestServer {
     private static final long FAKE_POSITION_MS = 123456L;   // 00:02:03
     private static final long FAKE_DURATION_MS = 7200000L;  // 02:00:00
 
+    /**
+     * 测试图标的尺寸。
+     *
+     * <p>刻意用一个"不像任何真实图标"的尺寸（13×7）：驱动要核对
+     * device.xml 里声明的宽高与 PNG 里 IHDR 报的宽高是否一致，
+     * 如果两边都写死 48，那么"声明跟着实际走"这件事就验不出来。
+     */
+    private static final int ICON_W = 13;
+    private static final int ICON_H = 7;
+
     private static volatile String transportState = "NO_MEDIA_PRESENT";
     private static volatile String currentUri = "";
     private static volatile int volume = 42;
+
+    /**
+     * 静音状态。和音量一样是**独立**的一格 —— 这正是被测点：
+     * "静音"不是"音量 0"，两个状态必须分开记。
+     *
+     * <p>驱动会 SetMute(true) 之后回读 GetMute，还会检查事件里的 Mute；
+     * 只要实现里哪一处写死了常量，那几条断言就会红。
+     */
+    private static volatile boolean muted = false;
 
     /**
      * 出错态模拟。
@@ -176,6 +195,18 @@ public class ProtocolTestServer {
             public int getVolume0to100() {
                 return volume;
             }
+
+            @Override
+            public void onSetMute(boolean mute) {
+                muted = mute;
+                rec("SetMute", mute ? "1" : "0");
+                push("RenderingControl");
+            }
+
+            @Override
+            public boolean getMute() {
+                return muted;
+            }
         };
 
         // 事件源：和真实服务一样，如实汇报当前状态。
@@ -196,7 +227,8 @@ public class ProtocolTestServer {
                 }
                 if ("RenderingControl".equals(service)) {
                     vars.put("Volume", String.valueOf(volume));
-                    vars.put("Mute", "0");
+                    // 和真实服务一致：报真实静音状态，不是写死的常量
+                    vars.put("Mute", muted ? "1" : "0");
                     return vars;
                 }
                 if ("ConnectionManager".equals(service)) {
@@ -211,6 +243,15 @@ public class ProtocolTestServer {
 
         UpnpHttpServer server = new UpnpHttpServer(port, UUID, "聚屏-TESTBOX", handler, source);
         SERVER = server;
+
+        // 给一份真图标，让驱动能验"声明了就必须给得出"这条纪律：
+        //   · device.xml 里出现 iconList，且宽高与这里传的一致；
+        //   · /upnp/icon.png 回 200 + image/png，且**字节一个不差**。
+        // 用真 PNG 而不是随便几个字节 —— 后者验不出"字节有没有被 UTF-8 编坏"
+        // 这个真实的坑（PNG 里大量字节不是合法 UTF-8 序列）。
+        byte[] icon = makeTestPng(ICON_W, ICON_H);
+        server.setIcon(icon, ICON_W, ICON_H);
+
         server.start();
 
         // 只把 HTTP 端口交给 SSDP —— LOCATION 由响应器在**绑上组播之后**
@@ -262,5 +303,20 @@ public class ProtocolTestServer {
         System.out.flush();
 
         Thread.sleep(Long.MAX_VALUE);
+    }
+
+    /**
+     * 生成一张真的 PNG。
+     *
+     * <p>桌面 JVM 有 {@code ImageIO}，直接用就行 —— 这个类只在
+     * tools/protocol-test 里用，不会进 APK，所以可以放心依赖 java.awt。
+     * 安卓侧的对应实现是 {@code Bitmap.compress()}（见 DlnaRendererService）。
+     */
+    private static byte[] makeTestPng(int w, int h) throws IOException {
+        java.awt.image.BufferedImage img = new java.awt.image.BufferedImage(
+                w, h, java.awt.image.BufferedImage.TYPE_INT_RGB);
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        javax.imageio.ImageIO.write(img, "png", out);
+        return out.toByteArray();
     }
 }

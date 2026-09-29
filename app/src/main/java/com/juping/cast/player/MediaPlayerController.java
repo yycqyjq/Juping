@@ -1,9 +1,11 @@
 package com.juping.cast.player;
 
+import android.content.Context;
 import android.media.AudioManager;
 import android.media.MediaPlayer;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.util.Log;
 import android.view.Surface;
 
@@ -60,6 +62,19 @@ public class MediaPlayerController {
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private Listener listener;
+
+    /**
+     * 只用于 {@code MediaPlayer.setWakeMode()}。
+     *
+     * <p>持有的是 Service 自身，生命周期与这个控制器完全一致，不会泄漏。
+     * 之所以必须拿到它：{@code setWakeMode} 的签名要一个 Context，
+     * 而这个能力没法用别的方式表达（见 {@link #startInternal()} 里的说明）。
+     */
+    private final Context context;
+
+    public MediaPlayerController(Context context) {
+        this.context = context;
+    }
 
     private MediaPlayer player;
     private Surface surface;
@@ -135,6 +150,18 @@ public class MediaPlayerController {
      * 控制点拖完音量条回读会看到跳回 100，等于谎报。
      */
     private float volume = 1.0f;
+
+    /**
+     * 是否静音。
+     *
+     * <p>和 {@link #volume} **必须分开记**：静音不是"音量 0"。
+     * 控制点按静音再取消静音时，音量要回到原来的值 —— 如果实现成
+     * 「静音 = setVolume(0)」，取消静音就只能回到满格，用户设过的音量被吃掉。
+     * 同理 GetVolume 报的也应该是用户设的那个值，而不是静音后的 0。
+     *
+     * <p>和音量一样，重连重建播放器实例后必须重放（见 {@link #applyVolume()}）。
+     */
+    private boolean muted;
 
     /**
      * 当前流有没有视频轨。onPrepared 时用 {@code getVideoWidth()} 判定。
@@ -224,9 +251,19 @@ public class MediaPlayerController {
         try {
             player = new MediaPlayer();
             player.setAudioStreamType(AudioManager.STREAM_MUSIC);
-            // 把记住的音量应用到新的 MediaPlayer 实例上。
-            // 重连会重建实例，不重放这一句的话，一次断流就会把音量悄悄拉回满格。
-            player.setVolume(volume, volume);
+            // 把记住的音量与静音状态应用到新的 MediaPlayer 实例上。
+            // 重连会重建实例，不重放的话一次断流就会把音量拉回满格、静音也丢了。
+            applyVolume();
+            // 播放期间必须钉住 CPU，否则息屏后解码会被系统挂起。
+            //
+            // 只靠 setScreenOnWhilePlaying(true) 是不够的：那一句**只对设了 Surface
+            // 的视频有效**（官方文档明写"仅在 setSurface() 被调用后有效"）。
+            // 而音乐投屏恰恰没有 Surface —— 屏幕不会亮，CPU 也不被钉住，
+            // 用户关了电视屏（或盒子进了待机）音乐就会卡住甚至断流。
+            //
+            // setWakeMode 从 API 1 就有，且它申请的 PARTIAL_WAKE_LOCK 由播放器自己
+            // 在 release() 时释放，不需要我们手动配平。WAKE_LOCK 权限在 manifest 里。
+            player.setWakeMode(context, PowerManager.PARTIAL_WAKE_LOCK);
             if (surface != null) {
                 player.setSurface(surface);
             }
@@ -592,18 +629,46 @@ public class MediaPlayerController {
     public void setVolume(float volume) {
         // 先记下来再下发：重连会重建 MediaPlayer 实例，不记的话音量会丢。
         this.volume = Math.max(0f, Math.min(1f, volume));
-        if (player != null) {
-            try {
-                player.setVolume(this.volume, this.volume);
-            } catch (Exception e) {
-                Log.w(TAG, "setVolume 失败", e);
-            }
-        }
+        applyVolume();
     }
 
     /** 当前音量，0 ~ 100。给 RenderingControl 的 GetVolume 回读用。 */
     public int getVolume0to100() {
         return Math.round(volume * 100f);
+    }
+
+    /**
+     * 设置静音。
+     *
+     * <p>同样**先记再下发** —— 重连重建实例后要重放，
+     * 否则一次断流就把用户的静音给取消了。
+     */
+    public void setMute(boolean mute) {
+        this.muted = mute;
+        applyVolume();
+    }
+
+    /** 当前是否静音。给 RenderingControl 的 GetMute 回读用。 */
+    public boolean isMuted() {
+        return muted;
+    }
+
+    /**
+     * 把「音量 + 静音」这两个状态一起下发给播放器。
+     *
+     * <p>只留这一个出口：任何一处单独调 {@code player.setVolume()} 都会漏掉静音，
+     * 于是出现「设了静音、改一下音量就又有声音了」这类只在特定顺序下复现的 bug。
+     */
+    private void applyVolume() {
+        if (player == null) {
+            return;
+        }
+        try {
+            float v = muted ? 0f : volume;
+            player.setVolume(v, v);
+        } catch (Exception e) {
+            Log.w(TAG, "应用音量失败", e);
+        }
     }
 
     /**

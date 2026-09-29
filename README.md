@@ -71,12 +71,12 @@ Juping/
     ├── check_dex_entrypoints.py  反汇编 dex，核 R8 有没有把框架回调名改坏
     ├── protocol-test/        DLNA 协议层端到端测试（桌面 JVM，不需要真机）
     │   ├── run.sh            编译 → 起服务 → 驱动 → 验证两个自检脚本
-    │   ├── drive.py          165 项一致性检查（原始 socket 精确控字节）
+    │   ├── drive.py          214 项一致性检查（原始 socket 精确控字节）
     │   ├── ProtocolTestServer.java  在桌面跑真实的 UpnpHttpServer + SsdpResponder
     │   ├── verify-device-selftest.sh  用假 adb 验 verify-on-device.sh 的管道
     │   └── android/util/Log.java    android.util.Log 的桌面替身
     └── policy-test/          播放重连策略测试（纯逻辑，不需要真机）
-        ├── run.sh            编译 + 57 项断言 + 156 条源码级不变量守卫
+        ├── run.sh            编译 + 57 项断言 + 189 条源码级不变量守卫
         └── PolicyTest.java   57 项断言 + 「卡死→重连→又卡死」循环模拟
 ```
 
@@ -379,14 +379,14 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 当前结果：
 
 ```
-被引用的平台类 63 个 · 方法 234 个 · 字段 3 个
-结论：237 个平台引用全部命中，无 API 越界。
+被引用的平台类 70 个 · 方法 249 个 · 字段 5 个
+结论：254 个平台引用全部命中，无 API 越界。
 ```
 
 为什么要两道：lint 依赖内置数据库，而且本项目关掉了 8 项检查 ——
 万一其中某一项顺带掩盖了 API 问题，lint 不会吭声。第二道是**独立判据**。
 
-> **release 的数字比 debug 还大（237 vs 228），这不是 bug。** 反了才对得上：
+> **release 的数字比 debug 还大（254 vs 244），这不是 bug。** 反了才对得上：
 > javac 编译 `MainActivity` 时，`findViewById` 这类继承来的调用**以子类为 owner**
 > 发出去（`Lcom/juping/cast/MainActivity;.findViewById`），而这个检查器只看
 > **平台类** owner 的引用 —— 于是 debug 包里有几条被静默跳过。
@@ -414,7 +414,7 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 ```
 
 ```
-协议一致性：165 / 165 通过
+协议一致性：214 / 214 通过
 ```
 
 覆盖两大故障场景 —— **「手机搜不到设备」和「投屏没反应」**：
@@ -430,8 +430,9 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 | **10** | **GENA 事件订阅**：SCPD 必须声明哪些变量可事件化；订阅后必须立刻收到 SEQ 0 的初始事件；状态一变必须推、SEQ 必须递增；非法订阅（CALLBACK 与 SID 同给/同不给、NT 不对、SID 不认识、服务名不对）必须回 412/404；退订后不许再推 |
 | 11     | 请求行变体：绝对形式（`GET http://host/path`）、多余空格、带查询串                                                                                                                                                          |
 | **12** | **三处「无上限」的防御**：超大 `Content-Length` 必须回 413（而不是照着它分配内存）、并发连接有上限且到顶后服务仍活着、订阅表到顶时最旧的被淘汰                        |
+| **13** | **照成熟 DMR 补齐的那批**：`<device>` 子元素顺序合 schema、`dlna:X_DLNADOC=DMR-1.50`、`iconList` 声明的宽高与 PNG 实际像素一致；三个 SCPD 的 `relatedStateVariable` 无悬空引用、有出参、声明了实现支持的每个 action；`SetMute`/`GetMute` 真接通（含 `yes`/`no` 两种布尔写法）；`Next`/`Previous` 回 701；协议清单里没有 `image/*`；M-SEARCH 按 MX 随机延迟 |
 
-> **这套测试累计抓出六个真 bug**，每一个都能让投屏在真机上失效，
+> **这套测试累计抓出十二处问题**，绝大多数都能让投屏在真机上失效，
 > 而真机上全都无从定位：
 >
 > **投屏侧（第 1–6 段）**
@@ -509,6 +510,29 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 > 一旦越过末尾，位置会直接落到结尾并触发播放完成，用户看到的就是
 > 「进度直接满了、声音也没了」。这个越界值往往不是控制点算错，
 > 而是**我们把 Target 解析错了**（单位、格式），错得越大越像「跳到了结尾」。
+>
+> **照成熟 DMR 补齐的那一轮（第 13 段）**
+> ⑪ **静音是坏的，而且坏在两个方向**。`SetMute` 明明写在白名单里，但
+> `dispatch()` 里**根本没有对应分支** —— 整条指令落进 default 被无视；
+> 而 `GetMute` 的实现是 `return 0;`，**和已经修过的 `GetVolume` 恒回 100
+> 是同一个 bug**，只是漏了静音那半边。
+> 比"整个没接"更难发现的是**解析方向反了**：UPnP 的布尔有**六个**合法取值
+> （`0`/`false`/`no` 为假，`1`/`true`/`yes` 为真，大小写不敏感），
+> 而 `parseBoolean` 只认 `1`/`true`。控制点发 `DesiredMute=yes` 时会被
+> 解析成 `false` —— **用户按静音，声音反而回来了**。
+> 这比"不支持静音"更糟：用户会以为是自己按错了。
+> 修的时候顺手把音量与静音收敛到**唯一一个** `applyVolume()`
+> （全项目唯一一处 `player.setVolume()`）—— 否则「设了静音、再动一下音量
+> 又有声」这种只在特定操作顺序下复现的问题会一直留着。
+> ⑫ **SCPD 是假的**。`relatedStateVariable` 直接拿**参数名**当状态变量名，
+> 而这些名字**从没在 `serviceStateTable` 里声明过**；并且每个 action
+> **一个 out 参数都没写**。这不是"少个字段"这么轻 ——
+> 严格校验 SCPD 的控制点（Cling / jUPnP 系、BubbleUPnP）会**整份解析失败**：
+> 在它眼里这台设备**根本不存在**，连个错误都不会报。
+> 而宽松的控制点（多数国产投屏 SDK）压根不校验，所以本地怎么试都是好的。
+> 同一轮还发现 `SetPlaySpeed` **不是 AVTransport:1 的标准 action**
+> （经 Platinum 官方 SCPD 逐条核实），而它同时写在白名单和 SCPD 里 ——
+> 等于对外声明一个不存在的指令，三处一起删掉。
 
 > **这些断言做过反向验证**：把 `getCurrentUri()` 临时改成恒返回空串，
 > 测试从 95/95 掉到 91/95，失败项正好是那 4 条「有媒体时必须有地址」的断言。
@@ -828,12 +852,12 @@ com/juping/cast/player/…                   →  找不到这个前缀
   结论：框架回调、Thread 子类、协议常量全部完好，R8 输出可用。
 ```
 
-共 **30 项**，核四类东西：
+共 **33 项**，核四类东西：
 
 | 核什么                                       | 为什么                                                                  |
 | -------------------------------------------- | ----------------------------------------------------------------------- |
 | manifest 三个组件的类名、父类、生命周期回调名 | 类被并掉 / 回调被改名 = 装上就崩                                        |
-| 13 个框架接口实现的方法名                     | 这些名字是系统写死的，改了等于没实现                                    |
+| 16 个框架接口实现的方法名                     | 这些名字是系统写死的，改了等于没实现                                    |
 | `extends Thread` 的子类数量（源码 2 / dex 2） | 纵向合并若并掉一个，它的 `run()` 永远不被调用 —— 而那正是 SSDP 接收循环 |
 | 6 个协议常量字符串                            | 找不到就说明这个 APK 不是当前源码编的，后面所有核验都白做               |
 
@@ -1005,6 +1029,96 @@ SSDP 线程就**永久**结束了。
 > 或者"改了但没改掉"，前面那处还在）—— 这恰恰说明证伪本身也要被审视：
 > 一处破坏红两条时，先确认是断言重叠，还是破坏下手太重。
 
+### 第十一组：照成熟 DMR 把该有的补齐
+
+前面几组都是「真机报上来的问题」。这一轮反过来 —— **照着一个成熟商用 DMR
+（小米盒子那一类）逐项对照**，把该有而没写的补齐。
+
+它们和前面几组有个共同点：不达标时代码照样编译、照样运行、日志里一个字都不多，
+**只是严格的控制点会静默地把这台设备划掉**，或者悄悄把某个功能当成不支持。
+宽松的控制点（多数国产 SDK）不看这些也能用 —— 所以这类缺陷只在部分手机上暴露，
+最容易被误判成"那台手机的问题"。本地怎么点都点不出来，只能和标准原文逐条对。
+
+对照基准：**Platinum UPnP SDK** 的 `Source/Devices/MediaRenderer/*.xml`
+（UPnP 官方 SCPD 模板的忠实转写）、gmrender-resurrect、MiniDLNA，
+以及 UPnP Device Architecture 1.0 的 device-1-0 schema。
+
+**① 三个真 bug**
+
+| 症状 | 机制 |
+| --- | --- |
+| 息屏后音乐投屏卡住 / 断流 | 只调了 `setScreenOnWhilePlaying(true)`，而它**只对设了 Surface 的视频有效**。音乐投屏没有 Surface → 屏幕不亮、CPU 也不被钉住。补上 `setWakeMode(context, PARTIAL_WAKE_LOCK)` —— 它从 API 1 就有，且申请的锁由 `release()` 自动释放，不需要手动配平 |
+| 界面显示"设备已就绪"，实际一个搜索都收不到 | `SsdpResponder.closeQuietly()` 只 close、**不复位 `boundPort`** → 线程因任何原因退出后 `isBound()` 仍返回 true。现在先清状态再关 socket；并给服务加了 30 秒一次的自检（**线程已死且未绑定**才重建） |
+| 控制点按静音没反应、开关自己弹回来 | `SetMute` 写在白名单里，但 `dispatch()` 没有对应分支（整个漏了）；`GetMute` 又写死回 `0`。**和已经修过的 `GetVolume` 恒回 100 是同一个 bug**，只是漏了静音那半边 |
+
+静音这条还牵出一个更细的坑：**静音不是"音量 0"**。实现成 `setVolume(0)` 的话，
+取消静音只能回到满格、用户设过的音量被吃掉；而且 `GetVolume` 应当报**用户设的**
+值，不是静音后的 0。现在音量与静音收敛到**唯一一个出口** `applyVolume()`，
+任何一处单独调 `player.setVolume()` 都会被源码守卫拦下。
+
+另外 `parseBoolean` 只认 `1`/`true` 是不够的：UPnP 的 boolean 有**六个**合法取值
+（`0`/`false`/`no` 为假，`1`/`true`/`yes` 为真）。漏了 `yes` 的后果不是
+"静音不生效"，而是**方向反了** —— 用户按静音，声音反而回来了。
+
+**② 四个兼容性缺口**
+
+- **SCPD 不合规。** `relatedStateVariable` 直接拿参数名当变量名
+  （生成 `<relatedStateVariable>InstanceID</relatedStateVariable>`，
+  而表里没有叫 `InstanceID` 的变量，正确名是 `A_ARG_TYPE_InstanceID`），
+  并且**一个 out 参数都没声明**。严格校验 SCPD 的控制点（Cling / jUPnP 系、
+  BubbleUPnP）会**整份解析失败** —— 不是少一个功能，是这台设备在它眼里不存在。
+  三个服务的 SCPD 已按官方模板重写。
+  顺带查出 `SetPlaySpeed` **根本不是 AVTransport:1 的标准 action**，
+  已从 SCPD 和 `KNOWN_ACTIONS` 里一起删掉（写进 `:1` 的 SCPD 本身就是错的）。
+  同时补上了原来漏在 SCPD 外面、代码里却在处理的 action
+  （`GetDeviceCapabilities` / `GetTransportSettings` / `GetCurrentTransportActions` /
+  `Next` / `Previous` / `SetPlayMode`，以及 RenderingControl 的
+  `ListPresets` / `SelectPreset`）—— 控制点**不会发 SCPD 里没有的 action**，
+  所以这些分支原本是死的。
+- **`device.xml` 字段太少。** 补上 `dlna:X_DLNADOC = DMR-1.50`（这条是分水岭：
+  部分控制点先看它，认不出就不把设备列进投屏列表）、`manufacturerURL` /
+  `modelDescription` / `modelURL` / `serialNumber` / `iconList`，
+  并按 schema 定死的顺序排列子元素（顺序错同样会导致整份解析失败）。
+  **刻意不声明** `presentationURL`（我们没有任何 Web 界面，写 `/` 只会把
+  `device.xml` 本身喂给浏览器）和 `UPC`（不是零售商品，编个假码没有意义）。
+  图标由服务启动时从 `R.drawable.ic_launcher` 解码一次递进来，
+  宽高按**实际像素**声明（`R.drawable` 在运行时只会解析成当前密度的那一张，
+  声明四档就是撒谎）；没有图标时**完全不声明 `iconList`** ——
+  声明了控制点就会真的去 GET，404 在它日志里就是一条"设备描述与实现不一致"。
+- **M-SEARCH 没有按 MX 随机延迟。** 规范要求设备在 0~MX 秒之间**随机**延迟后应答，
+  目的是把多设备、多搜索目标的应答在时间上错开、减少 UDP 碰撞。原来立即连发
+  最多 6 条 → 几台设备同网时表现是「有时搜得到、有时搜不到」，且完全看不出规律。
+  现在用单线程调度器排延迟（**不在收包线程里 sleep**，否则会丢掉这一秒内的其它搜索），
+  待发批数有上限（到顶就丢弃，让控制点重发）、MX 夹在 5 秒内。
+- **`Next` / `Previous` 未实现。** 它们在 AVTransport:1 里是**必选** action，
+  但没有播放列表时正确的回应是 `701 Transition not available`，不是 `200` 空响应
+  （回 200 会让控制点以为"切歌成功"）。判据刻意收得很紧：
+  只放行"设成我们本来就处于的状态" —— `SetPlayMode(NORMAL)` 回 200、
+  收到 `SHUFFLE` 才回 701。
+
+**③ 一处"声明了却做不到"**
+
+`SINK_PROTOCOL_INFO` 里曾经声明 `image/jpeg` / `image/png`，但整套实现里
+根本没有图片这条路（`kindOf()` 只认 audioItem / videoItem，`MediaPlayer`
+本身也不解图片）。**这份清单是控制点判断"能不能推给我"的唯一依据**，
+声明了却做不到，控制点（相册、文件管理器）就会把图片推过来然后必然失败 ——
+用户看到的是"投屏坏了"。宁可让控制点一开始就说"这台设备不支持"。
+已删掉图片格式，并加断言钉住两个出口（`GetProtocolInfo` 与事件里的
+`SinkProtocolInfo`）用的是同一份字符串。
+
+> **这一轮证伪了 14 处，每处都让"恰好预期的那几条"变红，无连带误伤。**
+> 其中两处是**守卫自己写错**，靠证伪才抓出来 —— 记下来当例子：
+>
+> - 「设备描述里有 `dlna:X_DLNADOC` 且值为 `DMR-1.50`」第一版只查方法体，
+>   而值在 `DLNA_DOC` 常量里、元素在方法体里 —— 把值破坏成 `DMR-1.0` 时**照样绿**。
+> - 「`startInternal` 里申请了 `PARTIAL_WAKE_LOCK`」第一版把**注释**也算进了判据。
+>   把调用整行删掉之后守卫仍然 PASS，因为紧挨着的说明注释里同时写着
+>   `setWakeMode` 和 `PARTIAL_WAKE_LOCK`。**一个只看注释就能通过的守卫等于没有** ——
+>   现在这一节的守卫统一**先剥注释再判**。
+>
+> 这两条都不是"想出来的"，是先写完、再拿真源码破坏一遍才暴露的。
+> **守卫的判据本身也要被证伪。**
+
 ### 收尾：把「只能在真机上试」的东西搬到桌面上
 
 上面三个问题修完之后，又收了两件尾 —— 都是「同一个语义写了两份，迟早对不上」
@@ -1057,13 +1171,27 @@ bash 在 **UTF-8 locale** 下会把多字节字符的字节一起吞进变量名
 - **乐联（LeLink）协议不支持**。B站、抖音、部分腾讯视频走的是乐播的私有闭源协议，开源界没有实现，无法对接。能收的是标准 DLNA / UPnP 推送。
 - **AirPlay 未实现**。iOS 侧目前只能用支持 DLNA 的 App 投。要做 AirPlay 接收需要移植 UxPlay（C/C++，GPLv3），是独立的一大块工作。
 - **镜像（Miracast）不做**。老盒子 Wi-Fi Direct 驱动不稳，正是断联根因，不值得修。
+- **图片投屏不支持，而且协议清单里也不再声明它**。`MediaPlayer` 本身不解图片，
+  实现里也没有图片这条路。所以 `SINK_PROTOCOL_INFO` 里**刻意没有** `image/*` ——
+  这份清单是控制点判断"能不能推给我"的唯一依据，声明了却做不到，
+  控制点会把图片推过来然后必然失败，用户看到的是"投屏坏了"。
+  宁可让控制点一开始就说"这台设备不支持"。
+- **事件用的是 AVTransport:1 的「逐变量」模型，没实现 `LastChange`**。
+  即 `TransportState` / `TransportStatus` / `CurrentTrackURI` /
+  `CurrentTrackDuration` / `RelativeTimePosition` 各自声明为可事件化、
+  各自出现在 NOTIFY 里 —— 这是 AVTransport:1 规范模板的写法。
+  另有一种后来的做法是把变更打包进一个 `LastChange` 变量（Platinum 的
+  SCPD 就是那样），控制点若**只**认 `LastChange`，就收不到我们的状态更新，
+  会退回轮询 `GetPositionInfo`（这条链路是通的，所以表现只是进度条
+  更新没那么跟手）。要做的话得构造嵌套 XML，风险与收益不成比例，暂不做。
 - **真机已经跑过一轮，但覆盖面还很窄**。2026-09-29 在目标盒子上实测过
   （Android 4.0.4 / MT5880 / 0.6GB），一轮就暴露并修掉了三个基础体验问题
-  （见上面「投屏基础体验」）。桌面核验现在是十二项全绿：编译 / lint `NewApi` 零命中 /
-  API 引用 237 项全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
-  DLNA 协议 165 项通过 / 播放策略 57 项断言 + 156 条源码级不变量通过 /
-  R8 dex 入口点 30 项通过 / 控制点自检脚本 33 项通过 / 真机验收脚本管道自测 6 项通过 /
-  密钥核查干净 / 工具链脚本的变量名边界检查通过（UTF-8 locale 下不再崩）。
+  （见上面「投屏基础体验」）。桌面核验现在是十三项全绿：编译 / lint `NewApi` 零命中 /
+  API 引用 244 项（release 254 项）全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
+  DLNA 协议 214 项通过 / 播放策略 57 项断言 + 189 条源码级不变量通过 /
+  R8 dex 入口点 33 项通过 / 控制点自检脚本 33 项通过 / 真机验收脚本管道自测 6 项通过 /
+  密钥核查干净 / 工具链脚本的变量名边界检查通过（UTF-8 locale 下不再崩）/
+  破坏性证伪 38 处（含本轮 14 处，每处都只让预期的那几条变红）。
   但**长时间稳定性**（连续投几小时）、**多控制点同时操作**、
   **各种编码格式的硬解**都还没验证过 —— `./tools/verify-on-device.sh`
   一条命令可以跑完基础验收。

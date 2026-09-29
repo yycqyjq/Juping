@@ -43,12 +43,27 @@ ALL_SERVICE_TYPES = (SVC_AVT, SVC_CMS, SVC_RCS)
 results = []
 
 
-def check(name, ok, detail=''):
+def check(name, ok, detail='', note=''):
+    """记一条断言。
+
+    detail 与 note 是**两种不同的东西**，别混：
+
+      · detail —— 诊断信息（实测值、"收到了几条"）。失败时必须打出来，
+        因为那就是定位问题的第一手证据。默认情况下通过时也会打，
+        当作"这条确实验到了"的凭据。
+      · note —— 「这条为什么重要」的说明。**只在通过时**打出来。
+
+    为什么要分开：把一段"缺了它控制点就不认设备"的话放在一个 PASS 行后面，
+    读起来像在报错 —— 上一轮在 tools/check_dex_entrypoints.py 里
+    就踩过一模一样的坑（通过却打印失败话术）。这里补上 note 这个出口，
+    原有的调用行为完全不变（不传 note 就还是老样子）。
+    """
     results.append((name, bool(ok), detail))
     mark = 'PASS' if ok else 'FAIL'
     line = '  [%s] %s' % (mark, name)
-    if detail:
-        line += '\n         %s' % detail.replace('\n', '\n         ')
+    extra = note if (ok and note) else detail
+    if extra:
+        line += '\n         %s' % extra.replace('\n', '\n         ')
     print(line, flush=True)
 
 
@@ -1254,6 +1269,464 @@ _st, _, _ = raw_request('UNSUBSCRIBE', '/upnp/event/AVTransport', {'SID': _first
 check('订阅表有上限：最旧的订阅被淘汰（已不认这个 SID）', '412' in _st, _st)
 _st, _, _ = raw_request('UNSUBSCRIBE', '/upnp/event/AVTransport', {'SID': _last_sid})
 check('订阅表有上限：最新的订阅仍然有效', _st.startswith('HTTP/1.1 200'), _st)
+
+
+# ══════════════════════════════════════════════════════════════ 13. 照成熟 DMR 补齐
+
+print('\n── 13. 照成熟 DMR 补齐（描述字段 / SCPD 自洽 / 静音 / 错误码 / MX）──')
+print('   这一节守的是两件事：「设备能被控制点认出来」和「声明了的必须做到」。')
+print('   共同点是：不达标时宽松的控制点照样能用，所以本地怎么试都试不出来 ——')
+print('   只有严格的控制点会**静默地**把设备划掉，连一句错误都不报。')
+
+
+# --- 13.1 设备描述：字段齐不齐、顺序合不合 schema ---
+
+st, hd, dev_body = raw_request('GET', '/upnp/device.xml')
+dev_root = None
+try:
+    dev_root = ET.fromstring(dev_body.decode('utf-8'))
+except Exception as e:
+    check('13.1 设备描述可解析', False, str(e))
+
+if dev_root is not None:
+    dev_el = None
+    for el in dev_root.iter():
+        if el.tag.endswith('}device'):
+            dev_el = el
+            break
+
+    def lname(t):
+        return t.split('}')[-1]
+
+    # --- 顺序：UDA 1.0 的 device-1-0 schema 定死了 <device> 子元素的次序。
+    #     顺序错的话，按 schema 校验的控制点会**整份解析失败** ——
+    #     不是"少读一个字段"，是这台设备在它眼里不存在。
+    SCHEMA_ORDER = ['deviceType', 'friendlyName', 'manufacturer', 'manufacturerURL',
+                    'modelDescription', 'modelName', 'modelNumber', 'modelURL',
+                    'serialNumber', 'UDN', 'UPC', 'iconList', 'serviceList',
+                    'deviceList', 'presentationURL']
+    order = [lname(c.tag) for c in dev_el]
+    # 除 dlna 扩展外，其余必须是 schema 顺序的一个子序列
+    core = [x for x in order if x != 'X_DLNADOC']
+    it = iter(SCHEMA_ORDER)
+    in_order = all(any(x == y for y in it) for x in core)
+    check('13.1 <device> 子元素顺序符合 device-1-0 schema', in_order,
+          '实际顺序: %s' % order)
+    check('13.1 dlna 扩展元素排在最后（schema 里属于「其它命名空间」）',
+          order and order[-1] == 'X_DLNADOC', '实际顺序: %s' % order)
+
+    def txt1(tag):
+        for el in dev_root.iter():
+            if lname(el.tag) == tag:
+                return el.text or ''
+        return None
+
+    # --- 关键字段：一个都不能缺、也不能是空串 ---
+    for tag, why in (
+            ('manufacturer', '厂商标识，控制点有时按它做兼容性分支'),
+            ('manufacturerURL', '厂商主页'),
+            ('modelDescription', '型号描述，设备详情页显示它'),
+            ('modelName', '型号名'),
+            ('modelNumber', '型号版本'),
+            ('modelURL', '型号主页'),
+            ('serialNumber', '设备序列号'),
+    ):
+        v = txt1(tag)
+        check('13.1 设备描述含 %s' % tag, bool(v and v.strip()),
+              '%s（缺失或为空）' % why if not (v and v.strip()) else '')
+
+    # --- DLNA 标记：这条是"控制点认不认这台设备"的分水岭 ---
+    doc = txt1('X_DLNADOC')
+    check('13.1 dlna:X_DLNADOC = DMR-1.50（渲染器类别声明）',
+          doc == 'DMR-1.50', '实际 %r' % doc,
+          note='声明了渲染器类别。缺了它，部分控制点（较新的国产投屏 SDK 尤其）'
+               '根本不把设备列进投屏列表 —— 而 SSDP 那边看起来一切正常')
+    check('13.1 没有误领 M-DMR-1.50（那是 DLNA Mobile 的类别）',
+          'M-DMR' not in (doc or ''), '实际 %r' % doc,
+          note='我们不是移动设备。领了那个标记，控制点会按移动端的规则来对待')
+
+    # --- 刻意不声明的两个字段：写上去就是撒谎 ---
+    check('13.1 没有声明 presentationURL（我们没有任何 Web 界面）',
+          txt1('presentationURL') is None,
+          '实际 %r' % txt1('presentationURL'),
+          note='写 "/" 只会把 device.xml 本身喂给浏览器。不声明时控制点就不画'
+               '那个按钮 —— 比画一个点开是乱码的按钮诚实')
+    check('13.1 没有编造 UPC 码', txt1('UPC') is None,
+          '实际 %r' % txt1('UPC'),
+          note='UPC 是零售商品条码。我们不是商品，编一个假码没有任何好处，'
+               '而 schema 里它是可选的')
+
+    # --- 图标：声明了就必须给得出，而且尺寸必须对得上 ---
+    icon_el = None
+    for el in dev_root.iter():
+        if lname(el.tag) == 'icon':
+            icon_el = el
+            break
+    check('13.1 声明了 iconList（控制点设备列表里显示的图标）',
+          icon_el is not None, 'device.xml 里没有 <icon>',
+          note='图标是可选的，但声明了就必须给得出 —— 见下面那条')
+
+    if icon_el is not None:
+        ico = {}
+        for c in icon_el:
+            ico[lname(c.tag)] = (c.text or '').strip()
+        check('13.1 icon 的子元素顺序符合 schema（mimetype/width/height/depth/url）',
+              [lname(c.tag) for c in icon_el] ==
+              ['mimetype', 'width', 'height', 'depth', 'url'],
+              '实际: %s' % [lname(c.tag) for c in icon_el])
+        check('13.1 icon 声明了 mimetype=image/png',
+              ico.get('mimetype') == 'image/png', '实际 %r' % ico.get('mimetype'))
+
+        i_st, i_hd, i_body = raw_request('GET', ico.get('url', '/'))
+        check('13.1 iconList 里的 URL 真的取得到（声明了就要给得出）',
+              i_st.startswith('HTTP/1.1 200'), '%s → %s' % (ico.get('url'), i_st))
+        check('13.1 图标按二进制发（Content-Type 是 image/png）',
+              'image/png' in i_hd.get('content-type', ''),
+              i_hd.get('content-type', '(缺失)'))
+
+        # 从 PNG 的 IHDR 里读出**真实**尺寸，与声明值比对。
+        # 只比"声明值等于某个常量"是验不出来的：两边都写死 48 照样绿。
+        def png_size(data):
+            if len(data) < 24 or data[:8] != b'\x89PNG\r\n\x1a\n':
+                return None
+            if data[12:16] != b'IHDR':
+                return None
+            return (int.from_bytes(data[16:20], 'big'),
+                    int.from_bytes(data[20:24], 'big'))
+
+        real = png_size(i_body)
+        check('13.1 发出去的是真 PNG（签名 + IHDR 都在）',
+              real is not None, '前 16 字节: %r' % i_body[:16])
+        if real is not None:
+            check('13.1 iconList 声明的宽高与 PNG 实际像素一致',
+                  (int(ico.get('width', '0')), int(ico.get('height', '0'))) == real,
+                  '声明 %sx%s，实际 %dx%d'
+                  % (ico.get('width'), ico.get('height'), real[0], real[1]),
+                  note='按密度声明四档、实际却只发同一张图，就会这样对不上')
+
+
+# --- 13.2 SCPD 自洽性：relatedStateVariable 必须指向表里真实存在的变量 ---
+
+print('\n  13.2 SCPD 自洽性')
+
+
+def scpd_model(body_bytes):
+    """把 SCPD 解析成 (状态变量名集合, {action: [(参数名, 方向, 关联变量)]})"""
+    root = ET.fromstring(body_bytes.decode('utf-8'))
+
+    def loc(t):
+        return t.split('}')[-1]
+
+    state = set()
+    for sv in root.iter():
+        if loc(sv.tag) == 'stateVariable':
+            for ch in sv:
+                if loc(ch.tag) == 'name':
+                    state.add(ch.text or '')
+
+    actions = {}
+    for a in root.iter():
+        if loc(a.tag) != 'action':
+            continue
+        name = ''
+        args = []
+        for ch in a:                      # 只看直接子节点，避免把 argument 里的 name 当成 action 名
+            if loc(ch.tag) == 'name':
+                name = ch.text or ''
+            elif loc(ch.tag) == 'argumentList':
+                for ag in ch:
+                    if loc(ag.tag) != 'argument':
+                        continue
+                    f = {'name': '', 'direction': '', 'relatedStateVariable': ''}
+                    for x in ag:
+                        k = loc(x.tag)
+                        if k in f:
+                            f[k] = x.text or ''
+                    args.append((f['name'], f['direction'], f['relatedStateVariable']))
+        if name:
+            actions[name] = args
+    return state, actions
+
+
+NEED_ACTIONS = {
+    'AVTransport': ['SetAVTransportURI', 'GetMediaInfo', 'GetTransportInfo',
+                    'GetPositionInfo', 'GetDeviceCapabilities', 'GetTransportSettings',
+                    'GetCurrentTransportActions', 'Stop', 'Play', 'Pause', 'Seek',
+                    'Next', 'Previous', 'SetPlayMode'],
+    'ConnectionManager': ['GetProtocolInfo', 'GetCurrentConnectionIDs',
+                          'GetCurrentConnectionInfo'],
+    'RenderingControl': ['ListPresets', 'SelectPreset', 'GetVolume', 'SetVolume',
+                         'GetMute', 'SetMute'],
+}
+# 每个服务里"必须有出参"的 action —— 这是原来漏得最彻底的一处：
+# 一个 out 参数都没声明，控制点拿到响应也不知道该去哪个变量取。
+NEED_OUT = {
+    'AVTransport': ['GetMediaInfo', 'GetTransportInfo', 'GetPositionInfo',
+                    'GetDeviceCapabilities', 'GetTransportSettings',
+                    'GetCurrentTransportActions'],
+    'ConnectionManager': ['GetProtocolInfo', 'GetCurrentConnectionIDs',
+                          'GetCurrentConnectionInfo'],
+    'RenderingControl': ['ListPresets', 'GetVolume', 'GetMute'],
+}
+
+for short in ('AVTransport', 'ConnectionManager', 'RenderingControl'):
+    s_st, s_hd, s_body = raw_request('GET', '/upnp/%s.xml' % short)
+    try:
+        state, actions = scpd_model(s_body)
+    except Exception as e:
+        check('13.2 %s.xml 可解析' % short, False, str(e))
+        continue
+
+    # (1) 每条 argument 的 relatedStateVariable 都必须在 serviceStateTable 里
+    dangling = []
+    for aname, aargs in actions.items():
+        for pname, _dir, arv in aargs:
+            if arv and arv not in state:
+                dangling.append('%s.%s → %s' % (aname, pname, arv))
+    check('13.2 %s：每个 relatedStateVariable 都指向表里存在的变量' % short,
+          not dangling, '悬空引用: %s' % dangling[:6],
+          note='严格校验 SCPD 的控制点会因为悬空引用**整份解析失败** ——'
+               '不是少一个功能，是这台设备在它眼里不存在')
+
+    # (2) action 清单：代码里处理了、SCPD 里却没声明的，等于死代码
+    missing = [a for a in NEED_ACTIONS[short] if a not in actions]
+    check('13.2 %s：SCPD 声明了实现支持的全部 action' % short, not missing,
+          '缺: %s' % missing,
+          note='控制点不会发 SCPD 里没有的 action，所以这些分支在真机上'
+               '根本不会被执行')
+
+    # (3) 出参
+    no_out = [a for a in NEED_OUT[short]
+              if a in actions and not any(d == 'out' for _, d, _ in actions[a])]
+    check('13.2 %s：有返回值的 action 都声明了 out 参数' % short, not no_out,
+          '缺 out 参数: %s' % no_out,
+          note='控制点靠 out 参数知道响应里该有哪些字段、以及去哪个变量取值')
+
+# (4) SetPlaySpeed 不是 AVTransport:1 的标准 action，不能出现在任何 :1 的 SCPD 里
+_s_st, _s_hd, _avt_body = raw_request('GET', '/upnp/AVTransport.xml')
+check('13.2 SCPD 里没有非标准的 SetPlaySpeed',
+      b'SetPlaySpeed' not in _avt_body,
+      'AVTransport.xml 里出现了 SetPlaySpeed',
+      note='AVTransport:1 的标准 action 里没有它（可对照 Platinum 的 SCPD）。'
+           '写进 :1 的 SCPD 本身就是错的 —— 控制点会以为这台设备支持变速播放')
+
+
+# --- 13.3 SetMute / GetMute 必须真的接通 ---
+
+print('\n  13.3 静音（SetMute / GetMute）')
+
+
+def rcs(action, extra=''):
+    return soap_post(action, SVC_RCS,
+                     '<InstanceID>0</InstanceID><Channel>Master</Channel>' + extra,
+                     control='RenderingControl')
+
+
+def read_mute():
+    _st, _hd, b = rcs('GetMute')
+    return find_xml_text(b, 'CurrentMute'), _st
+
+
+for raw_value, want, label in (('1', '1', '1'),
+                               ('0', '0', '0'),
+                               ('true', '1', 'true（UPnP 布尔的另一种合法写法）'),
+                               ('false', '0', 'false'),
+                               ('yes', '1', 'yes（规范允许，漏了它静音会**反向**）'),
+                               ('no', '0', 'no')):
+    st2, _, _ = rcs('SetMute', '<DesiredMute>%s</DesiredMute>' % raw_value)
+    got, gst = read_mute()
+    check('13.3 SetMute(%s) → GetMute 回 %s' % (label, want),
+          st2.startswith('HTTP/1.1 200') and got == want,
+          'SetMute 回 %s，GetMute 回 %r（期望 %r）' % (st2, got, want))
+
+# 事件里的 Mute 也要跟着走 —— 否则另一台遥控设备上的开关会自己弹回来
+cb_rc = FakeCallback()
+_st, _hd, _ = raw_request('SUBSCRIBE', '/upnp/event/RenderingControl',
+                          {'CALLBACK': '<%s>' % cb_rc.url(), 'NT': 'upnp:event'})
+rc_evs = cb_rc.wait(1, 6.0)
+rc_init_mute = None
+if rc_evs:
+    try:
+        rc_init_mute = propmap(rc_evs[0]['body']).get('Mute')
+    except Exception:
+        rc_init_mute = None
+
+rcs('SetMute', '<DesiredMute>1</DesiredMute>')
+rc_new = drain(cb_rc, len(rc_evs), 6.0)
+rc_mute_after = None
+for e in rc_new:
+    try:
+        m = propmap(e['body'])
+    except Exception:
+        continue
+    if 'Mute' in m:
+        rc_mute_after = m['Mute']
+check('13.3 事件里的 Mute 跟着 SetMute 走（不是写死的常量）',
+      rc_mute_after == '1',
+      '初始事件 Mute=%r，SetMute(1) 之后收到的事件 Mute=%r'
+      % (rc_init_mute, rc_mute_after),
+      note='写死 "0" 的话，用户按了静音，另一个遥控器上的开关会自己弹回来')
+# 收尾：把静音关掉，免得影响后面的断言
+rcs('SetMute', '<DesiredMute>0</DesiredMute>')
+cb_rc.close()
+
+
+# --- 13.4 「语法合法但做不到」必须如实回 701 ---
+
+print('\n  13.4 错误码：做不到就回 701，不假装成功')
+
+
+def fault_code(body_bytes):
+    return find_xml_text(body_bytes, 'errorCode')
+
+
+for act, args_xml, label in (
+        ('Next', '<InstanceID>0</InstanceID>', 'Next'),
+        ('Previous', '<InstanceID>0</InstanceID>', 'Previous'),
+):
+    _st, _hd, b = soap_post(act, SVC_AVT, args_xml)
+    check('13.4 %s 回 701 Transition not available' % label,
+          fault_code(b) == '701', '实际 errorCode=%r' % fault_code(b),
+          note='规范里这两个是必选 action，但没有播放列表时正确回应是 701。'
+               '回 200 空响应的话，控制点会以为"切歌成功"，而界面上什么都没发生')
+
+for mode, want_code, label in (('NORMAL', None, 'NORMAL（我们本来就是它，回 200）'),
+                               ('SHUFFLE', '701', 'SHUFFLE（做不到，回 701）')):
+    _st, _hd, b = soap_post('SetPlayMode', SVC_AVT,
+                            '<InstanceID>0</InstanceID><NewPlayMode>%s</NewPlayMode>' % mode)
+    got = fault_code(b)
+    check('13.4 SetPlayMode(%s)' % label, got == want_code,
+          '实际 errorCode=%r（期望 %r）' % (got, want_code),
+          note='判据刻意收得很紧：只放行"设成我们本来就处于的状态"。'
+               '一律回 200 就是假装支持，控制点会把界面画成"已设为随机播放"')
+
+for preset, want_code, label in (('FactoryDefaults', None, 'FactoryDefaults'),
+                                 ('Night', '701', 'Night（做不到）')):
+    _st, _hd, b = soap_post('SelectPreset', SVC_RCS,
+                            '<InstanceID>0</InstanceID><PresetName>%s</PresetName>' % preset,
+                            control='RenderingControl')
+    got = fault_code(b)
+    check('13.4 SelectPreset(%s)' % label, got == want_code,
+          '实际 errorCode=%r（期望 %r）' % (got, want_code))
+
+
+# --- 13.5 协议清单不能声明做不到的格式 ---
+
+print('\n  13.5 协议清单与实现一致（声明了却做不到 = 对控制点撒谎）')
+
+_st, _hd, b = soap_post('GetProtocolInfo', SVC_CMS, '', control='ConnectionManager')
+sink2 = find_xml_text(b, 'Sink') or ''
+check('13.5 Sink 里没有 image/*（实现里根本没有图片这条路）',
+      'image/' not in sink2.lower(), 'Sink=%s' % sink2[:120],
+      note='声明了图片，控制点（相册、文件管理器）就会把图片推过来，然后必然失败，'
+           '用户看到的是"投屏坏了"。这份清单是控制点判断"能不能推给我"的'
+           '**唯一依据**')
+
+cb_cm = FakeCallback()
+_st, _hd, _ = raw_request('SUBSCRIBE', '/upnp/event/ConnectionManager',
+                          {'CALLBACK': '<%s>' % cb_cm.url(), 'NT': 'upnp:event'})
+cm_evs = cb_cm.wait(1, 6.0)
+cm_sink = None
+if cm_evs:
+    try:
+        cm_sink = propmap(cm_evs[0]['body']).get('SinkProtocolInfo')
+    except Exception:
+        cm_sink = None
+check('13.5 事件里的 SinkProtocolInfo 与 GetProtocolInfo 是同一份',
+      cm_sink is not None and 'image/' not in cm_sink.lower() and cm_sink == sink2,
+      '事件=%r\n         GetProtocolInfo=%r' % (cm_sink, sink2),
+      note='两个出口各写一份的话，改一处忘一处，控制点会看到"声明的"和'
+           '"事件报的"不一致')
+
+
+# --- 13.6 M-SEARCH 必须按 MX 随机延迟 ---
+#
+# 规范（UDA 1.0 §1.3.2）要求设备在 0~MX 秒之间**随机**延迟之后才应答，
+# 目的是把多台设备、多个搜索目标的应答在时间上错开，减少 UDP 碰撞。
+# 立即连发的话，一次搜索就连发最多 6 条，几台设备同网时碰撞概率相当高 ——
+# 表现是「有时搜得到、有时搜不到」，而且完全看不出规律。
+
+print('\n  13.6 M-SEARCH 的 MX 随机延迟')
+
+
+def msearch_first_delay(mx, st_target='upnp:rootdevice'):
+    """发一条 M-SEARCH，返回**第一条应答**到达所用的秒数；超时返回 None"""
+    msg = ('M-SEARCH * HTTP/1.1\r\n'
+           'HOST: 239.255.255.250:1900\r\n'
+           'MAN: "ssdp:discover"\r\n'
+           'MX: %d\r\n'
+           'ST: %s\r\n\r\n' % (mx, st_target)).encode('utf-8')
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        t0 = time.monotonic()
+        s.sendto(msg, (HOST, SSDP_PORT))
+        s.settimeout(6.0)
+        try:
+            s.recvfrom(4096)
+        except socket.timeout:
+            return None
+        return time.monotonic() - t0
+    finally:
+        s.close()
+
+
+def msearch_batch(count, mx, st_target='upnp:rootdevice', window=0.1, total=4.0):
+    """一次发 count 条 M-SEARCH，返回 (收到总数, 前 window 秒内收到的条数)
+
+    为什么这么测：延迟是随机的，逐条计时去断言"确实等了"必然变成偶发红。
+    但"**8 条全都在 100ms 内回来**"的概率是 (0.101)^8 ≈ 1e-8 ——
+    这就把一个随机行为变成了确定性断言。
+    """
+    msg = ('M-SEARCH * HTTP/1.1\r\n'
+           'HOST: 239.255.255.250:1900\r\n'
+           'MAN: "ssdp:discover"\r\n'
+           'MX: %d\r\n'
+           'ST: %s\r\n\r\n' % (mx, st_target)).encode('utf-8')
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    got = early = 0
+    try:
+        for _ in range(count):
+            s.sendto(msg, (HOST, SSDP_PORT))
+        s.settimeout(window)
+        while True:
+            try:
+                s.recvfrom(4096)
+            except socket.timeout:
+                break
+            got += 1
+            early += 1
+        s.settimeout(total)
+        while True:
+            try:
+                s.recvfrom(4096)
+            except socket.timeout:
+                break
+            got += 1
+        return got, early
+    finally:
+        s.close()
+
+
+if SSDP_PORT > 0:
+    d0 = msearch_first_delay(0)
+    check('13.6 MX=0 时立刻应答（延迟确实是按 MX 算的，不是固定睡满）',
+          d0 is not None and d0 < 0.3, '用了 %r 秒' % d0,
+          note='MX=0 却还等半天，说明延迟跟 MX 无关')
+
+    d2 = msearch_first_delay(2)
+    check('13.6 MX=2 时在 MX 之内应答（延迟不会超过 MX）',
+          d2 is not None and d2 <= 2.6, '用了 %r 秒' % d2,
+          note='超过 MX 的话，控制点自己已经等不及了')
+
+    got8, early8 = msearch_batch(8, 1)
+    check('13.6 MX=1 的 8 次搜索全部收到应答（延迟没有把应答拖没）',
+          got8 == 8, '收到 %d / 8' % got8)
+    check('13.6 MX=1 时不是全部立刻回（真的做了 0~MX 的随机延迟）',
+          early8 < 8, '8 条里 %d 条在 100ms 内就回了' % early8,
+          note='全都秒回说明压根没做延迟 —— 多台设备同网时会 UDP 碰撞，'
+               '表现为「有时搜得到、有时搜不到」')
+else:
+    check('13.6 M-SEARCH 延迟（跳过：SSDP 没起来）', False, 'SSDP 端口不可用')
 
 
 # ══════════════════════════════════════════════════════════════ 汇总

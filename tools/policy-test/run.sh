@@ -1317,6 +1317,357 @@ if bad:
     sys.exit(1)
 PY
 
+# ── 11. 照成熟 DMR 补齐的源码级不变量 ──
+# 这一节守的是一批「编译、运行、日志全都正常，只是功能悄悄失效」的回归。
+# 它们有个共同点：**只有严格的控制点会受影响**，而严格的控制点不会报错 ——
+# 它只是静默地把这台设备划掉、或者悄悄把某个功能当成不支持。
+# 所以本地怎么点都点不出来，只能钉在源码上。
+#
+#   · 设备描述缺 dlna:X_DLNADOC → 部分控制点根本不把设备列进投屏列表
+#   · SCPD 的 relatedStateVariable 悬空 → 严格校验的控制点整份解析失败
+#   · 静音只认 "1"/"true"（漏了规范允许的 "yes"）→ 按静音声音**反而回来了**
+#   · M-SEARCH 不按 MX 随机延迟 → 多设备同网时 UDP 碰撞，"有时搜得到有时搜不到"
+#   · SSDP 线程死了不复位绑定状态 → 界面说"已就绪"，实际一个搜索都收不到
+#   · 播放器音量绕过 applyVolume 单独下发 → 设了静音、改一下音量又有声音了
+echo
+echo "── 11. 照成熟 DMR 补齐的源码级不变量 ──"
+python3 - "$HTTP" "$CTRL" "$SVC" <<'PY' || RC=1
+import re, sys, pathlib
+
+http_path, ctrl_path, svc_path = sys.argv[1], sys.argv[2], sys.argv[3]
+http = pathlib.Path(http_path).read_text(encoding='utf-8')
+ctrl = pathlib.Path(ctrl_path).read_text(encoding='utf-8')
+svc = pathlib.Path(svc_path).read_text(encoding='utf-8')
+ssdp = pathlib.Path('app/src/main/java/com/juping/cast/dlna/SsdpResponder.java'
+                    ).read_text(encoding='utf-8')
+def strip_comments(src):
+    """去掉 // 与 /* */ 注释（字符串字面量原样保留）。
+
+    **必须剥。** 不剥的话守卫会把注释也算进判据 —— 于是"代码删了、
+    说明注释还留着"照样绿。F13 那条就是这么被证伪抓出来的：
+    去掉 startInternal 里的 setWakeMode 调用之后守卫仍然 PASS，
+    因为紧挨着的注释里同时写着 setWakeMode 和 PARTIAL_WAKE_LOCK。
+    一个只看注释就能通过的守卫，等于没有。
+    """
+    out = []
+    i, n = 0, len(src)
+    state = 'code'
+    while i < n:
+        c = src[i]
+        nxt = src[i + 1] if i + 1 < n else ''
+        if state == 'code':
+            if c == '/' and nxt == '/':
+                state = 'line'
+                i += 2
+                continue
+            if c == '/' and nxt == '*':
+                state = 'block'
+                i += 2
+                continue
+            if c == '"':
+                state = 'str'
+            out.append(c)
+            i += 1
+        elif state == 'line':
+            if c == '\n':
+                state = 'code'
+                out.append(c)
+            i += 1
+        elif state == 'block':
+            if c == '*' and nxt == '/':
+                state = 'code'
+                i += 2
+                continue
+            if c == '\n':
+                out.append(c)          # 保留换行，别把行结构搅乱
+            i += 1
+        else:                          # 字符串字面量
+            if c == '\\':
+                out.append(c)
+                if nxt:
+                    out.append(nxt)
+                i += 2
+                continue
+            if c == '"':
+                state = 'code'
+            out.append(c)
+            i += 1
+    return ''.join(out)
+
+
+def action_args(src):
+    """把源码里每个 action("...") 调用点的参数抠出来（按顶层逗号切）。
+
+    只看 `action("` —— 方法定义 `action(String name, ...)` 因此被排除在外。
+    """
+    out = []
+    for m in re.finditer(r'\baction\("', src):
+        i = m.end() - 1              # 停在开头的那个引号上
+        depth, j = 1, i + 1
+        while j < len(src) and depth > 0:
+            if src[j] == '(':
+                depth += 1
+            elif src[j] == ')':
+                depth -= 1
+            j += 1
+        call = src[i:j - 1]
+        parts, buf, d, in_str, k = [], '', 0, False, 0
+        while k < len(call):
+            ch = call[k]
+            if in_str:
+                if ch == '\\':
+                    buf += call[k:k + 2]
+                    k += 2
+                    continue
+                if ch == '"':
+                    in_str = False
+                buf += ch
+            else:
+                if ch == '"':
+                    in_str = True
+                    buf += ch
+                elif ch in '([':
+                    d += 1
+                    buf += ch
+                elif ch in ')]':
+                    d -= 1
+                    buf += ch
+                elif ch == ',' and d == 0:
+                    parts.append(buf.strip())
+                    buf = ''
+                else:
+                    buf += ch
+            k += 1
+        if buf.strip():
+            parts.append(buf.strip())
+        out.append(parts)
+    return out
+
+
+http = strip_comments(http)
+ctrl = strip_comments(ctrl)
+svc = strip_comments(svc)
+ssdp = strip_comments(ssdp)
+failed = []
+
+
+def report(name, ok, detail=''):
+    print('  [%s] %s%s' % ('PASS' if ok else 'FAIL', name,
+                           ('\n         ' + detail) if detail else ''))
+    if not ok:
+        failed.append(name)
+
+
+def body_of(src, marker):
+    """从 marker 处开始，按大括号配对抠出方法体"""
+    i = src.find(marker)
+    if i < 0:
+        return None
+    j = src.find('{', i)
+    if j < 0:
+        return None
+    depth, k = 0, j
+    while k < len(src):
+        if src[k] == '{':
+            depth += 1
+        elif src[k] == '}':
+            depth -= 1
+            if depth == 0:
+                return src[j:k + 1]
+        k += 1
+    return None
+
+
+# ---- (1) 设备描述：DLNA 类别标记 ----
+bd = body_of(http, 'private String buildDeviceDescription()')
+report('buildDeviceDescription 方法体已找到', bd is not None,
+       '锚点：private String buildDeviceDescription()')
+if bd:
+    report('设备描述里有 dlna:X_DLNADOC 且值为 DMR-1.50',
+           'X_DLNADOC' in bd
+           and re.search(r'DLNA_DOC\s*=\s*"DMR-1\.50"', http) is not None,
+           '判据要看**实际拼进 XML 的那个值**：值在 DLNA_DOC 常量里、'
+           '元素在方法体里，两边都要查（只查方法体会假阴性 —— '
+           '这条守卫第一版就是这么写错的，拿真源码一试才发现）。\n'
+           '         缺了它，部分控制点（较新的国产投屏 SDK 尤其）根本不把'
+           '设备列进投屏列表 —— 而 SSDP 那边看起来一切正常，'
+           '最容易被当成"手机的问题"')
+    report('设备描述刻意不声明 presentationURL',
+           '<presentationURL>' not in bd,
+           '我们没有任何 Web 界面。写 "/" 只会把 device.xml 本身喂给浏览器 ——'
+           '不声明时控制点就不画那个按钮')
+
+# ---- (2) 图标：声明了就必须给得出 ----
+ail = body_of(http, 'private void appendIconList(StringBuilder sb)')
+report('appendIconList 方法体已找到', ail is not None,
+       '锚点：private void appendIconList(StringBuilder sb)')
+if ail:
+    report('没有图标时完全不声明 iconList（不留一个取不到的 URL）',
+           'iconPng == null' in ail and 'return' in ail,
+           '声明了控制点就会真的去 GET。404 在它的日志里就是一条'
+           '"设备描述与实现不一致" —— 给不出就别声明')
+si = body_of(http, 'public void setIcon(byte[] png, int width, int height)')
+report('setIcon 方法体已找到', si is not None,
+       '锚点：public void setIcon(byte[] png, int width, int height)')
+if si:
+    report('setIcon 对非法参数直接忽略（图标不能拖垮设备描述）',
+           'png == null' in si and 'return' in si,
+           '图标是纯装饰。参数不合法时若照收，device.xml 里就会出现一个'
+           '宽高为 0 或取不到的 iconList')
+hg = body_of(http, 'private void handleGet(String path, OutputStream out)')
+if hg:
+    report('图标走二进制出口，不经过 String',
+           'writeBinary' in hg and 'ICON_PATH' in hg,
+           'PNG 用 UTF-8 编一遍再解回来会被替换字符毁掉（0x80~0xFF 里大量字节'
+           '不是合法 UTF-8 序列），控制点收到的就是一张坏图')
+
+# ---- (3) SCPD 的 relatedStateVariable 不能由参数名推出来 ----
+report('SCPD 的 relatedStateVariable 不再拿参数名当变量名',
+       '.append(args[i]).append("</relatedStateVariable>")' not in http,
+       '参数名与变量名经常不一样（CurrentVolume → Volume、'
+       'InstanceID → A_ARG_TYPE_InstanceID）。按参数名推就会生成悬空引用，'
+       '严格校验 SCPD 的控制点会**整份解析失败** —— 不是少一个功能，'
+       '是这台设备在它眼里不存在')
+report('SCPD 参数一律写成 方向:参数名:状态变量 三段式',
+       'p.length != 3' in http and 'IllegalArgumentException' in http,
+       '少写一段会当场抛异常（而不是静默生成一份畸形 SCPD）。'
+       '静态初始化失败声音很大，但好过只在部分控制点上表现为"设备是灰的"')
+# 上一条只证明"校验存在"，不证明"模板里的参数都合规"。这一条逐个调用点查：
+# 参数必须是字符串字面量、且恰好两个冒号（方向:参数名:状态变量）。
+# 少了第三个字段，action() 里那句 p[2] 就会越界 —— 而它跑在**静态初始化**里，
+# 结果是 UpnpHttpServer 类加载失败、整个服务起不来。
+_bad_args = []
+for _parts in action_args(http):
+    for _a in _parts[1:]:
+        if not (_a.startswith('"') and _a.endswith('"')) or _a.count(':') != 2:
+            _bad_args.append(_a)
+report('SCPD 每条 action 参数都是 方向:参数名:状态变量 三段式（逐个调用点查）',
+       not _bad_args,
+       '可疑参数: %s\n         （必须逐个调用点查，只查 action() 里有没有校验是不够的 ——'
+       '模板里少写一段照样会越界）' % _bad_args[:6])
+
+# ---- (4) 静音：布尔解析与回读 ----
+pb = body_of(http, 'private static boolean parseBoolean(String s)')
+report('parseBoolean 方法体已找到', pb is not None,
+       '锚点：private static boolean parseBoolean(String s)')
+if pb:
+    report('parseBoolean 认规范允许的 yes / no',
+           '"yes"' in pb.lower() and 'equalsIgnoreCase' in pb,
+           '规范里 boolean 有六个合法取值。只认 1/true 的话，控制点发 "yes" '
+           '会被解析成"取消静音" —— 用户按静音，声音**反而回来了**，'
+           '方向反了比不支持更糟')
+ra = body_of(http, 'private String responseArgs(String action)')
+if ra:
+    report('GetMute 回读真实状态，不写死常量',
+           '<CurrentMute>0</CurrentMute>' not in ra and 'handler.getMute()' in ra,
+           '写死的话，控制点按完静音回读一次看到"没静音"，会把开关又画回去 ——'
+           '和已经修过的 GetVolume 恒回 100 是同一个 bug')
+report('SINK_PROTOCOL_INFO 不声明 image/*',
+       'image/' not in http.split('SINK_PROTOCOL_INFO =')[1].split(';')[0],
+       '实现里根本没有图片这条路（kindOf 只认 audioItem / videoItem）。'
+       '这份清单是控制点判断"能不能推给我"的**唯一依据**，声明了却做不到，'
+       '控制点会把图片推过来然后必然失败')
+
+# ---- (5) SSDP：M-SEARCH 的 MX 随机延迟 ----
+hm = body_of(ssdp, 'private void handleMessage(String msg, DatagramPacket packet)')
+report('SsdpResponder.handleMessage 方法体已找到', hm is not None,
+       '锚点：private void handleMessage(String msg, DatagramPacket packet)')
+if hm:
+    report('M-SEARCH 走延迟调度，不在收包线程里直接回',
+           'scheduleResponse' in hm and 'randomDelayMs' in hm
+           and 'sendResponse(' not in hm,
+           '规范要求 0~MX 秒随机延迟应答（把多设备/多目标的应答在时间上错开，'
+           '减少 UDP 碰撞）。直接连发的话，几台设备同网时表现是'
+           '「有时搜得到、有时搜不到」；而在收包线程里 sleep 会丢掉这一秒内的'
+           '其它搜索 —— 两个都不行')
+rd = body_of(ssdp, 'static long randomDelayMs(String mx)')
+report('randomDelayMs 方法体已找到', rd is not None,
+       '锚点：static long randomDelayMs(String mx)')
+if rd:
+    report('randomDelayMs 按 MX 夹上限（畸形报文不会把应答排到一天之后）',
+           'MAX_MX_SEC' in rd and 'RANDOM.nextInt' in rd,
+           'MX=99999 会让应答排在 27 小时之后 —— 那和不支持没有区别，'
+           '还白占一个待发位置')
+sr = body_of(ssdp, 'private void scheduleResponse(')
+report('scheduleResponse 方法体已找到', sr is not None,
+       '锚点：private void scheduleResponse(')
+if sr:
+    report('待发应答有上限，且计数在 finally 里还回去',
+           'MAX_PENDING_REPLIES' in sr and 'finally' in sr
+           and 'decrementAndGet' in sr,
+           '无上限 = 内存泄漏（0.6GB 的盒子上一个异常控制点就能撑爆）。'
+           '而计数漏还的话，几次之后它会永远顶在上限，'
+           '从此所有搜索都被判成"队列满"而丢弃 —— 表现为「设备突然搜不到了」')
+
+# ---- (6) SSDP：线程退出必须复位绑定状态 ----
+cq = body_of(ssdp, 'private void closeQuietly()')
+report('SsdpResponder.closeQuietly 方法体已找到', cq is not None,
+       '锚点：private void closeQuietly()')
+if cq:
+    report('closeQuietly 把「已绑定」的状态一并复位',
+           'boundPort = -1' in cq and 'boundInterface = null' in cq,
+           '只 close 不复位的话，线程因任何原因退出之后 isBound() 仍返回 true ——'
+           '界面显示"设备已就绪"，实际一个搜索请求都收不到。'
+           '用户唯一能做的是重启盒子，而重启之后"看起来"又好了，'
+           '于是永远定位不到')
+
+# ---- (7) 服务侧：自检与销毁顺序 ----
+ct = body_of(svc, 'private void checkThreadsAlive()')
+report('DlnaRendererService.checkThreadsAlive 方法体已找到', ct is not None,
+       '锚点：private void checkThreadsAlive()')
+if ct:
+    report('自检要求「线程已死」**且**「未绑定」才重建',
+           '!s.isAlive()' in ct and '!s.isBound()' in ct
+           and '!h.isAlive()' in ct and '!h.isBound()' in ct,
+           '只看 isAlive() 会打断"开机 Wi-Fi 未就绪、正在退避重试"这个正常状态 ——'
+           '变成每 30 秒重启一次、永远等不到网。只看 isBound() 同理')
+od = body_of(svc, 'public void onDestroy()')
+report('DlnaRendererService.onDestroy 方法体已找到', od is not None,
+       '锚点：public void onDestroy()')
+if od:
+    i_flag = od.find('shuttingDown = true')
+    i_ssdp = od.find('ssdp.shutdown()')
+    report('onDestroy 先关掉自检，再拆 SSDP',
+           i_flag >= 0 and i_ssdp >= 0 and i_flag < i_ssdp,
+           '反过来的话，看门狗可能正好在"刚 shutdown、还没设标志"的窗口里醒来，'
+           '看到线程死了就把它重新拉起来 —— 服务都销毁了 SSDP 还活着占着端口，'
+           '下次启动直接 EADDRINUSE')
+    report('onDestroy 摘掉看门狗的回调',
+           'removeCallbacks' in od,
+           '不摘的话，服务销毁后它还会被主线程队列捞起来跑一次，'
+           '那时候字段全是空的')
+
+# ---- (8) 播放器：唤醒锁与单一音量出口 ----
+si2 = body_of(ctrl, 'private void startInternal()')
+report('MediaPlayerController.startInternal 方法体已找到', si2 is not None,
+       '锚点：private void startInternal()')
+if si2:
+    report('startInternal 里申请了 PARTIAL_WAKE_LOCK',
+           'setWakeMode' in si2 and 'PARTIAL_WAKE_LOCK' in si2,
+           '只靠 setScreenOnWhilePlaying(true) 是不够的：那一句**只对设了 Surface '
+           '的视频有效**。音乐投屏没有 Surface，屏幕不亮、CPU 也不被钉住 ——'
+           '用户关了屏音乐就会卡住甚至断流')
+av = body_of(ctrl, 'private void applyVolume()')
+report('MediaPlayerController.applyVolume 方法体已找到', av is not None,
+       '锚点：private void applyVolume()')
+if av:
+    # 只数"真的带了参数"的调用：注释里那句 {@code player.setVolume()} 是空括号，
+    # 用 `player\.setVolume\([^)]` 才不会被它算进去（这正是"守卫自己也会误报"
+    # 的一个例子 —— 写完必须拿真源码试一遍）。
+    n_setvol = len(re.findall(r'player\.setVolume\([^)]', ctrl))
+    report('全项目只有 applyVolume 一处调 player.setVolume',
+           n_setvol == 1 and 'player.setVolume(' in av,
+           '实际出现 %d 次。任何一处绕过它单独下发，都会漏掉静音 ——'
+           '于是出现「设了静音、改一下音量就又有声音了」这类只在特定顺序下'
+           '复现的 bug' % n_setvol)
+sv2 = body_of(ctrl, 'public void setMute(boolean mute)')
+report('MediaPlayerController.setMute 先记状态再下发',
+       sv2 is not None and 'this.muted = mute' in sv2 and 'applyVolume' in sv2,
+       '重连会重建 MediaPlayer 实例。不先记的话，一次断流就把用户的静音取消了')
+
+sys.exit(1 if failed else 0)
+PY
+
 echo
 if [ "$RC" -ne 0 ]; then
     echo "播放策略核验未通过。" >&2

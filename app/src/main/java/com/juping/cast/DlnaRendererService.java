@@ -6,8 +6,11 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.net.wifi.WifiManager;
 import android.os.Binder;
+import android.os.Handler;
 import android.os.IBinder;
 import android.util.Log;
 
@@ -17,6 +20,7 @@ import com.juping.cast.dlna.SsdpResponder;
 import com.juping.cast.dlna.UpnpHttpServer;
 import com.juping.cast.player.MediaPlayerController;
 
+import java.io.ByteArrayOutputStream;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -48,6 +52,24 @@ public class DlnaRendererService extends Service
     /** DLNA 服务端口。用固定端口方便排查，冲突概率很低。 */
     private static final int HTTP_PORT = 49152;
 
+    /**
+     * 自检间隔（毫秒）。
+     *
+     * <p>30 秒是个取舍：SSDP 自己已经有 2~30 秒的绑定退避重试，自检只要负责
+     * "线程整个死了"这一种情况，不需要更快。太快反而是负担 ——
+     * 这台盒子只有 0.6GB 内存，任何周期性动作都要算进预算里。
+     */
+    private static final long WATCHDOG_INTERVAL_MS = 30000L;
+
+    /**
+     * 自检发现故障后，每这么多次才记一条日志。
+     *
+     * <p>和 SsdpResponder 里那条 RETRY_LOG_EVERY 同一个理由：如果故障是
+     * 持续的（比如端口被别的进程永久占着），每 30 秒一条日志挂一整夜
+     * 就是近 3000 行，真正有用的信息反而被冲掉。
+     */
+    private static final int WATCHDOG_LOG_EVERY = 20;
+
     /** 内容类型的三个取值，见 {@link #kindOf} 与 {@link #audioOnly}。 */
     private static final int KIND_UNKNOWN = 0;
     private static final int KIND_AUDIO = 1;
@@ -75,6 +97,48 @@ public class DlnaRendererService extends Service
     private volatile String lastError = "";
     private volatile String currentUri = "";
 
+    /** 传给 SSDP 的 SERVER 头。抽成字段是因为重建时要用同一个值 */
+    private String serverName;
+
+    /**
+     * 服务正在销毁。
+     *
+     * <p>自检看门狗靠它收手。**没有这个标志会出大问题**：{@link #onDestroy()}
+     * 会主动 {@code ssdp.shutdown()}，线程随即退出 —— 而看门狗下一轮醒来
+     * 看到"线程死了"，就会**把它重新拉起来**，于是服务销毁之后 SSDP
+     * 又活了，端口一直被占着，下次启动直接 EADDRINUSE。
+     */
+    private volatile boolean shuttingDown = false;
+
+    /** 自检看门狗跑在主线程的 Looper 上。见 {@link #watchdogTask} */
+    private final Handler watchdog = new Handler();
+
+    /** 连续自检失败的次数。只用于日志节流 */
+    private int watchdogFailures = 0;
+
+    /**
+     * 自检任务：活着就继续排下一轮，死了就重建。
+     *
+     * <p>写成字段而不是匿名类，是为了 {@link #onDestroy()} 能
+     * {@code removeCallbacks} 把它摘掉 —— 否则服务销毁后它还会被主线程
+     * 的队列捞起来跑一次，那时候字段全是空的。
+     */
+    private final Runnable watchdogTask = new Runnable() {
+        @Override
+        public void run() {
+            try {
+                checkThreadsAlive();
+            } catch (Throwable t) {
+                // 看门狗自己绝不能把主线程掀翻 —— 它是"最后一道保险"，
+                // 它崩了就真的没有任何东西能发现故障了。
+                Log.w(TAG, "自检本身出错（忽略）", t);
+            }
+            if (!shuttingDown) {
+                watchdog.postDelayed(this, WATCHDOG_INTERVAL_MS);
+            }
+        }
+    };
+
     /**
      * 当前是不是纯音频流（音乐投屏）。界面据此切「音乐卡片 / 视频画面」。
      *
@@ -94,7 +158,12 @@ public class DlnaRendererService extends Service
 
         uuid = loadOrCreateUuid();
         friendlyName = "聚屏-" + android.os.Build.MODEL;
-        player = new MediaPlayerController();
+        serverName = "Android/" + android.os.Build.VERSION.RELEASE;
+        // 必须把 this 传进去：播放器要用它调 MediaPlayer.setWakeMode()，
+        // 那一步是"息屏后音乐还能继续放"的唯一保障（理由见
+        // MediaPlayerController.startInternal）。Service 就是最合适的 Context ——
+        // 它的生命周期与播放器完全一致，不会泄漏。
+        player = new MediaPlayerController(this);
         player.setListener(this);
 
         acquireLocks();
@@ -103,6 +172,9 @@ public class DlnaRendererService extends Service
         localIp = NetUtil.pickLocalIp();
 
         httpServer = new UpnpHttpServer(HTTP_PORT, uuid, friendlyName, this, this);
+        // 图标要在 start() 之前给 —— 设备描述是随请求现生成的，
+        // 但早点给上可以让"第一台来搜的控制点"就看到图标。
+        provideDeviceIcon();
         httpServer.start();
 
         // 只把 HTTP 端口交给 SSDP，不传拼好的 LOCATION ——
@@ -110,11 +182,60 @@ public class DlnaRendererService extends Service
         // 提前在外面拼一个，就等于把「组播绑哪张网卡」和「告诉手机去哪取描述」
         // 拆成两次独立选择：第一张候选网卡 joinGroup 失败时，组播会绑到第二张上，
         // 而 LOCATION 还指着第一张 —— 手机搜得到设备、点进去却拉不到描述。
-        ssdp = new SsdpResponder(uuid, HTTP_PORT, "Android/" + android.os.Build.VERSION.RELEASE);
+        ssdp = new SsdpResponder(uuid, HTTP_PORT, serverName);
         ssdp.start();
+
+        // 自检看门狗。第一轮不用等 30 秒 —— 立刻排一次，让"启动就失败"
+        // 这种情况能早点进日志。
+        watchdog.postDelayed(watchdogTask, WATCHDOG_INTERVAL_MS);
 
         Log.i(TAG, "接收端已就绪：名称=" + friendlyName + " HTTP 端口=" + HTTP_PORT
                 + "（设备描述地址等 SSDP 绑上网卡后确定）");
+    }
+
+    /**
+     * 给设备描述准备图标 —— 控制点的设备列表里显示的就是它。
+     *
+     * <p>为什么要"解码成 Bitmap 再压回 PNG"，而不是直接读资源字节：
+     * APK 里 drawable 的文件路径会被 aapt / R8 改写（{@code res/drawable-xhdpi/
+     * ic_launcher.png} 可能变成 {@code res/xx.png}），按路径去 zip 里取是不可靠的。
+     * 而 {@code BitmapFactory} 是稳定接口。
+     *
+     * <p>为什么只做一张、尺寸运行时读：{@code R.drawable.ic_launcher} 在运行时
+     * **只会解析成当前屏幕密度的那一张**（四档拿到的是同一个 Bitmap）。
+     * 声明四个尺寸就是撒谎，所以按实际像素声明，多大就是多大。
+     *
+     * <p>整个过程包在 catch(Throwable) 里，失败就**不声明 iconList**：
+     * 图标是纯装饰，绝不能因为它让设备描述出不来 ——
+     * device.xml 拉不到等于整个设备在控制点眼里不存在。
+     * 用 Throwable 而不是 Exception 是有意的：老设备的 BitmapFactory
+     * 在内存吃紧时抛的是 {@code OutOfMemoryError}（一个 Error，不是 Exception），
+     * 漏掉它的话这一句会把整个 onCreate 掀翻，投屏功能全没了。
+     */
+    private void provideDeviceIcon() {
+        UpnpHttpServer s = httpServer;
+        if (s == null) {
+            return;
+        }
+        try {
+            Bitmap bmp = BitmapFactory.decodeResource(getResources(), R.drawable.ic_launcher);
+            if (bmp == null) {
+                Log.w(TAG, "图标解码失败，设备描述将不声明 iconList");
+                return;
+            }
+            int w = bmp.getWidth();
+            int h = bmp.getHeight();
+            ByteArrayOutputStream buf = new ByteArrayOutputStream();
+            // PNG 是无损格式，quality 参数对它没有意义，100 只是惯例写法
+            bmp.compress(Bitmap.CompressFormat.PNG, 100, buf);
+            // 老设备上 Bitmap 占的是 native 堆，越早释放越好
+            bmp.recycle();
+            byte[] png = buf.toByteArray();
+            s.setIcon(png, w, h);
+            Log.i(TAG, "设备图标已就绪：" + w + "x" + h + "，" + png.length + " 字节");
+        } catch (Throwable t) {
+            Log.w(TAG, "准备设备图标失败，设备描述将不声明 iconList", t);
+        }
     }
 
     /**
@@ -343,6 +464,24 @@ public class DlnaRendererService extends Service
         return player == null ? 100 : player.getVolume0to100();
     }
 
+    @Override
+    public void onSetMute(boolean mute) {
+        if (player != null) {
+            player.setMute(mute);
+        }
+        // 静音也是 RenderingControl 的状态，同样要推事件。
+        // 不推的话：用户手机上按了静音，同一个网络的另一台遥控设备
+        // （平板、另一个人的手机）上的静音开关会一直停在旧状态。
+        notifyEvent("RenderingControl");
+    }
+
+    @Override
+    public boolean getMute() {
+        // 如实回读。写死 false 的话，控制点按完静音回读一次看到"没静音"，
+        // 会把开关又画回去 —— 和已经修过的 GetVolume 恒回 100 是同一个 bug。
+        return player != null && player.isMuted();
+    }
+
     /** 当前是不是纯音频流。界面据此决定显示音乐卡片还是视频画面。 */
     public boolean isAudioOnly() {
         return audioOnly;
@@ -396,7 +535,10 @@ public class DlnaRendererService extends Service
         }
         if ("RenderingControl".equals(service)) {
             vars.put("Volume", String.valueOf(getVolume0to100()));
-            vars.put("Mute", "0");
+            // 必须报真实静音状态。原来这里写死 "0"（未静音）——
+            // 而 SCPD 里 Mute 是声明了可事件化的，控制点会拿这个值去画开关。
+            // 写死就等于"用户按了静音，另一个遥控器上的开关又自己弹回来了"。
+            vars.put("Mute", getMute() ? "1" : "0");
             return vars;
         }
         if ("ConnectionManager".equals(service)) {
@@ -568,6 +710,73 @@ public class DlnaRendererService extends Service
         return "(未绑定) 候选: " + NetUtil.describeCandidates();
     }
 
+    // ------------------------------------------------------------- 自检
+
+    /**
+     * 自检：两条链路是不是还活着；死了就重建。
+     *
+     * <p><b>为什么必须有"发现坏了就修"这一环。</b>这个项目里所有其它机制
+     * ——绑定退避重试、并发上限、body 上限、异常兜底——全都是**预防**。
+     * 而线程可能因为谁也预料不到的原因退出：系统把组播组踢掉、receive 抛出
+     * 一个没被 catch 的异常、socket 被底层关掉、Wi-Fi 驱动重启……
+     * 一旦退出，{@code isBound()} 就一直返回 false，
+     * 而**没有任何东西会去把它拉起来**。
+     *
+     * <p>用户看到的是「昨天还好好的，今天搜不到了」，重启 App 才好 ——
+     * 而日志里什么都看不出来，因为故障发生时根本没人记录它。
+     *
+     * <p>两条链路分开判断：SSDP 死了只影响"搜得到"，HTTP 死了只影响"投得上去"。
+     * 任何一个死了都单独重建，不一起推倒 —— 重建有成本（端口重绑、
+     * 控制点要重新拉设备描述）。
+     *
+     * <p>判据是 {@code !isAlive() && !isBound()}，两个条件缺一不可：
+     * 线程还活着但只是**还没绑上**（开机 Wi-Fi 未就绪、正在退避重试）是正常状态，
+     * 绝不能重建 —— 那会把正在进行的退避循环打断，变成"每 30 秒重启一次、
+     * 永远等不到网"。
+     */
+    private void checkThreadsAlive() {
+        if (shuttingDown) {
+            return;
+        }
+        boolean bad = false;
+
+        SsdpResponder s = ssdp;
+        if (s != null && !s.isAlive() && !s.isBound()) {
+            bad = true;
+            logWatchdog("SSDP 线程已死且未绑定，重建");
+            // 先 shutdown 一次：线程虽然死了，但 socket / 调度器可能还挂着。
+            // 不关就重建的话，每次自检漏一个 fd —— 老盒子上几十次之后
+            // 就是 "Too many open files"，而那时报错的是**别的**模块。
+            s.shutdown();
+            ssdp = new SsdpResponder(uuid, HTTP_PORT, serverName);
+            ssdp.start();
+        }
+
+        UpnpHttpServer h = httpServer;
+        if (h != null && !h.isAlive() && !h.isBound()) {
+            bad = true;
+            logWatchdog("HTTP 线程已死且未监听，重建");
+            h.shutdown();
+            httpServer = new UpnpHttpServer(HTTP_PORT, uuid, friendlyName, this, this);
+            provideDeviceIcon();
+            httpServer.start();
+        }
+
+        if (!bad) {
+            // 恢复正常了就把计数清零 —— 否则"偶发一次"会累积成
+            // 触发日志节流的次数，下一次真出问题时反而不打日志。
+            watchdogFailures = 0;
+        }
+    }
+
+    /** 自检日志的节流出口。前几次每次都记（那是最需要看的窗口），之后每 N 次一条 */
+    private void logWatchdog(String reason) {
+        watchdogFailures++;
+        if (watchdogFailures <= 3 || watchdogFailures % WATCHDOG_LOG_EVERY == 0) {
+            Log.w(TAG, "自检：" + reason + "（连续第 " + watchdogFailures + " 次）");
+        }
+    }
+
     // ------------------------------------------------------------- 生命周期
 
     @Override
@@ -584,6 +793,15 @@ public class DlnaRendererService extends Service
     @Override
     public void onDestroy() {
         Log.i(TAG, "服务销毁，释放资源");
+        // 第一件事：告诉自检看门狗"别再重建了"。
+        //
+        // 必须在 shutdown 之前设上。反过来的话，看门狗可能正好在
+        // "我们刚 shutdown、还没设标志"的窗口里醒来，看到线程死了
+        // 就把它重新拉起来 —— 于是服务都销毁了，SSDP 还活着占着端口，
+        // 下次启动直接 EADDRINUSE。
+        shuttingDown = true;
+        watchdog.removeCallbacks(watchdogTask);
+
         // 先撤掉前台通知，再拆服务。
         //
         // 不撤的话：startForeground 挂上去的那条常驻通知**不会**跟着服务一起消失，

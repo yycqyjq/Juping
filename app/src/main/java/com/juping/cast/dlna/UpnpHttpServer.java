@@ -84,6 +84,20 @@ public class UpnpHttpServer extends Thread {
         void onSetVolume(int volume0to100);
 
         int getVolume0to100();
+
+        /**
+         * SetMute —— 设置静音。
+         *
+         * <p>这个方法之前**整个漏了**：{@code SetMute} 写在 {@code KNOWN_ACTIONS}
+         * 里，但 {@code dispatch()} 没有对应分支，于是控制点按静音什么都不会发生。
+         * 而 {@code GetMute} 又写死回 {@code 0}（未静音）—— 控制点按完静音回读一次，
+         * 看到的是"没静音"，把开关又画回去。**和已经修过的 GetVolume 恒回 100
+         * 是同一个 bug**，只是漏了静音那半边。
+         */
+        void onSetMute(boolean mute);
+
+        /** GetMute 用。必须反映真实状态，不能恒回 false */
+        boolean getMute();
     }
 
     private final int port;
@@ -437,30 +451,176 @@ public class UpnpHttpServer extends Thread {
             writeSimple(out, "200 OK", "text/xml; charset=\"utf-8\"", SCPD_CONNECTION_MANAGER);
         } else if (path.contains("RenderingControl.xml")) {
             writeSimple(out, "200 OK", "text/xml; charset=\"utf-8\"", SCPD_RENDERING_CONTROL);
+        } else if (ICON_PATH.equals(path)) {
+            // 图标走字节，不走 String —— PNG 用 UTF-8 编一遍再解回来会被
+            // 替换字符毁掉，控制点拿到的就不是一张图了。
+            byte[] png = iconPng;
+            if (png == null) {
+                // 没图标。**必须是 404**，不能回一个空 body 的 200 ——
+                // 后者会让控制点以为"图片是 0 字节"，行为比 404 更难预料。
+                writeSimple(out, "404 Not Found", "text/plain", "");
+            } else {
+                writeBinary(out, "200 OK", "image/png", png);
+            }
         } else {
             writeSimple(out, "404 Not Found", "text/plain", "");
         }
     }
 
-    private String buildDeviceDescription() {
-        return "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
-                + "<root xmlns=\"urn:schemas-upnp-org:device-1-0\">\n"
-                + "  <specVersion><major>1</major><minor>0</minor></specVersion>\n"
-                + "  <device>\n"
-                + "    <deviceType>" + SsdpResponder.DEVICE_TYPE + "</deviceType>\n"
-                + "    <friendlyName>" + friendlyName + "</friendlyName>\n"
-                + "    <manufacturer>Juping</manufacturer>\n"
-                + "    <modelName>Juping Receiver</modelName>\n"
-                + "    <modelNumber>1.0</modelNumber>\n"
-                + "    <UDN>uuid:" + uuid + "</UDN>\n"
-                + "    <serviceList>\n"
-                + serviceEntry("AVTransport") + serviceEntry("ConnectionManager")
-                + serviceEntry("RenderingControl")
-                + "    </serviceList>\n"
-                + "  </device>\n"
-                + "</root>\n";
+    // ------------------------------------------------------------- 设备图标
+
+    /**
+     * 设备图标的路径。
+     *
+     * <p>只服务**一张**图，尺寸以 {@link #setIcon} 传进来的实际像素为准。
+     *
+     * <p>为什么不按密度声明四档（48/72/96/144）：{@code R.drawable.ic_launcher}
+     * 在运行时**只会解析成当前屏幕密度的那一张** —— 四档拿到的是同一个 Bitmap。
+     * 声明四个尺寸就是在撒谎，而控制点会照声明去挑，挑中的那张尺寸对不上。
+     */
+    private static final String ICON_PATH = "/upnp/icon.png";
+
+    /**
+     * 图标 PNG 字节。{@code null} 表示没有 —— 此时设备描述里
+     * **完全不声明 iconList**，上面那个路径也就永远是 404。
+     */
+    private volatile byte[] iconPng;
+    private volatile int iconWidth;
+    private volatile int iconHeight;
+
+    /**
+     * 提供设备图标（可选）。
+     *
+     * <p>协议层拿不到 Android 资源，图标必须由业务层解码好递进来。
+     *
+     * <p>为什么"没有"比"声明一个取不到的地址"好：控制点拿到 device.xml 之后
+     * 会**真的去 GET** iconList 里那个地址。404 在它的日志里就是一条
+     * 「设备描述与实现不一致」的记录。声明了就要给得出，给不出就别声明 ——
+     * 和 {@link #SINK_PROTOCOL_INFO} 是同一条纪律。
+     *
+     * <p>参数不合法时**静默忽略**（保持"没有图标"）：图标是纯装饰，
+     * 绝不能因为它让设备描述出不来 —— device.xml 拉不到等于整个设备不可用。
+     */
+    public void setIcon(byte[] png, int width, int height) {
+        if (png == null || png.length == 0 || width <= 0 || height <= 0) {
+            return;
+        }
+        this.iconWidth = width;
+        this.iconHeight = height;
+        this.iconPng = png;
     }
 
+    /** 项目主页。厂商 URL 与型号 URL 都指向它 —— 这是这台设备真正的"出处" */
+    private static final String PROJECT_URL = "https://github.com/yycqyjq/Juping";
+
+    /**
+     * DLNA 设备类别声明。
+     *
+     * <p>{@code DMR-1.50} = Digital Media Renderer，DLNA 1.5 版规范里的渲染器类别。
+     *
+     * <p>这一条**必须有**。部分控制点（较新的国产投屏 SDK 尤其）先看这个标记，
+     * 认不出就不把设备列进投屏列表 —— 表现为「SSDP 明明应答了，列表里却没有」，
+     * 而其余字段写得再全也没用。缺了它是最容易被忽略、后果又最彻底的一种缺。
+     *
+     * <p>只声明 {@code DMR-1.50}，**不声明** {@code M-DMR-1.50}：后者是
+     * DLNA Mobile 的类别，声明了会让控制点按移动设备的规则来对待我们
+     * （比如假定有触摸屏、假定省电策略不同）。不是移动设备就别领那个标记。
+     */
+    private static final String DLNA_DOC = "DMR-1.50";
+
+    /**
+     * 设备描述（DDD）—— 控制点了解"这台设备是什么"的唯一来源。
+     *
+     * <p><b>元素顺序不是随便排的。</b>UPnP 的 device-1-0 schema 对
+     * {@code <device>} 的子元素定死了顺序，严格按 schema 校验的控制点
+     * （部分嵌入式协议栈）会因为顺序错而**整份描述解析失败** —— 不是
+     * "少读一个字段"，是这台设备在它眼里不存在。顺序取自 UDA 1.0 的
+     * device-1-0 schema：
+     * <pre>
+     *   deviceType, friendlyName, manufacturer, manufacturerURL?, modelDescription?,
+     *   modelName, modelNumber?, modelURL?, serialNumber?, UDN, UPC?,
+     *   iconList?, serviceList?, deviceList?, presentationURL?, (其它命名空间)*
+     * </pre>
+     * {@code dlna:X_DLNADOC} 属于最后那类"其它命名空间"，所以放最后 ——
+     * MiniDLNA 与多数商用 DMR 的实际排法也是如此。
+     */
+    private String buildDeviceDescription() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n")
+                .append("<root xmlns=\"urn:schemas-upnp-org:device-1-0\">\n")
+                .append("  <specVersion><major>1</major><minor>0</minor></specVersion>\n")
+                .append("  <device>\n")
+                .append("    <deviceType>").append(SsdpResponder.DEVICE_TYPE).append("</deviceType>\n")
+                // friendlyName 是用户自己可能改过的（将来若要支持改名），
+                // 所以必须转义 —— 一个 & 就能让整份描述变成非法 XML。
+                .append("    <friendlyName>").append(escapeXml(friendlyName))
+                .append("</friendlyName>\n")
+                .append("    <manufacturer>Juping</manufacturer>\n")
+                .append("    <manufacturerURL>").append(PROJECT_URL).append("</manufacturerURL>\n")
+                .append("    <modelDescription>DLNA/UPnP 投屏接收端</modelDescription>\n")
+                .append("    <modelName>Juping Receiver</modelName>\n")
+                .append("    <modelNumber>1.0</modelNumber>\n")
+                .append("    <modelURL>").append(PROJECT_URL).append("</modelURL>\n")
+                // serialNumber 用设备自己的 UDN 值。它本来就是"这台设备在这个
+                // 网络里的唯一编号"，而且跨重启稳定（UUID 持久化在 SharedPreferences 里）。
+                // 编一个假的流水号没有任何好处 —— 排障时能对上号才有意义。
+                .append("    <serialNumber>").append(escapeXml(uuid)).append("</serialNumber>\n")
+                .append("    <UDN>uuid:").append(uuid).append("</UDN>\n");
+        // UPC：我们不是零售商品，没有 UPC 码。**刻意不写** ——
+        // 编一个假码没有任何好处，而 schema 里它是可选的。
+        appendIconList(sb);
+        sb.append("    <serviceList>\n")
+                .append(serviceEntry("AVTransport"))
+                .append(serviceEntry("ConnectionManager"))
+                .append(serviceEntry("RenderingControl"))
+                .append("    </serviceList>\n")
+                // presentationURL：**刻意不声明**。它只有一个含义 ——
+                // "用浏览器打开这里看设备信息"。我们没有任何 Web 界面，
+                // 写 "/" 只会把 device.xml 本身喂给浏览器（一屏原始 XML）。
+                // schema 里它是可选的：不声明，控制点就不画那个按钮；
+                // 画一个点开是乱码的按钮，比没有按钮糟。
+                .append("    <dlna:X_DLNADOC xmlns:dlna=\"urn:schemas-dlna-org:device-1-0\">")
+                .append(DLNA_DOC).append("</dlna:X_DLNADOC>\n")
+                .append("  </device>\n")
+                .append("</root>\n");
+        return sb.toString();
+    }
+
+    /**
+     * 有图标才写 iconList。
+     *
+     * <p>{@code <icon>} 的子元素顺序同样是 schema 定死的：
+     * mimetype, width, height, depth, url。
+     *
+     * <p>{@code depth} 报 32：图标是 PNG RGBA（8 位/通道 × 4 通道），
+     * 这是**实测值**，不是照抄别人的 24。控制点一般不校验它，
+     * 但既然写了就写真的 —— 这个项目里没有"随手填一个看着合理"的字段。
+     */
+    private void appendIconList(StringBuilder sb) {
+        if (iconPng == null) {
+            return;
+        }
+        sb.append("    <iconList>\n")
+                .append("      <icon>\n")
+                .append("        <mimetype>image/png</mimetype>\n")
+                .append("        <width>").append(iconWidth).append("</width>\n")
+                .append("        <height>").append(iconHeight).append("</height>\n")
+                .append("        <depth>32</depth>\n")
+                .append("        <url>").append(ICON_PATH).append("</url>\n")
+                .append("      </icon>\n")
+                .append("    </iconList>\n");
+    }
+
+    /**
+     * 一条 service 记录。
+     *
+     * <p><b>子元素顺序也是 schema 定死的</b>：serviceType → serviceId →
+     * SCPDURL → controlURL → eventSubURL。已按 UDA 1.0 的 device-1-0 schema
+     * 核对，并与 gmrender-resurrect（成熟 DMR 实现）的实际输出一致。
+     *
+     * <p>MiniDLNA 用的是 controlURL → eventSubURL → SCPDURL，那是它的历史写法，
+     * 多数控制点宽容接受，但没有理由跟着走。
+     */
     private String serviceEntry(String shortName) {
         String type = "urn:schemas-upnp-org:service:" + shortName + ":1";
         return "      <service>\n"
@@ -594,11 +754,12 @@ public class UpnpHttpServer extends Thread {
      * 手机端误判成「这台设备有问题」，所以给它们一个合法的空响应。
      */
     private static final String[] KNOWN_ACTIONS = {
-            // AVTransport
+            // AVTransport —— 与 SCPD_AV_TRANSPORT 的 actionList 一一对应。
+            // 两边必须同步：SCPD 里没有的 action 控制点不会发（写了也是死的），
+            // 而 SCPD 里有、这张表里没有的会被回 401（明明声明支持却做不到）。
             "SetAVTransportURI", "GetMediaInfo", "GetTransportInfo", "GetPositionInfo",
             "GetDeviceCapabilities", "GetTransportSettings", "GetCurrentTransportActions",
-            "Stop", "Play", "Pause", "Seek", "Next", "Previous",
-            "SetPlayMode", "SetPlaySpeed",
+            "Stop", "Play", "Pause", "Seek", "Next", "Previous", "SetPlayMode",
             // ConnectionManager
             "GetProtocolInfo", "GetCurrentConnectionIDs", "GetCurrentConnectionInfo",
             // RenderingControl
@@ -628,12 +789,48 @@ public class UpnpHttpServer extends Thread {
 
         try {
             Map<String, String> args = extractArguments(body);
+
+            // ---- 「语法合法、但我们做不到」的指令必须如实回 701 ----
+            // Next / Previous 在 AVTransport:1 里是**必选** action（规范要求它们存在），
+            // 但没有播放列表时正确的回应是 701 Transition not available。
+            // 原来它们落到 dispatch 的空分支、回一个 200 空响应 ——
+            // 控制点据此以为"切歌成功"，界面上却什么都没发生。
+            String reason = notApplicableReason(action, args);
+            if (reason != null) {
+                Log.i(TAG, action + " 不适用，回 701：" + reason);
+                writeSoapFault(out, service, "701", "Transition not available");
+                return;
+            }
+
             dispatch(service, action, args);
             writeSoapResponse(out, service, action, responseArgs(action));
         } catch (Exception e) {
             Log.e(TAG, "执行指令失败: " + action, e);
             writeSoapFault(out, service, "501", "Action Failed");
         }
+    }
+
+    /**
+     * 这个 action 是不是「语法合法、但我们做不到」——是则返回原因，否则 null。
+     *
+     * <p>判据刻意收得很紧：**只放行"设成我们本来就处于的状态"**。
+     * 比如 SetPlayMode 收到 NORMAL 就回 200 —— 我们本来就是 NORMAL，
+     * 回 701 只会让控制点弹一个莫名其妙的错误；收到 SHUFFLE 才回 701。
+     * 反过来的话（一律回 200）就是假装支持，控制点会把界面画成"已设为随机播放"。
+     */
+    private static String notApplicableReason(String action, Map<String, String> args) {
+        if ("Next".equals(action) || "Previous".equals(action)) {
+            return "没有播放列表，谈不上下一首 / 上一首";
+        }
+        if ("SetPlayMode".equals(action)) {
+            String mode = get(args, "NewPlayMode");
+            return "NORMAL".equals(mode) ? null : "只支持 NORMAL，收到 " + mode;
+        }
+        if ("SelectPreset".equals(action)) {
+            String preset = get(args, "PresetName");
+            return "FactoryDefaults".equals(preset) ? null : "只有 FactoryDefaults，收到 " + preset;
+        }
+        return null;
     }
 
     /** 把 SOAP 指令映射到业务回调 —— 协议与业务的分界线就在这 */
@@ -665,7 +862,32 @@ public class UpnpHttpServer extends Thread {
             }
         } else if ("SetVolume".equals(action)) {
             handler.onSetVolume(parseInt(get(args, "DesiredVolume"), 100));
+        } else if ("SetMute".equals(action)) {
+            // DesiredMute 是 UPnP 的 boolean："1" / "true" 为静音，其余为取消。
+            handler.onSetMute(parseBoolean(get(args, "DesiredMute")));
         }
+    }
+
+    /**
+     * UPnP 的 boolean。
+     *
+     * <p>规范里 boolean 有**六个**合法取值：{@code 0} / {@code false} / {@code no}
+     * 为假，{@code 1} / {@code true} / {@code yes} 为真，大小写不敏感。
+     *
+     * <p>只认 {@code 1} 和 {@code true} 是不够的 —— 规范明确允许 {@code yes}，
+     * 而确实有控制点发它。漏掉 {@code yes} 的后果不是"静音不生效"，
+     * 而是**方向反了**：用户按静音，声音反而回来了。这比不支持更糟。
+     *
+     * <p>其余一切（包括空串）按 false 处理。理由：静音是"打开声音"那一侧，
+     * 而一个解析不出来的值最可能是压根没带这个参数 —— 让声音出来
+     * 比让用户突然没声音好。
+     */
+    private static boolean parseBoolean(String s) {
+        if (s == null) {
+            return false;
+        }
+        String v = s.trim();
+        return "1".equals(v) || "true".equalsIgnoreCase(v) || "yes".equalsIgnoreCase(v);
     }
 
     /**
@@ -678,15 +900,21 @@ public class UpnpHttpServer extends Thread {
      * <p>公开成常量是因为它有两个出口：GetProtocolInfo 的响应，以及
      * ConnectionManager 事件里的 {@code SinkProtocolInfo}。**必须是同一份字符串** ——
      * 各写一份，改一处忘一处，控制点就会看到"声明的"和"事件报的"不一致。
+     *
+     * <p><b>为什么这里没有 image/*</b>：曾经声明过 {@code image/jpeg} 与
+     * {@code image/png}，但整套实现里根本没有图片这条路 —— {@code kindOf()}
+     * 只认 audioItem / videoItem，而 {@code MediaPlayer} 本身也不解图片。
+     * 声明了却做不到，控制点（相册、文件管理器）就会把图片推过来，
+     * 然后必然失败，用户看到的是"投屏坏了"。**这份清单是控制点判断
+     * "能不能推给我"的唯一依据，所以它必须与实现严格一致** ——
+     * 宁可让控制点一开始就说"这台设备不支持"，也不要收下再失败。
      */
     public static final String SINK_PROTOCOL_INFO =
             "http-get:*:video/mp4:*,"
                     + "http-get:*:application/vnd.apple.mpegurl:*,"
                     + "http-get:*:application/x-mpegURL:*,"
                     + "http-get:*:audio/mpeg:*,"
-                    + "http-get:*:audio/mp4:*,"
-                    + "http-get:*:image/jpeg:*,"
-                    + "http-get:*:image/png:*";
+                    + "http-get:*:audio/mp4:*";
 
     /** 各 action 需要回什么参数 */
     private String responseArgs(String action) {
@@ -759,7 +987,8 @@ public class UpnpHttpServer extends Thread {
             return "<CurrentVolume>" + handler.getVolume0to100() + "</CurrentVolume>";
         }
         if ("GetMute".equals(action)) {
-            return "<CurrentMute>0</CurrentMute>";
+            // 不能恒回 0 —— 那等于对着控制点撒谎（见 CommandHandler.getMute 的说明）。
+            return "<CurrentMute>" + (handler.getMute() ? "1" : "0") + "</CurrentMute>";
         }
         if ("GetProtocolInfo".equals(action)) {
             return "<Source></Source>"
@@ -914,6 +1143,26 @@ public class UpnpHttpServer extends Thread {
         out.write(payload);
     }
 
+    /**
+     * 带二进制 body 的响应（目前只有图标用）。
+     *
+     * <p>和 {@link #writeSimple} 的唯一区别是 body **不经过 String**：
+     * PNG 用 UTF-8 编一遍再解回来会被替换字符毁掉（0x80~0xFF 里大量字节
+     * 不是合法 UTF-8 序列），控制点收到的就是一张坏图。字节必须原样发出去。
+     */
+    private void writeBinary(OutputStream out, String status, String contentType, byte[] body)
+            throws IOException {
+        StringBuilder sb = new StringBuilder();
+        sb.append("HTTP/1.1 ").append(status).append("\r\n");
+        sb.append("Content-Type: ").append(contentType).append("\r\n");
+        sb.append("Content-Length: ").append(body.length).append("\r\n");
+        sb.append("Connection: close\r\n");
+        sb.append("Server: Android UPnP/1.0 Juping/1.0\r\n");
+        sb.append("\r\n");
+        out.write(sb.toString().getBytes("UTF-8"));
+        out.write(body);
+    }
+
     // ------------------------------------------------------------ 小工具
 
     private static String lastSegment(String path) {
@@ -1065,22 +1314,108 @@ public class UpnpHttpServer extends Thread {
     }
 
     // --------------------------------------------------------- SCPD 模板
+    //
+    // 这三份 XML 是**控制点了解"能调哪些指令"的唯一依据**。写错的后果不是
+    // "少一个功能"，而是控制点整份解析失败 —— 严格按 SCPD 校验的协议栈
+    // （Cling / jUPnP 系、BubbleUPnP 等）会直接判定这个服务不可用，于是设备
+    // 在列表里是灰的、点不动。宽松的（多数国产 SDK）不看这些也能用，
+    // 所以这类 bug 只在部分控制点上暴露，最容易被误判成"那台手机的问题"。
+    //
+    // 本轮改掉的两个硬伤：
+    //
+    //  1. relatedStateVariable **必须**指向 serviceStateTable 里真实存在的变量名。
+    //     原来直接拿参数名当变量名，生成的是
+    //         <relatedStateVariable>InstanceID</relatedStateVariable>
+    //     而表里没有叫 InstanceID 的变量（正确名是 A_ARG_TYPE_InstanceID）。
+    //     这是上面说的那种"整份解析失败"。
+    //
+    //  2. **out 参数原来一个都没声明。** 规范要求每个 action 的出参都列出来，
+    //     控制点靠它知道响应里该有哪些字段、以及去哪个变量取值。
+    //     缺了它，控制点拿到响应也不知道怎么读。
+    //
+    // 另外补上了原来漏在 SCPD 外面、但代码里已经在处理的 action
+    // （GetDeviceCapabilities / GetTransportSettings / GetCurrentTransportActions /
+    //  Next / Previous / SetPlayMode，以及 RenderingControl 的 ListPresets /
+    //  SelectPreset）—— 控制点**不会发 SCPD 里没写的 action**，
+    // 所以这些代码原本是死的。
+    //
+    // action 清单与变量表照 UPnP 官方的 AVTransport:1 / RenderingControl:1 /
+    // ConnectionManager:1 SCPD 模板来，并与 Platinum UPnP SDK
+    // （Source/Devices/MediaRenderer/AVTransportSCPD.xml 等）逐条核对过。
+    // 刻意**没有**收录 SetPlaySpeed —— 它不是 AVTransport:1 的标准 action，
+    // 写进 :1 的 SCPD 本身就是错的（原来它还同时出现在 KNOWN_ACTIONS 里）。
 
     private static final String SCPD_AV_TRANSPORT =
             "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
                     + "<scpd xmlns=\"urn:schemas-upnp-org:service-1-0\">\n"
                     + " <specVersion><major>1</major><minor>0</minor></specVersion>\n"
                     + " <actionList>\n"
-                    + action("SetAVTransportURI", "InstanceID", "CurrentURI", "CurrentURIMetaData")
-                    + action("GetMediaInfo", "InstanceID")
-                    + action("GetTransportInfo", "InstanceID")
-                    + action("GetPositionInfo", "InstanceID")
-                    + action("Play", "InstanceID", "Speed")
-                    + action("Pause", "InstanceID")
-                    + action("Stop", "InstanceID")
-                    + action("Seek", "InstanceID", "Unit", "Target")
+                    + action("SetAVTransportURI",
+                            "in:InstanceID:A_ARG_TYPE_InstanceID",
+                            "in:CurrentURI:AVTransportURI",
+                            "in:CurrentURIMetaData:AVTransportURIMetaData")
+                    + action("GetMediaInfo",
+                            "in:InstanceID:A_ARG_TYPE_InstanceID",
+                            "out:NrTracks:NumberOfTracks",
+                            "out:MediaDuration:CurrentMediaDuration",
+                            "out:CurrentURI:AVTransportURI",
+                            "out:CurrentURIMetaData:AVTransportURIMetaData",
+                            "out:NextURI:NextAVTransportURI",
+                            "out:NextURIMetaData:NextAVTransportURIMetaData",
+                            "out:PlayMedium:PlaybackStorageMedium",
+                            "out:RecordMedium:RecordStorageMedium",
+                            "out:WriteStatus:RecordMediumWriteStatus")
+                    + action("GetTransportInfo",
+                            "in:InstanceID:A_ARG_TYPE_InstanceID",
+                            "out:CurrentTransportState:TransportState",
+                            "out:CurrentTransportStatus:TransportStatus",
+                            "out:CurrentSpeed:TransportPlaySpeed")
+                    + action("GetPositionInfo",
+                            "in:InstanceID:A_ARG_TYPE_InstanceID",
+                            "out:Track:CurrentTrack",
+                            "out:TrackDuration:CurrentTrackDuration",
+                            "out:TrackMetaData:CurrentTrackMetaData",
+                            "out:TrackURI:CurrentTrackURI",
+                            "out:RelTime:RelativeTimePosition",
+                            "out:AbsTime:AbsoluteTimePosition",
+                            "out:RelCount:RelativeCounterPosition",
+                            "out:AbsCount:AbsoluteCounterPosition")
+                    + action("GetDeviceCapabilities",
+                            "in:InstanceID:A_ARG_TYPE_InstanceID",
+                            "out:PlayMedia:PossiblePlaybackStorageMedia",
+                            "out:RecMedia:PossibleRecordStorageMedia",
+                            "out:RecQualityModes:PossibleRecordQualityModes")
+                    + action("GetTransportSettings",
+                            "in:InstanceID:A_ARG_TYPE_InstanceID",
+                            "out:PlayMode:CurrentPlayMode",
+                            "out:RecQualityMode:CurrentRecordQualityMode")
+                    + action("GetCurrentTransportActions",
+                            "in:InstanceID:A_ARG_TYPE_InstanceID",
+                            "out:Actions:CurrentTransportActions")
+                    + action("Stop", "in:InstanceID:A_ARG_TYPE_InstanceID")
+                    + action("Play",
+                            "in:InstanceID:A_ARG_TYPE_InstanceID",
+                            "in:Speed:TransportPlaySpeed")
+                    + action("Pause", "in:InstanceID:A_ARG_TYPE_InstanceID")
+                    + action("Seek",
+                            "in:InstanceID:A_ARG_TYPE_InstanceID",
+                            "in:Unit:A_ARG_TYPE_SeekMode",
+                            "in:Target:A_ARG_TYPE_SeekTarget")
+                    // Next / Previous 在规范里是**必选** action（可以回 701，
+                    // 但不能不存在）—— 所以它们必须写在 SCPD 里。
+                    // 代码侧由 notApplicableReason() 回 701。
+                    + action("Next", "in:InstanceID:A_ARG_TYPE_InstanceID")
+                    + action("Previous", "in:InstanceID:A_ARG_TYPE_InstanceID")
+                    + action("SetPlayMode",
+                            "in:InstanceID:A_ARG_TYPE_InstanceID",
+                            "in:NewPlayMode:CurrentPlayMode")
                     + " </actionList>\n"
                     + " <serviceStateTable>\n"
+                    // ---- 声明为可事件化的，**必须**与 DlnaRendererService
+                    //      .eventedVars("AVTransport") 给出的键完全一致。
+                    //      多一个：控制点会一直等一个永远不来的值；
+                    //      少一个：事件体里带了它，控制点按 SCPD 直接忽略。
+                    //      两边各写一份，靠 tools/policy-test 的守卫钉住。
                     + stateVar("TransportState", "string", true)
                     + stateVar("TransportStatus", "string", true)
                     + stateVar("CurrentTrackURI", "string", true)
@@ -1089,8 +1424,33 @@ public class UpnpHttpServer extends Thread {
                     // 不轮询 GetPositionInfo，而是靠事件里的 RelativeTimePosition
                     // 更新进度条。SCPD 里不声明的话，事件体里就算给了它也不会用。
                     + stateVar("RelativeTimePosition", "string", true)
-                    + stateVar("CurrentURI", "string", false)
-                    + stateVar("CurrentURIMetaData", "string", false)
+                    // ---- 下面这些是"被 out 参数引用到"的变量，规范要求它们
+                    //      必须出现在表里，但不需要事件化（sendEvents="no"）。----
+                    + stateVar("PlaybackStorageMedium", "string", false)
+                    + stateVar("RecordStorageMedium", "string", false)
+                    + stateVar("PossiblePlaybackStorageMedia", "string", false)
+                    + stateVar("PossibleRecordStorageMedia", "string", false)
+                    + stateVar("CurrentPlayMode", "string", false)
+                    + stateVar("TransportPlaySpeed", "string", false)
+                    + stateVar("RecordMediumWriteStatus", "string", false)
+                    + stateVar("CurrentRecordQualityMode", "string", false)
+                    + stateVar("PossibleRecordQualityModes", "string", false)
+                    + stateVar("NumberOfTracks", "ui4", false)
+                    + stateVar("CurrentTrack", "ui4", false)
+                    + stateVar("CurrentMediaDuration", "string", false)
+                    + stateVar("CurrentTrackMetaData", "string", false)
+                    + stateVar("AVTransportURI", "string", false)
+                    + stateVar("AVTransportURIMetaData", "string", false)
+                    + stateVar("NextAVTransportURI", "string", false)
+                    + stateVar("NextAVTransportURIMetaData", "string", false)
+                    + stateVar("AbsoluteTimePosition", "string", false)
+                    + stateVar("RelativeCounterPosition", "i4", false)
+                    + stateVar("AbsoluteCounterPosition", "i4", false)
+                    + stateVar("CurrentTransportActions", "string", false)
+                    // A_ARG_TYPE_* 是"参数类型"变量，规范里统一用这个前缀。
+                    + stateVar("A_ARG_TYPE_InstanceID", "ui4", false)
+                    + stateVar("A_ARG_TYPE_SeekMode", "string", false)
+                    + stateVar("A_ARG_TYPE_SeekTarget", "string", false)
                     + " </serviceStateTable>\n"
                     + "</scpd>\n";
 
@@ -1099,9 +1459,20 @@ public class UpnpHttpServer extends Thread {
                     + "<scpd xmlns=\"urn:schemas-upnp-org:service-1-0\">\n"
                     + " <specVersion><major>1</major><minor>0</minor></specVersion>\n"
                     + " <actionList>\n"
-                    + action("GetProtocolInfo")
-                    + action("GetCurrentConnectionIDs")
-                    + action("GetCurrentConnectionInfo", "ConnectionID")
+                    + action("GetProtocolInfo",
+                            "out:Source:SourceProtocolInfo",
+                            "out:Sink:SinkProtocolInfo")
+                    + action("GetCurrentConnectionIDs",
+                            "out:ConnectionIDs:CurrentConnectionIDs")
+                    + action("GetCurrentConnectionInfo",
+                            "in:ConnectionID:A_ARG_TYPE_ConnectionID",
+                            "out:RcsID:A_ARG_TYPE_RcsID",
+                            "out:AVTransportID:A_ARG_TYPE_AVTransportID",
+                            "out:ProtocolInfo:A_ARG_TYPE_ProtocolInfo",
+                            "out:PeerConnectionManager:A_ARG_TYPE_ConnectionManager",
+                            "out:PeerConnectionID:A_ARG_TYPE_ConnectionID",
+                            "out:Direction:A_ARG_TYPE_Direction",
+                            "out:Status:A_ARG_TYPE_ConnectionStatus")
                     + " </actionList>\n"
                     // ConnectionManager 在标准里也有可事件化变量，控制点常订阅它。
                     // 声明了就必须在 eventedVars 里如实给值，否则控制点收到的是一份
@@ -1110,6 +1481,13 @@ public class UpnpHttpServer extends Thread {
                     + stateVar("SourceProtocolInfo", "string", true)
                     + stateVar("SinkProtocolInfo", "string", true)
                     + stateVar("CurrentConnectionIDs", "string", true)
+                    + stateVar("A_ARG_TYPE_ConnectionStatus", "string", false)
+                    + stateVar("A_ARG_TYPE_ConnectionManager", "string", false)
+                    + stateVar("A_ARG_TYPE_Direction", "string", false)
+                    + stateVar("A_ARG_TYPE_ProtocolInfo", "string", false)
+                    + stateVar("A_ARG_TYPE_ConnectionID", "i4", false)
+                    + stateVar("A_ARG_TYPE_AVTransportID", "i4", false)
+                    + stateVar("A_ARG_TYPE_RcsID", "i4", false)
                     + " </serviceStateTable>\n"
                     + "</scpd>\n";
 
@@ -1118,29 +1496,77 @@ public class UpnpHttpServer extends Thread {
                     + "<scpd xmlns=\"urn:schemas-upnp-org:service-1-0\">\n"
                     + " <specVersion><major>1</major><minor>0</minor></specVersion>\n"
                     + " <actionList>\n"
-                    + action("GetVolume", "InstanceID", "Channel")
-                    + action("SetVolume", "InstanceID", "Channel", "DesiredVolume")
-                    + action("GetMute", "InstanceID", "Channel")
-                    + action("SetMute", "InstanceID", "Channel", "DesiredMute")
+                    // ListPresets / SelectPreset 属于 RenderingControl:1（不在 AVTransport 里）。
+                    // 原来 KNOWN_ACTIONS 和 responseArgs 都处理了它们，SCPD 里却没声明 ——
+                    // 而控制点不会发 SCPD 里没有的 action，所以那两段代码是死的。
+                    + action("ListPresets",
+                            "in:InstanceID:A_ARG_TYPE_InstanceID",
+                            "out:CurrentPresetNameList:PresetNameList")
+                    + action("SelectPreset",
+                            "in:InstanceID:A_ARG_TYPE_InstanceID",
+                            "in:PresetName:A_ARG_TYPE_PresetName")
+                    + action("GetVolume",
+                            "in:InstanceID:A_ARG_TYPE_InstanceID",
+                            "in:Channel:A_ARG_TYPE_Channel",
+                            "out:CurrentVolume:Volume")
+                    + action("SetVolume",
+                            "in:InstanceID:A_ARG_TYPE_InstanceID",
+                            "in:Channel:A_ARG_TYPE_Channel",
+                            "in:DesiredVolume:Volume")
+                    + action("GetMute",
+                            "in:InstanceID:A_ARG_TYPE_InstanceID",
+                            "in:Channel:A_ARG_TYPE_Channel",
+                            "out:CurrentMute:Mute")
+                    + action("SetMute",
+                            "in:InstanceID:A_ARG_TYPE_InstanceID",
+                            "in:Channel:A_ARG_TYPE_Channel",
+                            "in:DesiredMute:Mute")
                     + " </actionList>\n"
                     // 声明 Volume / Mute 是「可事件化」的 —— 控制点订阅后，
-                    // 音量一变就能收到 NOTIFY。原来这里一张 stateVariable 表都没有，
+                    // 音量/静音一变就能收到 NOTIFY。原来这里一张 stateVariable 表都没有，
                     // 于是控制点订阅 RenderingControl 拿到的是空事件集。
                     + " <serviceStateTable>\n"
                     + stateVar("Volume", "ui2", true)
                     + stateVar("Mute", "boolean", true)
+                    + stateVar("PresetNameList", "string", false)
+                    + stateVar("A_ARG_TYPE_InstanceID", "ui4", false)
+                    + stateVar("A_ARG_TYPE_Channel", "string", false)
+                    + stateVar("A_ARG_TYPE_PresetName", "string", false)
                     + " </serviceStateTable>\n"
                     + "</scpd>\n";
 
+    /**
+     * 生成一条 {@code <action>}。
+     *
+     * <p>参数按 {@code "方向:参数名:关联状态变量"} 写，例如
+     * {@code "out:CurrentVolume:Volume"}、{@code "in:InstanceID:A_ARG_TYPE_InstanceID"}。
+     *
+     * <p>为什么把第三个字段做成**必填**而不是从参数名推：规范要求
+     * {@code relatedStateVariable} 指向 serviceStateTable 里真实存在的变量，
+     * 而参数名与变量名**经常不一样**（{@code CurrentVolume} → {@code Volume}、
+     * {@code InstanceID} → {@code A_ARG_TYPE_InstanceID}）。
+     * 按参数名推就是本类原来那个 bug 的成因。写成三段之后，
+     * 少写一段会当场抛异常（而不是静默生成一份畸形 SCPD）。
+     */
     private static String action(String name, String... args) {
         StringBuilder sb = new StringBuilder();
         sb.append("  <action><name>").append(name).append("</name>");
         if (args.length > 0) {
             sb.append("<argumentList>");
             for (int i = 0; i < args.length; i++) {
-                sb.append("<argument><name>").append(args[i]).append("</name>")
-                        .append("<direction>in</direction><relatedStateVariable>")
-                        .append(args[i]).append("</relatedStateVariable></argument>");
+                String[] p = args[i].split(":");
+                if (p.length != 3) {
+                    // 宁可当场炸掉。静态初始化失败会让 UpnpHttpServer 类加载不出来，
+                    // 服务一起起不来 —— 声音很大，但**好过静默生成一份畸形 SCPD**：
+                    // 后者只在部分控制点上表现为"设备是灰的"，极难定位。
+                    // 而它一定会在 tools/protocol-test 里被抓到（那一轮会 GET 三份 SCPD）。
+                    throw new IllegalArgumentException(
+                            "SCPD 参数必须写成 方向:参数名:状态变量，收到: " + args[i]);
+                }
+                sb.append("<argument><name>").append(p[1]).append("</name>")
+                        .append("<direction>").append(p[0]).append("</direction>")
+                        .append("<relatedStateVariable>").append(p[2])
+                        .append("</relatedStateVariable></argument>");
             }
             sb.append("</argumentList>");
         }

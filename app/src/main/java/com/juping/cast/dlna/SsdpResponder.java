@@ -10,6 +10,13 @@ import java.net.MulticastSocket;
 import java.net.NetworkInterface;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Random;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * SSDP 响应器 —— 让手机端投屏 App「搜得到」这台设备。
@@ -132,6 +139,37 @@ public class SsdpResponder extends Thread {
      */
     private static final int RETRY_LOG_EVERY = 20;
 
+    /**
+     * MX 头的上限（秒）。
+     *
+     * <p>规范里 MX 表示"设备最多等这么多秒再应答"，取值 1~5。
+     * 这里夹一道上限不是为了合规，是为了**挡住畸形报文**：
+     * 一个写着 {@code MX: 99999} 的包会让应答排在 27 小时之后 ——
+     * 那和不支持没有区别，而且它还会占着一个待发位置。
+     */
+    private static final int MAX_MX_SEC = 5;
+
+    /**
+     * 待发应答的批数上限。
+     *
+     * <p>这台盒子只有 0.6GB 内存。一个每秒发几十条 M-SEARCH 的异常控制点
+     * （或一个端口扫描器）能排出一条无限长的队列 —— 那是内存泄漏，
+     * 而且它排在最前面堵着，正常搜索的应答反而排在后面。
+     *
+     * <p>到上限就**直接丢弃**：UDP 本来就会丢包，控制点收不到会重发，
+     * 丢几条远比把进程撑爆好。32 批 × 最多 6 条 = 192 个包，够用了。
+     */
+    private static final int MAX_PENDING_REPLIES = 32;
+
+    /**
+     * 随机延迟用的发生器。
+     *
+     * <p>用 {@link Random} 而不是 {@code Math.random()}：这里要的是一个
+     * **有明确边界**的整数（0 到 MX 毫秒之间，含两端），
+     * {@code nextInt(n)} 正好表达这个语义，不必再处理取整方向。
+     */
+    private static final Random RANDOM = new Random();
+
     private final String uuid;
     private final int httpPort;      // 设备描述 URL 里的端口（LOCATION 用）
     private final String serverName;
@@ -151,6 +189,24 @@ public class SsdpResponder extends Thread {
     private MulticastSocket socket;
     private NetworkInterface boundInterface;
     private volatile int boundPort = -1;
+
+    /**
+     * 延迟应答用的调度器。
+     *
+     * <p>为什么必须延迟：UPnP DA 1.0 §1.3.2 要求设备在 **0 ~ MX 秒之间随机**
+     * 之后才回应 M-SEARCH，目的是把多台设备、多个搜索目标的应答在时间上错开，
+     * 减少 UDP 碰撞。立即连发的话（原来的做法），一次搜索就要连发最多 6 条，
+     * 几台设备同网时碰撞概率相当高 —— 表现就是「有时搜得到、有时搜不到」，
+     * 且完全看不出规律，最容易被当成"手机的问题"。
+     *
+     * <p>为什么用调度器而不是在收包线程里 sleep：收包线程必须一直待在
+     * {@code receive()} 上。睡一秒就意味着这一秒内其它设备的搜索
+     * （以及控制点因为没收到应答而重发的搜索）全被丢掉。
+     */
+    private volatile ScheduledExecutorService replyScheduler;
+
+    /** 已经排进调度器、还没发出去的批数。见 {@link #MAX_PENDING_REPLIES} */
+    private final AtomicInteger pendingReplies = new AtomicInteger();
 
     /** 定期重播线程。持有引用是为了能在 {@link #shutdown()} 里 interrupt 掉。 */
     private volatile Thread announcer;
@@ -218,6 +274,19 @@ public class SsdpResponder extends Thread {
                 // 只有「还没绑上就被要求关闭」才会走到这里
                 return;
             }
+
+            // 延迟应答的调度器。单线程就够（应答只是"到点发几个 UDP 包"），
+            // 而且单线程天然把并发量压在 1 —— 0.6GB 的盒子上越简单越好。
+            replyScheduler = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread t = new Thread(r, "ssdp-reply");
+                    // daemon：桌面协议测试跑完要能直接退出，
+                    // 不能被这个线程吊着不放。
+                    t.setDaemon(true);
+                    return t;
+                }
+            });
 
             // 加入组播成功之后**立刻主动广播一轮 ssdp:alive**。
             //
@@ -421,10 +490,91 @@ public class SsdpResponder extends Thread {
             return;
         }
 
+        long delayMs = randomDelayMs(headerValue(msg, "MX"));
         Log.i(TAG, "收到设备搜索（ST=" + st + "），来自 "
-                + packet.getAddress().getHostAddress() + "，将回 " + targets.size() + " 条");
-        for (int i = 0; i < targets.size(); i++) {
-            sendResponse(targets.get(i), packet);
+                + packet.getAddress().getHostAddress() + "，将回 " + targets.size()
+                + " 条，延迟 " + delayMs + "ms");
+        scheduleResponse(targets, packet, delayMs);
+    }
+
+    /**
+     * 按 MX 头算出延迟多少毫秒再应答。
+     *
+     * <p>规范要求「0 ~ MX 秒之间的**随机**延迟」，而不是立即回、也不是固定睡满。
+     *
+     * <p>MX 缺失时按 1 秒处理。规范说 MX 是必选头，但缺失时用一个保守的小值
+     * 比不应答好：应答晚一点不影响正确性，**不应答才是真的搜不到**。
+     *
+     * <p>上限夹在 {@link #MAX_MX_SEC}：一个畸形报文里写 {@code MX: 99999}
+     * 会让应答排在一天之后 —— 那和不支持没有区别，而且白占一个待发位置。
+     *
+     * <p>返回值是**纯函数**（只依赖入参和随机源），所以能单独核验：
+     * {@code MX=0} 必须恰好得 0（这是可判定的，测试就靠它把"真的按 MX 算了"
+     * 和"其实没算、只是碰巧很快"区分开）。
+     */
+    static long randomDelayMs(String mx) {
+        int seconds = 1;
+        if (mx != null && mx.length() > 0) {
+            try {
+                seconds = Integer.parseInt(mx.trim());
+            } catch (NumberFormatException ignored) {
+                // 解析不出来就按默认的 1 秒走。**不要**因为一个畸形头不应答。
+                seconds = 1;
+            }
+        }
+        if (seconds < 0) {
+            seconds = 0;
+        }
+        if (seconds > MAX_MX_SEC) {
+            seconds = MAX_MX_SEC;
+        }
+        if (seconds == 0) {
+            return 0L;
+        }
+        // [0, seconds*1000] 闭区间：MX=1 时可能是 0ms（立刻），也可能是 1000ms。
+        // nextInt(n) 的取值范围是 [0, n)，所以上界要 +1 才把 1000 包含进来。
+        return (long) RANDOM.nextInt(seconds * 1000 + 1);
+    }
+
+    /**
+     * 把这一轮应答排进延迟队列。
+     *
+     * <p>延迟时长对整个 targets 列表是**同一个** —— 规范说的是"对这次搜索的
+     * 应答延迟一个随机时间"，不是每条各自随机。同一个值还能保证控制点在极短的
+     * 窗口内收齐所有 ST 的应答，不会出现"搜到了设备类型、却没搜到它的服务"
+     * 这种半截状态（那会让设备列表里出现一个点不开的条目）。
+     */
+    private void scheduleResponse(final List<String> targets, final DatagramPacket request,
+                                  long delayMs) {
+        final ScheduledExecutorService s = replyScheduler;
+        if (s == null || s.isShutdown()) {
+            return;
+        }
+        if (pendingReplies.get() >= MAX_PENDING_REPLIES) {
+            // 丢弃而不是排队。控制点收不到会重发，而排队排到最后的结果
+            // 是"内存被撑爆 + 正常搜索的应答被堵在后面"。
+            Log.w(TAG, "待发应答已达上限 " + MAX_PENDING_REPLIES
+                    + "，丢弃这次搜索（控制点会重发）");
+            return;
+        }
+        pendingReplies.incrementAndGet();
+        try {
+            s.schedule(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        for (int i = 0; i < targets.size(); i++) {
+                            sendResponse(targets.get(i), request);
+                        }
+                    } finally {
+                        pendingReplies.decrementAndGet();
+                    }
+                }
+            }, delayMs, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException e) {
+            // 调度器正好在关闭。计数必须还回去 —— 不还的话它会一直顶在上限，
+            // 从此所有搜索都被判成"队列满"而丢弃，表现为「设备突然搜不到了」。
+            pendingReplies.decrementAndGet();
         }
     }
 
@@ -727,20 +877,57 @@ public class SsdpResponder extends Thread {
         }
     }
 
+    /**
+     * 关掉 socket，并把「已绑定」的状态**一并复位**。
+     *
+     * <p>复位这一步是本类里最容易漏、后果又最隐蔽的一句。原来这里只 close，
+     * {@code boundPort} / {@code boundInterface} / {@code location} 全留着 ——
+     * 于是线程因为任何原因退出之后（被系统踢出组播组、receive 抛出没 catch 的异常、
+     * 上层 shutdown 之后又被重建……），{@code isBound()} **仍然返回 true**。
+     *
+     * <p>后果不是"少一个状态"这么轻：界面据此显示"设备已就绪"，而实际上
+     * 一个搜索请求都收不到 —— 手机搜不到设备，界面却说一切正常。
+     * 用户唯一能做的就是重启盒子，而重启之后"看起来"又好了，
+     * 于是永远定位不到这个故障。
+     *
+     * <p>顺序：**先清状态，再关 socket**。反过来的话，close 与清状态之间
+     * 有一个瞬间是"端口已经没了、状态却说在监听"，调用方会读到假信息。
+     */
     private void closeQuietly() {
-        if (socket == null) {
+        MulticastSocket s = socket;
+        NetworkInterface nif = boundInterface;
+        int boundPortBefore = boundPort;
+
+        boundPort = -1;
+        boundInterface = null;
+        location = null;
+        socket = null;
+
+        // 调度器也一并收掉。不关的话它会挂着一条 daemon 线程，
+        // 而里面排着的延迟应答还持有着 socket 的引用 —— 服务都销毁了，
+        // 30 秒后还想往一个已关闭的 socket 上发东西。
+        ScheduledExecutorService sc = replyScheduler;
+        replyScheduler = null;
+        if (sc != null) {
+            sc.shutdownNow();
+        }
+
+        if (s == null) {
             return;
         }
         try {
-            if (!socket.isClosed()) {
+            if (!s.isClosed()) {
+                // leaveGroup 用的是**关掉之前**的值 —— 状态已经清空了，
+                // 这里必须用上面存下来的局部变量，否则退组退到的是 null 组。
                 try {
-                    socket.leaveGroup(
-                            new InetSocketAddress(InetAddress.getByName(SSDP_ADDR), boundPort),
-                            boundInterface);
+                    if (nif != null && boundPortBefore > 0) {
+                        s.leaveGroup(new InetSocketAddress(
+                                InetAddress.getByName(SSDP_ADDR), boundPortBefore), nif);
+                    }
                 } catch (Exception ignored) {
                     // 退出组播失败不影响关闭
                 }
-                socket.close();
+                s.close();
             }
         } catch (Exception e) {
             Log.w(TAG, "关闭 SSDP socket 出错", e);
