@@ -143,12 +143,14 @@ public class UpnpHttpServer extends Thread {
             String requestLine = headLines[0];
             Log.d(TAG, "<< " + requestLine);
 
-            String[] parts = requestLine.split(" ");
+            // 用 \s+ 而不是 " "：请求行里多余的空格（"GET  /x HTTP/1.1"）
+            // 会让 split(" ") 切出空串，path 变成 ""，直接 404。
+            String[] parts = requestLine.split("\\s+");
             if (parts.length < 2) {
                 return;
             }
             String method = parts[0];
-            String path = parts[1];
+            String path = normalizePath(parts[1]);
 
             int contentLength = 0;
             String soapAction = null;
@@ -211,6 +213,41 @@ public class UpnpHttpServer extends Thread {
     }
 
     // ---------------------------------------------------------------- GET
+
+    /**
+     * 把请求目标规整成「以 / 开头的路径」。
+     *
+     * <p>HTTP/1.1 允许请求行里写**绝对形式**的 URI（RFC 7230 §5.3.2）：
+     * <pre>GET http://192.168.1.50:49152/upnp/device.xml HTTP/1.1</pre>
+     * 而服务端**必须**接受这种写法。部分控制点（尤其是嵌入式协议栈和
+     * 某些 Windows 组件）确实这么发 —— 原来直接拿 parts[1] 当路径比较，
+     * 绝对形式下 startsWith("/upnp/device.xml") 为假，于是设备描述返回 404，
+     * 手机端表现为「搜到了设备但投不了屏」，而日志里只有一句 404。
+     */
+    private static String normalizePath(String target) {
+        if (target == null || target.length() == 0) {
+            return "/";
+        }
+        // 绝对形式：剥掉 scheme://authority 前缀
+        int scheme = target.indexOf("://");
+        if (scheme >= 0) {
+            int slash = target.indexOf('/', scheme + 3);
+            target = (slash >= 0) ? target.substring(slash) : "/";
+        }
+        // 丢掉查询串和片段，它们不参与路由
+        int cut = target.indexOf('?');
+        if (cut < 0) {
+            cut = target.indexOf('#');
+        }
+        if (cut >= 0) {
+            target = target.substring(0, cut);
+        }
+        if (target.length() == 0) {
+            return "/";
+        }
+        // 容忍没写前导斜杠的写法
+        return target.startsWith("/") ? target : "/" + target;
+    }
 
     private void handleGet(String path, OutputStream out) throws IOException {
         if (path.startsWith("/upnp/device.xml") || path.equals("/")) {

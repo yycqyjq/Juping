@@ -21,11 +21,18 @@ import xml.etree.ElementTree as ET
 HOST = '127.0.0.1'
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 49152
 CALL_LOG = sys.argv[2] if len(sys.argv) > 2 else '/tmp/juping-calls.log'
+# SSDP 用临时端口，由服务端实际绑上后回传（见 run.sh 解析 READY 行）
+SSDP_PORT = int(sys.argv[3]) if len(sys.argv) > 3 else 0
 
 NS_SOAP = '{http://schemas.xmlsoap.org/soap/envelope/}'
 SVC_AVT = 'urn:schemas-upnp-org:service:AVTransport:1'
 SVC_CMS = 'urn:schemas-upnp-org:service:ConnectionManager:1'
 SVC_RCS = 'urn:schemas-upnp-org:service:RenderingControl:1'
+
+# 必须与 ProtocolTestServer.java 里的 UUID 一致
+DEV_UUID = '11111111-2222-3333-4444-555555555555'
+DEV_TYPE = 'urn:schemas-upnp-org:device:MediaRenderer:1'
+ALL_SERVICE_TYPES = (SVC_AVT, SVC_CMS, SVC_RCS)
 
 results = []
 
@@ -390,6 +397,232 @@ check('畸形请求后服务仍存活', st.startswith('HTTP/1.1 200'), st)
 st, hd, body = soap_post('NoSuchAction', SVC_AVT, '')
 check('未知 action 返回 SOAP Fault 而不是崩溃',
       b'Fault' in body or '500' in st or '401' in st, st)
+
+
+# ══════════════════════════════════════════════════════════════ SSDP 发现
+
+def parse_ssdp(resp):
+    head, _, _ = resp.partition('\r\n\r\n')
+    lines = head.split('\r\n')
+    hdrs = {}
+    for hl in lines[1:]:
+        if ':' in hl:
+            k, _, v = hl.partition(':')
+            hdrs[k.strip().lower()] = v.strip()
+    return (lines[0] if lines else ''), hdrs
+
+
+def msearch(st, mx=1, timeout=3.0, quiet=0.5):
+    """发一条真实的 M-SEARCH，收齐应答后返回 [(status, headers), ...]
+
+    用**单播**发到服务端绑定的 UDP 端口：socket 绑在通配地址上，单播包一样能收到，
+    于是整套 SSDP 逻辑都能在桌面上验证，不必依赖组播 ——
+    组播在不同平台/网络环境下的行为差异太大，不适合做自动化断言。
+    """
+    msg = ('M-SEARCH * HTTP/1.1\r\n'
+           'HOST: 239.255.255.250:1900\r\n'
+           'MAN: "ssdp:discover"\r\n'
+           'MX: %d\r\n'
+           'ST: %s\r\n'
+           '\r\n' % (mx, st)).encode('utf-8')
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    out = []
+    try:
+        s.sendto(msg, (HOST, SSDP_PORT))
+        s.settimeout(timeout)
+        while True:
+            try:
+                data, _ = s.recvfrom(4096)
+            except socket.timeout:
+                break
+            out.append(parse_ssdp(data.decode('utf-8', 'replace')))
+            # 收到第一条之后只再等一小会儿，免得每条都干等满超时
+            s.settimeout(quiet)
+    finally:
+        s.close()
+    return out
+
+
+def raw_ssdp(payload, timeout=1.5):
+    """发任意 UDP 报文，返回收到的应答条数（验证「不该答的不能答」）"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.sendto(payload, (HOST, SSDP_PORT))
+        s.settimeout(timeout)
+        try:
+            s.recvfrom(4096)
+            return 1
+        except socket.timeout:
+            return 0
+    finally:
+        s.close()
+
+
+def short(st):
+    return st.replace('urn:schemas-upnp-org:', '').replace('uuid:' + DEV_UUID, 'uuid:<本机>')
+
+
+print('\n── 7. SSDP 设备发现（手机搜不搜得到这台设备）──')
+
+if SSDP_PORT <= 0:
+    check('SSDP 端口可用', False, '服务端没报告绑上的端口（网卡选择失败？）')
+    all_resp, sts, first = [], [], {}
+else:
+    check('SSDP 端口可用', True, 'UDP %d' % SSDP_PORT)
+
+    # --- ssdp:all：规范要求对每个搜索目标各回一条，不是回一条就完事 ---
+    all_resp = msearch('ssdp:all')
+    sts = [h.get('st', '') for _, h in all_resp]
+    first = all_resp[0][1] if all_resp else {}
+    check('ssdp:all 收到应答', len(all_resp) > 0, '收到 %d 条' % len(all_resp))
+
+    expected = {'upnp:rootdevice', 'uuid:' + DEV_UUID, DEV_TYPE} | set(ALL_SERVICE_TYPES)
+    missing = expected - set(sts)
+    check('ssdp:all 覆盖全部 6 个搜索目标', not missing,
+          ('缺少 %s' % ', '.join(sorted(short(m) for m in missing))) if missing
+          else 'ST = %s' % ', '.join(sorted(short(x) for x in set(sts))))
+
+    # --- 应答头必须齐 ---
+    for name, key in (('CACHE-CONTROL', 'cache-control'), ('EXT', 'ext'),
+                      ('LOCATION', 'location'), ('SERVER', 'server'),
+                      ('ST', 'st'), ('USN', 'usn')):
+        check('应答含 %s 头' % name, key in first, first.get(key, '(缺失)'))
+
+    status0 = all_resp[0][0] if all_resp else ''
+    check('应答状态行是 200 OK', status0.startswith('HTTP/1.1 200'), status0 or '(无应答)')
+    check('CACHE-CONTROL 是 max-age=1800',
+          'max-age=1800' in first.get('cache-control', ''), first.get('cache-control', '(缺失)'))
+    check('LOCATION 是 http:// 开头的绝对地址',
+          first.get('location', '').startswith('http://'), first.get('location', '(缺失)'))
+
+    # --- ST 必须原样回给控制点，否则控制点会丢弃这条应答 ---
+    #     这是「有的 App 搜得到、有的搜不到」的典型来源
+    for st_val, usn_expect in (
+            ('upnp:rootdevice', 'uuid:%s::upnp:rootdevice' % DEV_UUID),
+            ('uuid:%s' % DEV_UUID, 'uuid:%s' % DEV_UUID),
+            (DEV_TYPE, 'uuid:%s::%s' % (DEV_UUID, DEV_TYPE)),
+            (SVC_AVT, 'uuid:%s::%s' % (DEV_UUID, SVC_AVT)),
+            (SVC_CMS, 'uuid:%s::%s' % (DEV_UUID, SVC_CMS)),
+            (SVC_RCS, 'uuid:%s::%s' % (DEV_UUID, SVC_RCS)),
+    ):
+        resp = msearch(st_val)
+        got_sts = [h.get('st', '') for _, h in resp]
+        got_usn = [h.get('usn', '') for _, h in resp]
+        check('搜 %s → ST 原样回' % short(st_val), st_val in got_sts,
+              '收到 ST = %s' % (', '.join(short(x) for x in got_sts) or '(无应答)'))
+        check('搜 %s → USN 正确' % short(st_val), usn_expect in got_usn,
+              '期望 %s，收到 %s' % (usn_expect, ', '.join(got_usn) or '(无应答)'))
+
+    # --- 不该答的不能答，否则局域网里全是噪声 ---
+    other = msearch('urn:schemas-upnp-org:device:MediaServer:1')
+    check('搜 MediaServer（不是我们）→ 不应答', len(other) == 0, '收到 %d 条' % len(other))
+
+    n = raw_ssdp(b'NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n'
+                 b'NT: upnp:rootdevice\r\nNTS: ssdp:alive\r\n\r\n')
+    check('NOTIFY 上线广播 → 不应答', n == 0, '收到 %d 条' % n)
+
+    n = raw_ssdp(b'GARBAGE\r\n\r\n')
+    check('畸形 UDP 报文 → 不应答且服务存活', n == 0, '收到 %d 条' % n)
+
+
+# ══════════════════════════════════════════════════════════════ 发现链路闭环
+
+print('\n── 8. 发现链路闭环（SSDP → 设备描述 → 服务描述）──')
+print('   控制点真实走的就是这条链：搜到设备 → 按 LOCATION 抓描述 → 按 SCPDURL 抓服务。')
+print('   任何一环断开，表现都是「搜到了却投不了屏」。')
+
+loc = first.get('location', '')
+loc_path = '/' + loc.split('/', 3)[3] if loc.count('/') >= 3 else '/upnp/device.xml'
+
+st_line, _, dev_xml = raw_request('GET', loc_path)
+check('顺着 LOCATION 抓得到设备描述', st_line.startswith('HTTP/1.1 200'), '%s → %s' % (loc_path, st_line))
+
+NSD = '{urn:schemas-upnp-org:device-1-0}'
+try:
+    dev_root = ET.fromstring(dev_xml)
+    dev = dev_root.find(NSD + 'device')
+except Exception as e:
+    dev = None
+    check('设备描述是合法 XML', False, str(e))
+
+if dev is not None:
+    check('设备描述是合法 XML', True, '%d 字节' % len(dev_xml))
+
+    udn = dev.findtext(NSD + 'UDN', '')
+    check('UDN 与 SSDP 宣告的 uuid 一致', udn == 'uuid:' + DEV_UUID, udn or '(缺失)')
+
+    dev_type = dev.findtext(NSD + 'deviceType', '')
+    check('deviceType 与 SSDP 宣告的一致', dev_type == DEV_TYPE, dev_type or '(缺失)')
+
+    check('friendlyName 非空', bool(dev.findtext(NSD + 'friendlyName', '').strip()),
+          dev.findtext(NSD + 'friendlyName', '') or '(缺失)')
+
+    # 设备描述里声明的服务，SSDP 也必须都宣告过 ——
+    # 否则靠 SSDP 过滤服务类型的控制点会漏掉它们
+    declared = [s.findtext(NSD + 'serviceType', '') for s in dev.iter(NSD + 'service')]
+    not_announced = [t for t in declared if t and t not in sts]
+    check('描述里的服务类型都在 SSDP 宣告过', not not_announced,
+          ('未宣告 %s' % ', '.join(short(t) for t in not_announced)) if not_announced
+          else '%d 个服务全部一致' % len(declared))
+
+    # 每个 SCPDURL 都要真能取到，且是合法 XML
+    probe = {
+        'AVTransport': ('GetTransportInfo', SVC_AVT, ''),
+        'ConnectionManager': ('GetProtocolInfo', SVC_CMS, ''),
+        'RenderingControl': ('GetVolume', SVC_RCS, '<Channel>Master</Channel>'),
+    }
+    for svc in dev.iter(NSD + 'service'):
+        svc_type = svc.findtext(NSD + 'serviceType', '')
+        name = svc_type.split(':')[-2] if ':' in svc_type else svc_type
+        scpd = svc.findtext(NSD + 'SCPDURL', '')
+        ctrl = svc.findtext(NSD + 'controlURL', '')
+
+        s_line, _, s_body = raw_request('GET', scpd)
+        ok = s_line.startswith('HTTP/1.1 200')
+        detail = '%s → %s' % (scpd, s_line)
+        if ok:
+            try:
+                ET.fromstring(s_body)
+            except Exception as e:
+                ok, detail = False, 'XML 解析失败: %s' % e
+        check('SCPD 可取且是合法 XML：%s' % name, ok, detail)
+
+        # controlURL 路由必须存在 —— 404 说明设备描述和实际路由对不上
+        if name in probe:
+            action, svc_ns, args = probe[name]
+            c_line, _, _ = soap_post(action, svc_ns, args, control=name)
+            check('controlURL 可达：%s' % name, '404' not in c_line, '%s → %s' % (ctrl, c_line))
+
+
+# ══════════════════════════════════════════════════════════════ 请求行变体
+
+print('\n── 9. 请求行变体（RFC 7230 §5.3 要求服务端都接受）──')
+
+
+def raw_line(request_line, timeout=10):
+    raw = ('%s\r\nHost: %s:%d\r\n\r\n' % (request_line, HOST, PORT)).encode()
+    s = socket.create_connection((HOST, PORT), timeout=timeout)
+    try:
+        s.sendall(raw)
+        return s.recv(65536)
+    finally:
+        s.close()
+
+
+# 绝对形式（部分嵌入式控制点与 Windows 组件会这么发）
+data = raw_line('GET http://%s:%d/upnp/device.xml HTTP/1.1' % (HOST, PORT))
+check('绝对形式请求行能取到设备描述', b'200 OK' in data,
+      data.split(b'\r\n')[0].decode('iso-8859-1', 'replace'))
+
+# 请求行里多余空格
+data = raw_line('GET  /upnp/device.xml HTTP/1.1')
+check('请求行多余空格也能取到设备描述', b'200 OK' in data,
+      data.split(b'\r\n')[0].decode('iso-8859-1', 'replace'))
+
+# 带查询串
+data = raw_line('GET /upnp/device.xml?cache=1 HTTP/1.1')
+check('带查询串也能取到设备描述', b'200 OK' in data,
+      data.split(b'\r\n')[0].decode('iso-8859-1', 'replace'))
 
 
 # ══════════════════════════════════════════════════════════════ 汇总

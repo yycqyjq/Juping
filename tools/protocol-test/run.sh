@@ -45,6 +45,7 @@ echo "── 编译协议层（桌面 JVM，零 Android 依赖）──"
 mkdir -p "$OUT/classes"
 if ! "$JAVAC" -nowarn -encoding UTF-8 -d "$OUT/classes" \
         "$HERE/android/util/Log.java" \
+        app/src/main/java/com/juping/cast/dlna/NetUtil.java \
         app/src/main/java/com/juping/cast/dlna/UpnpHttpServer.java \
         app/src/main/java/com/juping/cast/dlna/SsdpResponder.java \
         "$HERE/ProtocolTestServer.java" 2>"$OUT/javac.err"; then
@@ -54,16 +55,21 @@ if ! "$JAVAC" -nowarn -encoding UTF-8 -d "$OUT/classes" \
 fi
 echo "  通过（证明 dlna 包确实不依赖 Android 运行时）"
 
-# ── 2. 找一个空闲端口 ──
-PORT="$(python3 -c "
+# ── 2. 找两个空闲端口（HTTP 走 TCP，SSDP 走 UDP）──
+HTTP_PORT="$(python3 -c "
 import socket
 s = socket.socket(); s.bind(('127.0.0.1', 0))
+print(s.getsockname()[1]); s.close()")"
+SSDP_PORT="$(python3 -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(('127.0.0.1', 0))
 print(s.getsockname()[1]); s.close()")"
 CALL_LOG="$OUT/calls.log"
 
 # ── 3. 起服务（单条命令内起、用、收）──
-echo "── 启动 UpnpHttpServer（端口 $PORT）──"
-"$JAVA" -Dfile.encoding=UTF-8 -cp "$OUT/classes" ProtocolTestServer "$PORT" "$CALL_LOG" \
+echo "── 启动 UpnpHttpServer（TCP $HTTP_PORT）+ SsdpResponder（UDP $SSDP_PORT）──"
+"$JAVA" -Dfile.encoding=UTF-8 -cp "$OUT/classes" ProtocolTestServer \
+    "$HTTP_PORT" "$CALL_LOG" "$SSDP_PORT" \
     >"$OUT/server.out" 2>"$OUT/server.err" &
 SERVER_PID=$!
 
@@ -85,8 +91,12 @@ if ! grep -q READY "$OUT/server.out" 2>/dev/null; then
     exit 2
 fi
 
+# READY <http端口> <实际ssdp端口> <location>
+READY_LINE="$(grep READY "$OUT/server.out" | head -1)"
+ACTUAL_SSDP_PORT="$(echo "$READY_LINE" | awk '{print $3}')"
+
 # ── 4. 驱动 ──
-python3 "$HERE/drive.py" "$PORT" "$CALL_LOG"
+python3 "$HERE/drive.py" "$HTTP_PORT" "$CALL_LOG" "$ACTUAL_SSDP_PORT"
 RC=$?
 
 # ── 5. 失败时把服务端日志带出来 ──

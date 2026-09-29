@@ -11,14 +11,11 @@ import android.os.Binder;
 import android.os.IBinder;
 import android.util.Log;
 
+import com.juping.cast.dlna.NetUtil;
 import com.juping.cast.dlna.SsdpResponder;
 import com.juping.cast.dlna.UpnpHttpServer;
 import com.juping.cast.player.MediaPlayerController;
 
-import java.net.Inet4Address;
-import java.net.InetAddress;
-import java.net.NetworkInterface;
-import java.util.Enumeration;
 import java.util.UUID;
 
 /**
@@ -82,7 +79,7 @@ public class DlnaRendererService extends Service
         acquireLocks();
         startForegroundNotification();
 
-        localIp = findLocalIp();
+        localIp = NetUtil.pickLocalIp();
         String location = "http://" + localIp + ":" + HTTP_PORT + "/upnp/device.xml";
 
         httpServer = new UpnpHttpServer(HTTP_PORT, uuid, friendlyName, this);
@@ -159,29 +156,6 @@ public class DlnaRendererService extends Service
                 .setOngoing(true)
                 .getNotification();
         startForeground(1, notification);
-    }
-
-    /** 找出本机在局域网里的 IPv4 地址 —— 设备描述 URL 要用它 */
-    private String findLocalIp() {
-        try {
-            Enumeration<NetworkInterface> ifaces = NetworkInterface.getNetworkInterfaces();
-            while (ifaces != null && ifaces.hasMoreElements()) {
-                NetworkInterface nif = ifaces.nextElement();
-                if (!nif.isUp() || nif.isLoopback()) {
-                    continue;
-                }
-                Enumeration<InetAddress> addrs = nif.getInetAddresses();
-                while (addrs.hasMoreElements()) {
-                    InetAddress addr = addrs.nextElement();
-                    if (addr instanceof Inet4Address && !addr.isLoopbackAddress()) {
-                        return addr.getHostAddress();
-                    }
-                }
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "获取本机 IP 失败", e);
-        }
-        return "0.0.0.0";
     }
 
     // ------------------------------------------- UpnpHttpServer.CommandHandler
@@ -308,7 +282,15 @@ public class DlnaRendererService extends Service
     }
 
     public String getBoundInterfaceName() {
-        return ssdp == null ? "(未启动)" : ssdp.getBoundInterfaceName();
+        if (ssdp == null) {
+            return "(未启动)";
+        }
+        if (ssdp.isBound()) {
+            return ssdp.getBoundInterfaceName();
+        }
+        // 没绑上时把候选网卡列出来 —— 这才是排障真正需要的信息。
+        // 只显示"未绑定"等于什么都没说：用户既不知道有没有网卡，也不知道为什么没绑上。
+        return "(未绑定) 候选: " + NetUtil.describeCandidates();
     }
 
     // ------------------------------------------------------------- 生命周期

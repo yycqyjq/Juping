@@ -53,6 +53,7 @@ Juping/
 │   │   ├── BootReceiver.java        开机自启
 │   │   ├── DlnaRendererService.java 前台服务心脏（DLNA + 播放器都挂这儿）
 │   │   ├── dlna/
+│   │   │   ├── NetUtil.java         网卡选择的唯一出处（SSDP 与 LOCATION 共用）
 │   │   │   ├── SsdpResponder.java   组播监听 + 设备回应
 │   │   │   └── UpnpHttpServer.java  HTTP 服务 + SOAP 控制解析
 │   │   └── player/
@@ -67,7 +68,7 @@ Juping/
     ├── check_sources.py      无 JDK 环境下的源码结构检查
     └── protocol-test/        DLNA 协议层端到端测试（桌面 JVM，不需要真机）
         ├── run.sh            编译 → 起服务 → 驱动 → 收尾
-        ├── drive.py          43 项一致性检查（原始 socket 精确控字节）
+        ├── drive.py          85 项一致性检查（原始 socket 精确控字节）
         ├── ProtocolTestServer.java  在桌面跑真实的 UpnpHttpServer
         └── android/util/Log.java    android.util.Log 的桌面替身
 ```
@@ -183,6 +184,8 @@ adb install -r dist/juping-0.1.0-release.apk
 | **前台服务** + `START_STICKY` | 被系统/低内存杀手回收 |
 | **WifiLock** (`FULL_HIGH_PERF`) | 息屏后 Wi-Fi 降频断流 |
 | **MulticastLock** | 收不到 SSDP 组播（表现为「手机搜不到设备」） |
+| **网卡选择要挑有 IPv4 的那张** | 绑到隧道/蜂窝接口（`utun3` / `rmnet_data0`）会让 SSDP 静默死掉 |
+| **网卡依次重试** | 候选列表里第一张 `joinGroup` 失败就换下一张，不一次就放弃 |
 | **看门狗** | 播放卡死不动 —— 点播 20s、直播 60s 两档阈值 |
 | **指数退避重连** | 1s → 2s → 4s → 8s → 16s，最多 5 次 |
 | **卡死熔断** | 连续卡死 3 次就停手，避免无限重连反而打断播放 |
@@ -225,8 +228,8 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 当前结果：
 
 ```
-被引用的平台类 52 个 · 方法 164 个 · 字段 3 个
-结论：167 个平台引用全部命中，无 API 越界。
+被引用的平台类 54 个 · 方法 177 个 · 字段 3 个
+结论：180 个平台引用全部命中，无 API 越界。
 ```
 
 为什么要两道：lint 依赖内置数据库，而且本项目关掉了 8 项检查 ——
@@ -243,26 +246,59 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 是全项目最容易出错、又最难在真机上调的部分。
 
 好在 `dlna` 包对 Android 的依赖只有 `android.util.Log` 一个类 ——
-补一个桌面替身，就能把**真实的** `UpnpHttpServer` 编到桌面 JVM 上，
-用原始 socket 发真实 DLNA 报文核对响应：
+补一个桌面替身，就能把**真实的** `UpnpHttpServer` 和 `SsdpResponder`
+编到桌面 JVM 上，用原始 socket 发真实 DLNA 报文核对响应：
 
 ```bash
 ./tools/build.sh protocol
 ```
 
 ```
-协议一致性：43 / 43 通过
+协议一致性：85 / 85 通过
 ```
 
-> 这套测试一上来就抓出了两个真 bug：
+覆盖两大故障场景 —— **「手机搜不到设备」和「投屏没反应」**：
+
+| 段 | 查什么 |
+|---|---|
+| 1–2 | 设备描述 XML、三个服务的 SCPD 是否可取且合法 |
+| 3–5 | SOAP 控制指令、`SetAVTransportURI` 中文元数据、播放状态机 |
+| 6 | 健壮性：未知路径 / 缺失头 / 畸形报文后服务是否还活着 |
+| **7** | **SSDP 发现**：`ssdp:all` 要回全 6 个搜索目标；每个 ST 必须原样回、USN 格式正确；无关搜索与 NOTIFY 不能应答 |
+| **8** | **发现链路闭环**：顺着 LOCATION 抓 device.xml → 校验 UDN/deviceType 与 SSDP 一致 → 逐个抓 SCPDURL → 每个 controlURL 可达 |
+| 9 | 请求行变体：绝对形式（`GET http://host/path`）、多余空格、带查询串 |
+
+> **这套测试累计抓出五个真 bug**，每一个都能让投屏在真机上失效，
+> 而真机上全都无从定位：
+>
+> **投屏侧（第 1–6 段）**
 > ① 用 `BufferedReader.read(char[])` 读 HTTP body —— 那是**字符数**，
 >    而 `Content-Length` 是**字节数**。含中文标题的投屏请求会一直阻塞到
 >    socket 超时，**一个字节响应都不发**（真机上表现就是"投屏没反应"）。
 > ② `extractActionName()` 把 XML 属性名吞进了 action 名
 >    （`GetTransportInfo xmlns:u="..."`），导致指令全部无法匹配。
 >
-> 这两个 bug 在真机上极难定位 —— 手机端只会显示"投屏失败"，
-> 盒子端没有报错。能在这里拦住，是这套测试最大的价值。
+> **发现侧（第 7–9 段）**
+> ③ SSDP 应答的 `ST` 写死成设备类型，**没有原样回控制点的搜索目标**。
+>    控制点是拿 ST 匹配应答的 —— 搜 `upnp:rootdevice` 却收到 `MediaRenderer`，
+>    这条应答会被直接丢弃，手机端显示"什么都没搜到"。
+>    而且搜 `ssdp:all` 时规范要求对每个搜索目标**各回一条**，不是回一条完事。
+>    这就是「同一个 App 有时搜得到、有时搜不到」的典型来源。
+> ④ 网卡选择会选中**没有 IPv4 地址的隧道接口**（`utun3` / Android 上的
+>    `rmnet_data0`、`tun0`、`p2p0`），`joinGroup` 直接抛 `EADDRNOTAVAIL`，
+>    SSDP 线程静默死掉。而且当时 `boundPort` 是在 `joinGroup` **之前**赋值的，
+>    于是界面还显示"已就绪"—— **谎报军情比失败更糟**。
+> ⑤ `setReuseAddress(true)` 写在构造函数之后 = 空操作（那时已经 bind 了）。
+>    1900 端口一旦被占（盒子自带的投屏服务、或上一次没退干净的自己），
+>    整个 SSDP 线程静默死掉，表现为「设备突然搜不到」。
+>
+> 另外修掉一个 RFC 合规问题：HTTP 请求行允许**绝对形式**
+> （`GET http://192.168.1.50:49152/upnp/device.xml HTTP/1.1`，RFC 7230 §5.3.2），
+> 而服务端必须接受。原来直接拿路径比较，绝对形式下返回 404 →
+> 手机「搜到了设备却投不了屏」。
+>
+> **反向验证**：把 `ST` 改回写死的旧写法，10 条断言立刻变红。
+> 一个只会说"通过"的测试是没有价值的。
 
 ---
 
@@ -272,7 +308,7 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 - **AirPlay 未实现**。iOS 侧目前只能用支持 DLNA 的 App 投。要做 AirPlay 接收需要移植 UxPlay（C/C++，GPLv3），是独立的一大块工作。
 - **镜像（Miracast）不做**。老盒子 Wi-Fi Direct 驱动不稳，正是断联根因，不值得修。
 - **从未在真机上运行过**。已通过六项静态核验（编译 / lint `NewApi` 零命中 /
-  API 引用 167 项全命中 / DEX 版本 035 / 签名在 API 15 上有效 / DLNA 协议 43 项通过），
+  API 引用 180 项全命中 / DEX 版本 035 / 签名在 API 15 上有效 / DLNA 协议 85 项通过），
   但真机上的组播收发、MediaPlayer 硬解、断联恢复都还没实测。
 
 ---
@@ -283,7 +319,9 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 
 - **设备名** — 手机投屏列表里应该出现的名字（`聚屏-<型号>`）
 - **地址** — 盒子的 IP:端口。手机搜不到时，先确认手机和盒子在同一个网段
-- **网络** — 组播实际绑在哪个网卡上（有线优先）。显示 `(未启动)` 说明组播没绑上
+- **网络** — 组播实际绑在哪张网卡上（有线优先）。若显示 `(未绑定) 候选: ...`，
+  说明组播没绑上，后面列出的是系统里**可用于组播的网卡**（网卡名/IP）。
+  候选为空就是这台设备确实没有可用的局域网接口
 - **状态** — 等待投屏 / 正在播放 / 已暂停 / 出错
 
 遥控器按「重启服务」可以原地重启整个接收端，不用拔电。
