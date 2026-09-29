@@ -27,6 +27,19 @@
     <string name="fmt_progress">%1$s / %2$s</string>
     <string name="fmt_state_error">出错：%1$s</string>
 
+    <!-- 播放错误的分类文案。
+         每条都回答「用户接下来该做什么」，而不只是"哪里错了" ——
+         原来界面上显示的是 "播放错误 what=1 extra=-1010" 这种原样字符串，
+         用户既看不懂，也没法据此做任何决定。
+         分类本身在 PlaybackPolicy（纯逻辑层，可脱离 Android 跑断言），
+         文案在这里，两者分开：改措辞不动判据，改判据不动措辞。 -->
+    <string name="err_connect">连不上媒体服务器，检查一下网络</string>
+    <string name="err_server">服务器取不到这个内容，换一个试试</string>
+    <string name="err_decode">这台盒子解不了这个格式</string>
+    <string name="err_stalled">播放中断，正在重连</string>
+    <string name="err_giveup">反复中断，已停止重连 —— 请重新投屏</string>
+    <string name="err_unknown">播放出错</string>
+
     <string name="toast_restarted">服务已重启</string>
     <string name="notify_title">聚屏运行中</string>
     <string name="notify_text">等待投屏 · 点击打开界面</string>

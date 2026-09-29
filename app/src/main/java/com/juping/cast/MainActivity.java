@@ -16,6 +16,8 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import com.juping.cast.player.PlaybackPolicy;
+
 /**
  * 主界面。
  *
@@ -218,14 +220,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 ? getString(R.string.fmt_progress, formatClock(pos), formatClock(dur))
                 : getString(R.string.music_live);
         if (mode == MODE_AUDIO) {
-            musicSource.setText(shortName(service.getCurrentUri()));
+            musicSource.setText(currentLabel());
             musicProgress.setText(progress);
         }
         // 顶部条现在只在暂停 / 出错 / 缓冲时出现，那些时刻用户要的正是
         // 「放到哪儿了」，所以两种形态都报进度。原来音频时这里固定写
         // 「音乐投屏」是因为状态条常驻、和音乐卡片的大标题重复了 ——
         // 条子不再常驻，那个理由也就不成立了。
-        playingText.setText(dur > 0 ? progress : shortName(service.getCurrentUri()));
+        playingText.setText(dur > 0 ? progress : currentLabel());
     }
 
     private boolean isPlaying() {
@@ -283,13 +285,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         surfaceView.setVisibility(idle ? View.GONE : View.VISIBLE);
         applyTopBar(mode);
 
-        String uri = service == null ? null : service.getCurrentUri();
-        boolean hasSource = uri != null && uri.length() > 0;
+        String label = currentLabel();
+        boolean hasSource = label.length() > 0;
         // 两个分支都要设可见性。只设 VISIBLE、不设 GONE 的话，
         // 停止播放后「片源」那一行会一直留在面板上，显示上一部片子的地址。
         rowSource.setVisibility(hasSource ? View.VISIBLE : View.GONE);
         if (hasSource) {
-            infoSource.setText(uri);
+            infoSource.setText(label);
         }
         if (!idle) {
             bindSurfaceIfReady();
@@ -319,9 +321,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         boolean show = false;
         int dot = R.drawable.dot_online;
         if (mode != MODE_IDLE && service != null) {
-            String err = service.getLastError();
             String ts = service.getTransportState();
-            boolean error = (err != null && err.length() > 0);
+            // 用分类判断，不用「细节字符串非空」—— 后者是拿"有没有那句话"
+            // 当"有没有出错"，一旦哪天细节被清空而分类还在，这里就会漏报。
+            boolean error = (service.getLastErrorKind() != PlaybackPolicy.ERR_NONE);
             show = error || "PAUSED_PLAYBACK".equals(ts) || "TRANSITIONING".equals(ts);
             if (error) {
                 // 出错就亮红点。
@@ -349,10 +352,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      */
     private void applyStatusDot(boolean playing) {
         int dot;
-        String err = service == null ? null : service.getLastError();
         if (service == null) {
             dot = R.drawable.dot_error;
-        } else if (err != null && err.length() > 0) {
+        } else if (service.getLastErrorKind() != PlaybackPolicy.ERR_NONE) {
             dot = R.drawable.dot_error;
         } else if (!service.isDiscoveryReady()) {
             // 组播没就绪 —— 手机搜不到设备，这是最该被一眼看见的状态
@@ -374,9 +376,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (service == null || service.getPlayer() == null) {
             return getString(R.string.state_starting);
         }
-        String err = service.getLastError();
-        if (err != null && err.length() > 0) {
-            return getString(R.string.fmt_state_error, err);
+        int errKind = service.getLastErrorKind();
+        if (errKind != PlaybackPolicy.ERR_NONE) {
+            // 显示的是「连不上媒体服务器」这类用户能懂的话，而不是
+            // "what=1 extra=-1010"。技术细节进日志，不上面。
+            return getString(R.string.fmt_state_error, getString(errorTextRes(errKind)));
         }
         // 用 UPnP 传输状态机判断，而不是靠「有没有时长」去猜：
         //   1) 暂停时 getDuration() 照样 > 0，原来那套判断会把「已暂停」显示成「正在播放」
@@ -399,6 +403,33 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             return getString(R.string.state_service_down);
         }
         return getString(R.string.state_waiting);
+    }
+
+    /**
+     * 错误分类 → 文案资源。
+     *
+     * <p>文案放在 {@code strings.xml} 而不是 Java 里，是为了能本地化 ——
+     * 而分类本身在 {@code PlaybackPolicy}（纯逻辑层，可以脱离 Android 跑断言）。
+     * 两者分开之后：改一句措辞不会动到判据，改判据也不会动到文案。
+     *
+     * <p>每条话术都回答「**用户接下来该做什么**」，而不只是"哪里错了"：
+     * 网络问题去看路由器、片源问题换一个、格式问题换片源或换设备。
+     */
+    private int errorTextRes(int kind) {
+        switch (kind) {
+            case PlaybackPolicy.ERR_CONNECT:
+                return R.string.err_connect;
+            case PlaybackPolicy.ERR_SERVER:
+                return R.string.err_server;
+            case PlaybackPolicy.ERR_DECODE:
+                return R.string.err_decode;
+            case PlaybackPolicy.ERR_STALLED:
+                return R.string.err_stalled;
+            case PlaybackPolicy.ERR_GIVEUP:
+                return R.string.err_giveup;
+            default:
+                return R.string.err_unknown;
+        }
     }
 
     /**
@@ -427,6 +458,32 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             return uri == null ? "" : uri;
         }
         return uri.substring(0, 30) + " … " + uri.substring(uri.length() - 26);
+    }
+
+    /**
+     * 片源的显示名 —— 界面所有"正在播什么"的地方都走这一个出口。
+     *
+     * <p><b>优先用元数据里的标题</b>：控制点推流时会带 {@code dc:title}，
+     * 那才是用户认得的东西（「夜曲」）。原来直接显示从 URL 截出来的文件名
+     * （{@code 6a3f9c2b.mp3}），用户根本不知道那是什么 —— 而这个界面
+     * 存在的意义就是让用户确认"电视上放的是不是我要投的那个"。
+     *
+     * <p><b>取不到标题就回退到文件名</b>，不是显示空白：文件名虽然难认，
+     * 但至少能区分"投的是这一个"和"投的是另一个"，比一片空白有用。
+     * 而"控制点没给标题"本来就是常见情况（不少 App 的元数据是空壳）。
+     *
+     * <p>抽成一个方法而不是三处各写一遍：同一个语义写三份，
+     * 迟早有一处忘了跟着改，然后界面上同一个片源在不同位置显示成不同的东西。
+     */
+    private String currentLabel() {
+        if (service == null) {
+            return "";
+        }
+        String title = service.getCurrentTitle();
+        if (title != null && title.length() > 0) {
+            return title;
+        }
+        return shortName(service.getCurrentUri());
     }
 
     // ---------------------------------------------- SurfaceHolder.Callback

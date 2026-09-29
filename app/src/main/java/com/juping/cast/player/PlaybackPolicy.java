@@ -218,4 +218,110 @@ public final class PlaybackPolicy {
     public static boolean isSeekExpired(long elapsedSinceSeekMs) {
         return elapsedSinceSeekMs > SEEK_PENDING_TIMEOUT_MS;
     }
+
+    // --------------------------------------------------------- 播放错误的分类
+
+    /**
+     * 错误分类。
+     *
+     * <h3>为什么要分类，而不是直接把异常消息丢给用户看</h3>
+     * 原来界面上显示的是 {@code "播放错误 what=1 extra=-1010"} 这种原样字符串 ——
+     * 用户看不懂，也没法据此做任何决定。而这几类的**处置方式完全不同**：
+     * <ul>
+     *   <li>连不上 → 是网络的事，用户该去看看路由器</li>
+     *   <li>服务器返回错误 → 是片源的事，换一个视频就行</li>
+     *   <li>解不了 → 是这台盒子的能力边界，换格式或者换片源</li>
+     *   <li>反复中断 → 已经放弃重连了，需要用户手动重投</li>
+     * </ul>
+     * 分类放在这里（而不是 UI 层）是因为它是**纯逻辑**：
+     * {@code what}/{@code extra}/异常类型 → 分类，这段映射可以脱离 Android 跑断言。
+     */
+    public static final int ERR_NONE = 0;
+
+    /** 连不上媒体服务器：网络不通、地址不可达、超时 */
+    public static final int ERR_CONNECT = 1;
+
+    /** 媒体服务器返回了错误：404 / 403 这类「地址在、内容取不到」 */
+    public static final int ERR_SERVER = 2;
+
+    /** 这台设备解不了这个格式：解码器不支持，或码流本身损坏 */
+    public static final int ERR_DECODE = 3;
+
+    /** 播放中断，正在重连（卡死看门狗判定） */
+    public static final int ERR_STALLED = 4;
+
+    /** 反复中断，已放弃重连 */
+    public static final int ERR_GIVEUP = 5;
+
+    /** 归不了类的兜底 */
+    public static final int ERR_UNKNOWN = 6;
+
+    /**
+     * 把 {@code MediaPlayer.OnErrorListener} 的 {@code what}/{@code extra} 分类。
+     *
+     * <p><b>这里刻意用字面量而不是常量名</b>：{@code MEDIA_ERROR_UNSUPPORTED} /
+     * {@code MALFORMED} / {@code IO} / {@code TIMED_OUT} 这几个常量都是
+     * <b>API 17 (Android 4.2)</b> 才加进 {@code MediaPlayer} 的，
+     * 而本机是 API 15 —— 引用常量名会在真机上直接 {@code NoSuchFieldError} 崩溃，
+     * 而 lint / 编译期都看不出来（这正是本项目「对着 android.jar 逐条核」那道闸的用武之地）。
+     * 数值取自 MediaPlayer 文档，长期稳定。
+     */
+    public static int classifyMediaError(int what, int extra) {
+        if (extra == -1010 || extra == -1007) {
+            return ERR_DECODE;      // UNSUPPORTED / MALFORMED
+        }
+        if (extra == -1004 || extra == -110) {
+            return ERR_CONNECT;     // IO / TIMED_OUT
+        }
+        // what == 100 是 MEDIA_ERROR_SERVER_DIED —— 播放器所在的进程挂了，
+        // 既不是网络也不是格式问题，归兜底。
+        if (what == 100) {
+            return ERR_UNKNOWN;
+        }
+        // what == 1（MEDIA_ERROR_UNKNOWN）是绝大多数情况的落点，
+        // 而它的头号成因是「取不到流」（CDN 403、分段缺失、地址过期）。
+        // 归到 UNKNOWN 而不是 CONNECT：宁可说「播放出错」，
+        // 也不要让用户跑去重启路由器 —— 那多半没用。
+        return ERR_UNKNOWN;
+    }
+
+    /**
+     * 把起播时抛出的异常分类。
+     *
+     * <p>{@code FileNotFoundException} 要单独拎出来：{@code setDataSource()} 走 HTTP 时
+     * 拿到 4xx 抛的就是它，含义是「服务器在，但这个内容取不到」，
+     * 和「网络根本不通」是两件事 —— 前者用户该换个片源，后者该去看网络。
+     * 顺序不能反：{@code FileNotFoundException} 是 {@code IOException} 的子类。
+     */
+    public static int classifyStartFailure(Throwable t) {
+        if (t == null) {
+            return ERR_UNKNOWN;
+        }
+        if (t instanceof java.io.FileNotFoundException) {
+            return ERR_SERVER;
+        }
+        if (t instanceof java.io.IOException) {
+            return ERR_CONNECT;
+        }
+        return ERR_UNKNOWN;
+    }
+
+    /**
+     * 分类的英文名 —— 只给日志和断言用，不是给用户看的文案。
+     *
+     * <p>用户看到的文案在 {@code strings.xml} 里（要能本地化，而且
+     * 纯逻辑层不该管界面措辞）。这里是给测试一个**稳定的判据**：
+     * 断言分类结果时比对英文名，不会因为改了一句中文文案就红。
+     */
+    public static String errorKindName(int kind) {
+        switch (kind) {
+            case ERR_CONNECT: return "CONNECT";
+            case ERR_SERVER:  return "SERVER";
+            case ERR_DECODE:  return "DECODE";
+            case ERR_STALLED: return "STALLED";
+            case ERR_GIVEUP:  return "GIVEUP";
+            case ERR_UNKNOWN: return "UNKNOWN";
+            default:          return "NONE";
+        }
+    }
 }

@@ -17,8 +17,19 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 cd "$ROOT"
 
-TOOLCHAIN="${ANDROID_BUILD_HOME:-$HOME/.android-build}"
-export JAVA_HOME="$TOOLCHAIN/jdk/Contents/Home"
+# JAVA_HOME 的选择顺序：与 protocol-test/run.sh 相同 ——
+# 已有可用的就尊重（CI 上的 setup-java 会设），没有才回退到自包含工具链；
+# 工具链的两种目录布局（macOS 的 Contents/Home 与 Linux 的平铺）都要认。
+# 这段是照着那边改的，两处必须保持一致 —— 一处改了另一处忘了，
+# 症状是「协议闸门绿、策略闸门红」，看起来像断言挂了，其实是环境问题。
+if [ -z "${JAVA_HOME:-}" ] || [ ! -x "$JAVA_HOME/bin/javac" ]; then
+    TOOLCHAIN="${ANDROID_BUILD_HOME:-$HOME/.android-build}"
+    if [ -x "$TOOLCHAIN/jdk/Contents/Home/bin/javac" ]; then
+        export JAVA_HOME="$TOOLCHAIN/jdk/Contents/Home"
+    elif [ -x "$TOOLCHAIN/jdk/bin/javac" ]; then
+        export JAVA_HOME="$TOOLCHAIN/jdk"
+    fi
+fi
 JAVAC="$JAVA_HOME/bin/javac"
 JAVA="$JAVA_HOME/bin/java"
 
@@ -559,16 +570,33 @@ if disp:
            'Unit' in disp and 'REL_TIME' in disp,
            '当时间解析会把"切下一曲"变成"跳回开头"')
 
-# 顶部条的可见性依赖 lastError，所以「什么时候清 lastError」也要守住。
+# 顶部条的可见性依赖错误分类，所以「什么时候清错误」也要守住。
 # 只在换片源 / 停止时清的话，一次**已经自愈**的断流会让那句报错一直挂着 ——
 # 画面好好的，屏幕上却压着一条故障提示。这属于"谎报军情"，和漏报一样糟。
 op = body_of(svc, 'public void onPrepared(int durationMs, boolean hasVideo)')
 report('DlnaRendererService.onPrepared 方法体已找到', op is not None,
        '锚点：public void onPrepared(int durationMs, boolean hasVideo)')
 if op:
-    report('播放就绪时清掉陈旧的 lastError',
-           re.search(r'lastError\s*=\s*""', op) is not None,
+    # 清错误已经收敛到 clearError()（要同时清「分类」和「细节」两个字段），
+    # 所以这里判的是**调用**而不是字段赋值 —— 判旧写法的话，
+    # 代码重构了、语义没变，守卫也会红，那就成了"守卫拦着重构"。
+    report('播放就绪时清掉陈旧的错误（调 clearError）',
+           'clearError()' in op,
            '不清的话，自愈之后顶部条会一直挂着那条已经过期的报错')
+
+# clearError 自己也要守住：它必须**同时**清两个字段。
+# 只清分类不清洁细节 → hasTransportError 说没错了、日志里却还留着旧报错；
+# 只清细节不清分类 → 顶部条还挂着报错。漏掉任何一个都是自相矛盾的状态。
+ce = body_of(svc, 'private void clearError()')
+report('DlnaRendererService.clearError 方法体已找到', ce is not None,
+       '锚点：private void clearError()')
+if ce:
+    report('clearError 同时清错误分类',
+           'lastErrorKind' in ce,
+           '只清洁细节不清分类的话，顶部条会继续挂着那条已经过期的报错')
+    report('clearError 同时清错误细节',
+           re.search(r'lastError\s*=\s*""', ce) is not None,
+           '只清分类不清洁细节的话，日志里会留着已经自愈的那条旧报错')
 
 sys.exit(1 if failed else 0)
 PY
@@ -1664,6 +1692,87 @@ sv2 = body_of(ctrl, 'public void setMute(boolean mute)')
 report('MediaPlayerController.setMute 先记状态再下发',
        sv2 is not None and 'this.muted = mute' in sv2 and 'applyVolume' in sv2,
        '重连会重建 MediaPlayer 实例。不先记的话，一次断流就把用户的静音取消了')
+
+# ---- (9) 网络变化监听 ----
+# LOCATION 是「绑上网卡那一刻生成一次」的，网络一变它就是旧 IP。
+# 没有监听的话，Wi-Fi 断一下就得重启 App —— 而看门狗判据是
+# 「线程已死且未绑定」，线程活得好好的它就看不见这个变化。
+rcw = body_of(svc, 'private void registerConnectivityWatch()')
+report('registerConnectivityWatch 方法体已找到', rcw is not None,
+       '锚点：private void registerConnectivityWatch()')
+if rcw:
+    report('网络监听是动态注册且挂在 CONNECTIVITY_ACTION 上',
+           'registerReceiver' in rcw and 'CONNECTIVITY_ACTION' in rcw,
+           '静态注册从 Android 7.0 起收不到 CONNECTIVITY_ACTION，动态注册才是长期有效的写法')
+    report('网络监听的注册包在 try 里',
+           'try' in rcw,
+           '注册不上只是少一层保险（看门狗和退避重试还在），绝不能因此让服务起不来')
+
+anc = body_of(svc, 'private void applyNetworkChange()')
+report('applyNetworkChange 方法体已找到', anc is not None,
+       '锚点：private void applyNetworkChange()')
+if anc:
+    i_lock = anc.find('refreshLocks()')
+    i_rs = anc.find('restartSsdp(')
+    i_rh = anc.find('restartHttp(')
+    report('网络重建的顺序：先刷锁、再重建链路',
+           0 <= i_lock < i_rs < i_rh,
+           '锁是「能收到组播包」的前提，SSDP 一绑上就开始收包 —— '
+           '顺序反了重建出来的 socket 会有一段收不到包的空窗')
+    report('网络重建有 shuttingDown 守卫',
+           'shuttingDown' in anc,
+           '服务销毁后排着的防抖任务还会被主线程队列捞起来跑一次，'
+           '不能对着一堆已清空的字段动手')
+
+rh_m = body_of(svc, 'private void restartHttp(String reason)')
+report('restartHttp 方法体已找到', rh_m is not None,
+       '锚点：private void restartHttp(String reason)')
+if rh_m:
+    i_icon = rh_m.find('provideDeviceIcon()')
+    i_start = rh_m.find('httpServer.start()')
+    report('HTTP 重建后重新给图标（且在 start 之前）',
+           0 <= i_icon < i_start,
+           '新实例的 iconPng 是空的 —— 不重给的话，网络变化之后控制点就再也拿不到图标')
+
+od2 = body_of(svc, 'public void onDestroy()')
+if od2:
+    report('onDestroy 摘掉网络重建的防抖任务并注销监听',
+           'removeCallbacks(rebuildOnNetworkChange)' in od2
+           and 'unregisterReceiver' in od2,
+           '不注销的话系统一直持有 Receiver，而它内部持有 Service 实例 —— '
+           '0.6GB 的盒子上这就是一个永远回收不掉的 Service')
+
+# ---- (10) 媒体元数据：原样回读 + 正确转义 ----
+report('GetMediaInfo 回读元数据且做了转义',
+       'getCurrentMetadata()' in http and 'escapeXml(meta)' in http,
+       '恒回空会被依赖回读确认的控制点判成「设备没接收成功」，画面留在手机上不投了；'
+       '不转义的话元数据里的 < 会把整条 SOAP 响应变成非法 XML')
+
+didl = pathlib.Path('app/src/main/java/com/juping/cast/dlna/DidlLite.java'
+                    ).read_text(encoding='utf-8')
+didl = strip_comments(didl)
+report('DidlLite 元素匹配认「无前缀」写法',
+       didl.count('\\\\w+:)?') >= 2,
+       '同一个字段，控制点可能写 dc:title / upnp:title，也可能不带前缀 —— '
+       '只认一种的话换个手机就悄悄解析不出来，界面上退回文件名还不报错。'
+       '（判据里四个反斜杠 = Java 源码里的 \\w，别数错层级 —— 这条自己就红过一次）')
+report('DidlLite 反转义用一次扫描（quoteReplacement）',
+       'quoteReplacement' in didl and 'ENTITY' in didl,
+       '歌名里的 $ 或 \\ 不转义的话 appendReplacement 会把它当成组引用抛异常；'
+       '每个实体只处理一次也天然避开 &amp;lt; 的二次替换')
+
+# 注意：这个脚本里的 $CTRL 是 MediaPlayerController，不是 MainActivity ——
+# MainActivity（$ACT）没有传进这个 heredoc，所以像上面的 ssdp / didl 一样
+# 按路径硬编码加载。变量名语义（CTRL ≠ 界面）就是这个脚本自己的坑。
+main_act = pathlib.Path('app/src/main/java/com/juping/cast/MainActivity.java'
+                         ).read_text(encoding='utf-8')
+main_act = strip_comments(main_act)
+report('界面片源显示收敛到 currentLabel 单一出口',
+       'private String currentLabel()' in main_act
+       and main_act.count('currentLabel()') >= 4
+       and 'getCurrentTitle' in main_act,
+       '「标题优先、取不到回退文件名」这个判据写三份的话，迟早有一处忘了跟着改 —— '
+       '界面上同一个片源在不同位置显示成不同的东西')
 
 sys.exit(1 if failed else 0)
 PY

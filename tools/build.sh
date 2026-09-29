@@ -166,7 +166,13 @@ verify_protocol() {
         rm -f "$out"; return 0
     fi
     echo "  !! 协议层核验未通过 —— 手机可能投不进来：" >&2
-    tail -60 "$out" >&2
+    # 失败清单必须完整打出来，不能只 tail —— FAIL 行散布在整个输出的
+    # 各个小节里，tail 一截，失败的「是哪几条」就丢了，只剩一句「没通过」。
+    # 这不是理论风险：证伪脚本破坏一个守卫，FAIL 行落在输出中部，
+    # tail -60 之后什么线索都不剩（第一版就是这样）。
+    grep '\[FAIL\]' "$out" >&2 || true
+    grep -E '^  · ' "$out" >&2 || true
+    tail -15 "$out" >&2
     rm -f "$out"; return 1
 }
 
@@ -187,7 +193,11 @@ verify_policy() {
         rm -f "$out"; return 0
     fi
     echo "  !! 播放策略核验未通过 —— 断联后可能不会恢复，或无限重连：" >&2
-    tail -60 "$out" >&2
+    # 同 verify_protocol：FAIL 行散布在各小节，tail 会把「是哪几条」截没。
+    # 证伪实测：破坏一个中部守卫，tail -60 之后一条线索都不剩。
+    grep '\[FAIL\]' "$out" >&2 || true
+    grep -E '^  · ' "$out" >&2 || true
+    tail -15 "$out" >&2
     rm -f "$out"; return 1
 }
 

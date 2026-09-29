@@ -1729,6 +1729,69 @@ else:
     check('13.6 M-SEARCH 延迟（跳过：SSDP 没起来）', False, 'SSDP 端口不可用')
 
 
+# ══════════════════════════════════════════════════════════════ 14. 媒体元数据
+# 原来的实现把元数据**只**用来猜「音频还是视频」，GetMediaInfo / GetPositionInfo
+# 回读时永远回空 —— 而部分控制点会拿回读值和自己刚推的比对，回空会被判成
+# 「设备没接收成功」，画面留在手机上不投了。回读必须原样，且转义必须正确
+# （元数据本身就是一段 XML，不转义的话整条 SOAP 响应都是非法的）。
+
+print('\n  14. 媒体元数据：原样回读 + 正确转义')
+
+# 一份刻意「难缠」的元数据，一次覆盖三个坑：
+#   中文   —— 之前有「字符数 vs 字节数」的 body 读取 bug，中文最容易踩
+#   &amp;  —— 转义链：推的时候转义一次、回读时服务端再转义一次，两头必须对称
+#   &#39;  —— DIDL 里单引号几乎都长这样（数字实体），歌名带单引号非常常见
+DIDL_RAW = ('<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/"'
+            ' xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
+            '<item id="1"><dc:title>Tom &amp; Jerry 夜曲 &#39;07</dc:title>'
+            '<upnp:artist>周杰伦</upnp:artist>'
+            '<upnp:class>object.item.audioItem.musicTrack</upnp:class>'
+            '</item></DIDL-Lite>')
+# 推进 SOAP 参数时要按 XML 规则转义一次（< > " &）
+DIDL_ESC = (DIDL_RAW.replace('&', '&amp;').replace('<', '&lt;')
+            .replace('>', '&gt;').replace('"', '&quot;'))
+META_URI = 'http://192.168.1.9:8080/meta-check.mp3'
+
+st, hd, body = soap_post('SetAVTransportURI', SVC_AVT,
+                         '<CurrentURI>%s</CurrentURI>\n'
+                         '<CurrentURIMetaData>%s</CurrentURIMetaData>' % (META_URI, DIDL_ESC))
+check('14.1 带元数据的投屏返回 200', st.startswith('HTTP/1.1 200'), st)
+
+st, hd, body_gm = soap_post('GetMediaInfo', SVC_AVT, '')
+got_meta = find_xml_text(body_gm, 'CurrentURIMetaData')
+check('14.2 GetMediaInfo 原样回读元数据（不是恒回空）',
+      got_meta == DIDL_RAW,
+      'got=%r ← 恒回空的实现在这里露馅' % got_meta[:60])
+
+st, hd, body = soap_post('GetPositionInfo', SVC_AVT, '')
+got_track = find_xml_text(body, 'TrackMetaData')
+check('14.3 GetPositionInfo 的 TrackMetaData 与 GetMediaInfo 同源',
+      got_track == DIDL_RAW,
+      'got=%r ← 两处各回各的，控制点会看到"同一媒体、两个接口给的元数据不一样"'
+      % got_track[:60])
+
+# 回读值嵌入 SOAP 时必须被正确转义 —— 整条响应要仍是合法 XML。
+# 原始串里有 < > &，不转义的话这条 GetMediaInfo 响应本身就解析不出来。
+#
+# 检查的必须是 body_gm（14.2 那条 GetMediaInfo 响应）。**这个 bug 是证伪抓出来的**：
+# 第一版写的 `body` 在此处已经被 14.3 的 GetPositionInfo 覆盖 —— 那条响应是
+# 转义过的，于是「没转义」这个破坏在它上面恒为 PASS（假绿）。变量名一样、
+# 拿错响应，断言看起来还在跑，其实早就不检查它该检查的东西了。
+check('14.4 回读值在响应里是转义过的（&lt; 而不是裸的 <）',
+      b'&lt;DIDL-Lite' in body_gm,
+      '裸 < 会把 SOAP 响应变成非法 XML —— 控制点那边是「整条解析失败」，'
+      '不是「少个字段」。注意裸 DIDL 恰好是**合法** XML（它自己带命名空间声明），'
+      '所以 XML 解析不报错、find_xml_text 只会拿到空文本 —— 两个断言必须一起看')
+
+soap_post('Stop', SVC_AVT, '')
+st, hd, body = soap_post('GetMediaInfo', SVC_AVT, '')
+got_after = find_xml_text(body, 'CurrentURIMetaData')
+check('14.5 停止后元数据回空（不残留上一部片子的）',
+      got_after == '',
+      'got=%r ← 留着的话，下一次投屏的间隙里控制点会读到上一部片子的元数据'
+      % got_after[:40])
+
+
 # ══════════════════════════════════════════════════════════════ 汇总
 
 total = len(results)

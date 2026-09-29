@@ -3,22 +3,27 @@ package com.juping.cast;
 import android.app.Notification;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.net.ConnectivityManager;
 import android.net.wifi.WifiManager;
 import android.os.Binder;
 import android.os.Handler;
 import android.os.IBinder;
 import android.util.Log;
 
+import com.juping.cast.dlna.DidlLite;
 import com.juping.cast.dlna.EventDispatcher;
 import com.juping.cast.dlna.NetUtil;
 import com.juping.cast.dlna.SsdpResponder;
 import com.juping.cast.dlna.UpnpHttpServer;
 import com.juping.cast.player.MediaPlayerController;
+import com.juping.cast.player.PlaybackPolicy;
 
 import java.io.ByteArrayOutputStream;
 import java.util.HashMap;
@@ -70,6 +75,20 @@ public class DlnaRendererService extends Service
      */
     private static final int WATCHDOG_LOG_EVERY = 20;
 
+    /**
+     * 网络变化后等多久才重建（防抖窗口）。
+     *
+     * <p><b>为什么要防抖</b>：{@code CONNECTIVITY_ACTION} 在一次网络切换里
+     * **会连发好几条**（旧网络断开一条、Wi-Fi 状态变化一条、新网络连上一条）。
+     * 每条都立刻重建的话，会在网卡**还没拿到 IPv4** 的时候反复重建 ——
+     * 每次都绑不上，反而把 SSDP 自己的退避重试节奏打乱。
+     *
+     * <p><b>为什么是 3 秒</b>：网卡从"连上"到"拿到 IPv4"通常几百毫秒到 2 秒，
+     * 3 秒之后再重建，第一次就能绑上。这个延迟只发生在网络变化时，
+     * 不影响稳态。
+     */
+    private static final long NETWORK_SETTLE_MS = 3000L;
+
     /** 内容类型的三个取值，见 {@link #kindOf} 与 {@link #audioOnly}。 */
     private static final int KIND_UNKNOWN = 0;
     private static final int KIND_AUDIO = 1;
@@ -94,8 +113,49 @@ public class DlnaRendererService extends Service
     private String friendlyName;
     private String localIp = "0.0.0.0";
     private volatile String transportState = "STOPPED";
+
+    /**
+     * 当前错误分类（{@code PlaybackPolicy.ERR_*}）。{@code ERR_NONE} 表示没出错。
+     *
+     * <p><b>为什么是分类而不是一个字符串</b>：界面要显示的是「连不上媒体服务器」
+     * 这类用户能看懂的话，而播放器给的是 {@code "what=1 extra=-1010"} 这类技术细节 ——
+     * 两者必须分开走。分类留在服务层（它是"发生了什么"），文案由界面按分类去
+     * {@code strings.xml} 取（那是"怎么说"，还可能要本地化）。
+     * 把技术细节直接丢到界面上，用户既看不懂、也没法据此做任何决定。
+     */
+    private volatile int lastErrorKind = PlaybackPolicy.ERR_NONE;
+
+    /**
+     * 错误的技术细节 —— {@code what}/{@code extra}、异常栈里那一行。
+     *
+     * <p>只进日志。排障时把日志发过来就能定位，而界面上永远不出现它。
+     */
     private volatile String lastError = "";
+
     private volatile String currentUri = "";
+
+    /**
+     * 控制点推来的原始元数据（DIDL-Lite XML）。
+     *
+     * <p><b>原样保存、原样回读</b>：控制点会回读 {@code GetMediaInfo} 的
+     * {@code CurrentURIMetaData}，和自己刚推的那份比对。回一个"我们重新拼的"
+     * 版本，哪怕语义等价，也可能因为元素顺序、命名空间声明的差异被判成不一致。
+     * 所以这里不做任何加工，收到什么存什么。
+     */
+    private volatile String currentMetadata = "";
+
+    /**
+     * 从元数据里解析出来的标题。
+     *
+     * <p>只用于**界面显示**（让用户看到「夜曲」而不是 {@code 6a3f9c2b.mp3}）。
+     * 协议回读走 {@link #currentMetadata} 的原文，不用这个 ——
+     * 解析出来的标题是给人看的，不是给控制点看的。
+     *
+     * <p>取不到时为空串，界面自己回退到文件名。**不要在这里编一个
+     * "未知曲目"之类的默认值**：那样界面就分不清"控制点没给标题"
+     * 和"控制点给的标题就叫未知曲目"，而前者应该显示文件名（那是有用信息）。
+     */
+    private volatile String currentTitle = "";
 
     /** 传给 SSDP 的 SERVER 头。抽成字段是因为重建时要用同一个值 */
     private String serverName;
@@ -115,6 +175,35 @@ public class DlnaRendererService extends Service
 
     /** 连续自检失败的次数。只用于日志节流 */
     private int watchdogFailures = 0;
+
+    /**
+     * 网络变化监听。{@code null} 表示还没注册或已经注销。
+     *
+     * <p><b>为什么必须有这一环</b>：{@link SsdpResponder} 的 LOCATION 是在
+     * **绑上网卡那一刻生成一次**的，之后每条应答都用它。而 {@link #checkThreadsAlive()}
+     * 的判据是「线程已死**且**未绑定」—— 网络变了但线程活得好好的时候，
+     * 看门狗**看不见**：socket 还绑在旧网卡上、LOCATION 还是旧 IP，
+     * 用户看到的就是「Wi-Fi 断一下就得重启 App」。
+     *
+     * <p>路由器重启、IP 换了、从有线切到无线，都会走到这里。
+     */
+    private BroadcastReceiver connectivityReceiver;
+
+    /**
+     * 网络变化后的重建任务。
+     *
+     * <p>写成字段是为了两件事：① 防抖 —— 新广播到达时先
+     * {@code removeCallbacks} 掉上一次；② {@link #onDestroy()} 能把它摘掉，
+     * 否则服务销毁后它还会被主线程队列捞起来跑一次。
+     */
+    private final Runnable rebuildOnNetworkChange = new Runnable() {
+        @Override
+        public void run() {
+            if (!shuttingDown) {
+                applyNetworkChange();
+            }
+        }
+    };
 
     /**
      * 自检任务：活着就继续排下一轮，死了就重建。
@@ -184,6 +273,10 @@ public class DlnaRendererService extends Service
         // 而 LOCATION 还指着第一张 —— 手机搜得到设备、点进去却拉不到描述。
         ssdp = new SsdpResponder(uuid, HTTP_PORT, serverName);
         ssdp.start();
+
+        // 网络变化监听。放在两条链路都起来之后注册 —— 注册本身不做事，
+        // 但万一注册失败抛异常，前面该起来的已经起来了。
+        registerConnectivityWatch();
 
         // 自检看门狗。第一轮不用等 30 秒 —— 立刻排一次，让"启动就失败"
         // 这种情况能早点进日志。
@@ -285,6 +378,125 @@ public class DlnaRendererService extends Service
         Log.i(TAG, "WifiLock 已获取");
     }
 
+    /**
+     * 注册网络变化监听。
+     *
+     * <p>用**动态注册**而不是在 manifest 里静态声明：{@code CONNECTIVITY_ACTION}
+     * 从 Android 7.0 起静态注册就收不到了，动态注册才是能长期工作的写法；
+     * 而且我们只在服务活着的时候关心它，动态注册天然对得上这个生命周期。
+     */
+    private void registerConnectivityWatch() {
+        connectivityReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                // 先记一笔 —— 这条日志是「设备为什么突然重新广播了」的第一现场。
+                Log.i(TAG, "网络发生变化（" + intent.getAction() + "），"
+                        + (NETWORK_SETTLE_MS / 1000) + " 秒后重建监听");
+                // 防抖：新广播到达就把上一次的排程推后。
+                watchdog.removeCallbacks(rebuildOnNetworkChange);
+                watchdog.postDelayed(rebuildOnNetworkChange, NETWORK_SETTLE_MS);
+            }
+        };
+        try {
+            registerReceiver(connectivityReceiver,
+                    new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION));
+            Log.i(TAG, "已注册网络变化监听");
+        } catch (Exception e) {
+            // 注册不上只是少了「网络变了自动重建」这一层保险，
+            // 看门狗和 SSDP 自己的退避重试还在。绝不能因此让服务起不来。
+            connectivityReceiver = null;
+            Log.w(TAG, "注册网络变化监听失败（继续运行）", e);
+        }
+    }
+
+    /**
+     * 网络真的变了：重新选网卡、重建两条链路。
+     *
+     * <p>顺序有讲究：**先刷新锁，再重建链路**。锁是「能收到组播包」的前提，
+     * 而 {@link SsdpResponder} 一绑上就开始收包 —— 顺序反了的话，
+     * 重建出来的 socket 会有一段收不到包的空窗。
+     */
+    private void applyNetworkChange() {
+        if (shuttingDown) {
+            return;
+        }
+        // 重新选 IP：NetUtil 每次都重新枚举网卡、不缓存，
+        // 所以这里拿到的就是变化之后的真实情况。
+        localIp = NetUtil.pickLocalIp();
+        Log.i(TAG, "按网络变化重建：候选网卡 " + NetUtil.describeCandidates());
+        refreshLocks();
+        restartSsdp("网络变化");
+        restartHttp("网络变化");
+    }
+
+    /**
+     * 重新获取两把锁。
+     *
+     * <p>Wi-Fi 断开重连会把系统层面的锁清掉，而 {@code isHeld()} 在老平台上
+     * 不一定如实反映这件事 —— 所以这里**无条件** release + acquire，
+     * 不去赌那个布尔值。release 之前仍然判一次 {@code isHeld()}，
+     * 因为对没持有的锁调 release 会抛 {@code RuntimeException}。
+     */
+    private void refreshLocks() {
+        try {
+            if (multicastLock != null && multicastLock.isHeld()) {
+                multicastLock.release();
+            }
+            if (multicastLock != null) {
+                multicastLock.acquire();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "重新获取 MulticastLock 失败", e);
+        }
+        try {
+            if (wifiLock != null && wifiLock.isHeld()) {
+                wifiLock.release();
+            }
+            if (wifiLock != null) {
+                wifiLock.acquire();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "重新获取 WifiLock 失败", e);
+        }
+    }
+
+    /**
+     * 重建 SSDP 接收线程。
+     *
+     * <p>抽成方法是因为它有**两个**调用方：自检看门狗（线程死了）和网络变化
+     * （网卡换了）。同一段重建逻辑写两遍的话，迟早有一处忘了改 ——
+     * 而「重建漏了一步」的后果是老盒子上慢慢漏 fd，最后报错的是别的模块。
+     */
+    private void restartSsdp(String reason) {
+        SsdpResponder s = ssdp;
+        if (s != null) {
+            // 先 shutdown：网络变化时线程**还活着**，
+            // 不关就重建等于漏一个 socket + 一个调度器。
+            s.shutdown();
+        }
+        ssdp = new SsdpResponder(uuid, HTTP_PORT, serverName);
+        ssdp.start();
+        Log.i(TAG, "已重建 SSDP（" + reason + "）");
+    }
+
+    /**
+     * 重建 HTTP 服务。
+     *
+     * <p>图标必须重新给一次：设备描述是随请求现生成的，而新实例里
+     * {@code iconPng} 是空的 —— 不重给的话，网络变化之后控制点就再也
+     * 拿不到图标了（设备列表里变成一个默认方块）。
+     */
+    private void restartHttp(String reason) {
+        UpnpHttpServer h = httpServer;
+        if (h != null) {
+            h.shutdown();
+        }
+        httpServer = new UpnpHttpServer(HTTP_PORT, uuid, friendlyName, this, this);
+        provideDeviceIcon();
+        httpServer.start();
+        Log.i(TAG, "已重建 HTTP 服务（" + reason + "）");
+    }
+
     private void startForegroundNotification() {
         Intent intent = new Intent(this, MainActivity.class);
         //noinspection UnspecifiedImmutableFlag
@@ -311,8 +523,15 @@ public class DlnaRendererService extends Service
     public void onSetUri(String uri, String metadata) {
         Log.i(TAG, "收到投屏地址: " + uri);
         currentUri = uri;
-        lastError = "";
+        clearError();
         kindFromMetadata = kindOf(metadata);
+        // 元数据原样留着（协议回读要用），另外解析一份标题给界面。
+        // 解析失败不抛异常 —— DidlLite 取不到就返回空串，界面回退到文件名。
+        currentMetadata = metadata == null ? "" : metadata;
+        currentTitle = DidlLite.title(currentMetadata);
+        if (currentTitle.length() > 0) {
+            Log.i(TAG, "片源标题: " + currentTitle);
+        }
         // 还没 prepare，先按元数据猜一个；等 onPrepared 拿到真实视频尺寸再定论。
         // 这样从"收到投屏"到"画面出来"这段时间界面形态就是对的，不会先黑一下再跳。
         audioOnly = (kindFromMetadata == KIND_AUDIO);
@@ -379,9 +598,13 @@ public class DlnaRendererService extends Service
         // 「正在播放」形态（面板隐藏、只剩播放条）。describeState() 同理，
         // 它也会因为 URI 非空而继续报「正在播放」。
         currentUri = "";
+        // 元数据和标题一起清。留着的话，下一次投屏在解析出新标题之前，
+        // 界面会短暂显示**上一首**的名字 —— 旧标题配新地址，自相矛盾。
+        currentMetadata = "";
+        currentTitle = "";
         // 一并清掉上一次的错误：已经停止的传输不该继续挂着旧报错，
         // 否则 describeState() 会优先显示那句陈旧的「出错：…」。
-        lastError = "";
+        clearError();
         // 报一次：控制点要知道"设备上已经没内容了"
         notifyEvent("AVTransport");
     }
@@ -442,9 +665,22 @@ public class DlnaRendererService extends Service
         return hasTransportError() ? "ERROR_OCCURRED" : "OK";
     }
 
-    /** 「当前是否处于出错态」—— 事件与 GetTransportInfo 共用的唯一判据 */
+    /** 「当前是否处于出错态」—— 事件、GetTransportInfo、界面共用的唯一判据 */
     private boolean hasTransportError() {
-        return lastError != null && lastError.length() > 0;
+        return lastErrorKind != PlaybackPolicy.ERR_NONE;
+    }
+
+    /**
+     * 清掉当前错误。
+     *
+     * <p><b>为什么抽成一个方法</b>：要清的是**两个**字段（分类 + 细节），
+     * 三处各写一遍迟早会漏掉一个 —— 而漏掉的后果是「分类说没错、
+     * 细节里还留着上次的报错」这种自相矛盾的状态。顶部状态条正是靠分类
+     * 判断要不要出现，于是会出现画面好好的、屏幕上却压着一条旧报错。
+     */
+    private void clearError() {
+        lastErrorKind = PlaybackPolicy.ERR_NONE;
+        lastError = "";
     }
 
     @Override
@@ -595,9 +831,12 @@ public class DlnaRendererService extends Service
     }
 
     @Override
-    public void onError(String message) {
-        lastError = message;
-        Log.w(TAG, "播放错误: " + message);
+    public void onError(int kind, String detail) {
+        lastErrorKind = kind;
+        lastError = detail;
+        // 分类名进日志（"播放错误[DECODE]"），细节也进日志。
+        // 两者都要有：分类让日志能一眼扫出"哪类错多"，细节用来定位具体那一次。
+        Log.w(TAG, "播放错误[" + PlaybackPolicy.errorKindName(kind) + "]: " + detail);
     }
 
     @Override
@@ -611,7 +850,7 @@ public class DlnaRendererService extends Service
         //
         // 这和「谎报军情比失败更糟」是同一条纪律：状态字段必须反映**现在**，
         // 而不是"曾经出过事"。真要报故障，下一次 onError 会重新写上。
-        lastError = "";
+        clearError();
         // 元数据说了算的时候听元数据的；元数据没说，就用 MediaPlayer 报的
         // 真实视频尺寸定论。两个信号都用上，比只看一个稳。
         if (kindFromMetadata == KIND_AUDIO) {
@@ -660,6 +899,23 @@ public class DlnaRendererService extends Service
         return HTTP_PORT;
     }
 
+    /**
+     * 当前错误的**分类** —— 界面据此显示用户能懂的话。
+     *
+     * <p>取值是 {@link PlaybackPolicy} 里的 {@code ERR_*}，
+     * {@code ERR_NONE} 表示当前没出错。
+     */
+    public int getLastErrorKind() {
+        return lastErrorKind;
+    }
+
+    /**
+     * 当前错误的**技术细节**。
+     *
+     * <p>给排障用的（写进日志、贴给人看）。**界面不该直接显示它** ——
+     * {@code "what=1 extra=-1010"} 这种字符串用户看不懂，也没法据此做任何决定。
+     * 界面上要显示的是 {@link #getLastErrorKind()} 对应的那句话。
+     */
     public String getLastError() {
         return lastError;
     }
@@ -674,6 +930,26 @@ public class DlnaRendererService extends Service
     @Override
     public String getCurrentUri() {
         return currentUri;
+    }
+
+    /**
+     * GetMediaInfo / GetPositionInfo 用 —— 当前媒体的元数据原文。
+     *
+     * <p>回的是**控制点自己推来的那一份**，一个字节都不改。
+     */
+    @Override
+    public String getCurrentMetadata() {
+        return currentMetadata;
+    }
+
+    /**
+     * 从元数据里解析出的标题，给界面用。
+     *
+     * <p>可能为空串（控制点没给标题，或者给的是空壳元数据）——
+     * 界面此时应当回退到从 URL 截出来的文件名，而不是显示空白。
+     */
+    public String getCurrentTitle() {
+        return currentTitle;
     }
 
     /**
@@ -744,22 +1020,14 @@ public class DlnaRendererService extends Service
         if (s != null && !s.isAlive() && !s.isBound()) {
             bad = true;
             logWatchdog("SSDP 线程已死且未绑定，重建");
-            // 先 shutdown 一次：线程虽然死了，但 socket / 调度器可能还挂着。
-            // 不关就重建的话，每次自检漏一个 fd —— 老盒子上几十次之后
-            // 就是 "Too many open files"，而那时报错的是**别的**模块。
-            s.shutdown();
-            ssdp = new SsdpResponder(uuid, HTTP_PORT, serverName);
-            ssdp.start();
+            restartSsdp("线程已死");
         }
 
         UpnpHttpServer h = httpServer;
         if (h != null && !h.isAlive() && !h.isBound()) {
             bad = true;
             logWatchdog("HTTP 线程已死且未监听，重建");
-            h.shutdown();
-            httpServer = new UpnpHttpServer(HTTP_PORT, uuid, friendlyName, this, this);
-            provideDeviceIcon();
-            httpServer.start();
+            restartHttp("线程已死");
         }
 
         if (!bad) {
@@ -801,6 +1069,19 @@ public class DlnaRendererService extends Service
         // 下次启动直接 EADDRINUSE。
         shuttingDown = true;
         watchdog.removeCallbacks(watchdogTask);
+        // 网络变化的重建任务也要摘掉 —— 它跑在同一个主线程队列上，
+        // 服务销毁后醒来会对着一堆已经清空的字段动手。
+        watchdog.removeCallbacks(rebuildOnNetworkChange);
+        // 注销广播：不注销的话，系统会一直持有这个 Receiver，
+        // 而它内部持有 Service 实例 —— 老盒子上这就是一个漏掉的 Service。
+        if (connectivityReceiver != null) {
+            try {
+                unregisterReceiver(connectivityReceiver);
+            } catch (Exception e) {
+                Log.w(TAG, "注销网络监听失败（继续销毁）", e);
+            }
+            connectivityReceiver = null;
+        }
 
         // 先撤掉前台通知，再拆服务。
         //

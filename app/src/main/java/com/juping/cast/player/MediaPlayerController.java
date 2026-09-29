@@ -48,7 +48,17 @@ public class MediaPlayerController {
     public interface Listener {
         void onStateChanged(String state);
 
-        void onError(String message);
+        /**
+         * 播放出错。
+         *
+         * <p>{@code kind} 是 {@link PlaybackPolicy} 里的 {@code ERR_*} 分类 ——
+         * 界面据此显示用户能看懂的话（"连不上媒体服务器" / "这台盒子解不了这个格式"）。
+         *
+         * <p>{@code detail} 是给日志和排障用的技术细节（{@code what}/{@code extra}、
+         * 异常消息）。**它不该直接显示给用户**：{@code "what=1 extra=-1010"}
+         * 这种字符串用户看不懂，也没法据此做任何决定。
+         */
+        void onError(int kind, String detail);
 
         /**
          * 已就绪。
@@ -324,7 +334,8 @@ public class MediaPlayerController {
                     // "准备中"而永远不生效 —— 表现是投不上去，而且点播放键没反应。
                     preparing = false;
                     if (listener != null) {
-                        listener.onError("播放错误 what=" + what + " extra=" + extra);
+                        listener.onError(PlaybackPolicy.classifyMediaError(what, extra),
+                                "播放错误 what=" + what + " extra=" + extra);
                     }
                     scheduleRetry();
                     return true;
@@ -343,7 +354,8 @@ public class MediaPlayerController {
             // "准备中"吞掉 —— 表现是投不上去，而且点播放键也没任何反应。
             preparing = false;
             if (listener != null) {
-                listener.onError("启动失败: " + e.getMessage());
+                listener.onError(PlaybackPolicy.classifyStartFailure(e),
+                        "启动失败: " + e);
             }
             scheduleRetry();
         }
@@ -461,7 +473,7 @@ public class MediaPlayerController {
             if (PlaybackPolicy.shouldStopRetryingStalls(stallCount)) {
                 Log.w(TAG, "连续卡死 " + stallCount + " 次，停止重连");
                 if (listener != null) {
-                    listener.onError("播放持续卡死，已停止重试");
+                    listener.onError(PlaybackPolicy.ERR_GIVEUP, "播放持续卡死，已停止重试");
                 }
                 notifyState("ERROR");
                 return;
@@ -470,7 +482,8 @@ public class MediaPlayerController {
             Log.w(TAG, "检测到卡死（位置停在 " + pos + "ms，时长 " + duration
                     + "ms），第 " + stallCount + " 次重连");
             if (listener != null) {
-                listener.onError("播放卡死，正在重连（第 " + stallCount + " 次）");
+                listener.onError(PlaybackPolicy.ERR_STALLED,
+                        "播放卡死，正在重连（第 " + stallCount + " 次）");
             }
             retryCount = 0;             // 卡死按网络问题处理，错误重连计数清零
             lastProgressAt = now;       // 重置计时，避免下一轮立刻重复触发

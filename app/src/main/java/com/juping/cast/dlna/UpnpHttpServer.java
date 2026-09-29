@@ -81,6 +81,18 @@ public class UpnpHttpServer extends Thread {
          */
         String getCurrentUri();
 
+        /**
+         * GetMediaInfo / GetPositionInfo 用 —— 当前媒体的元数据原文。
+         *
+         * <p>必须回**控制点推来的那一份**，不能回空、也不能回我们自己重拼的。
+         * 部分控制点（尤其依赖回读确认的那些）会拿它和自己刚推的比对 ——
+         * 回空的话它会认为"这台设备没接收成功"，画面留在手机上不投了；
+         * 回一个语义等价但格式不同的版本，同样可能被判成不一致。
+         *
+         * @return 元数据原文；无媒体时返回空串（不是 null）
+         */
+        String getCurrentMetadata();
+
         void onSetVolume(int volume0to100);
 
         int getVolume0to100();
@@ -939,6 +951,10 @@ public class UpnpHttpServer extends Thread {
             if (uri == null) {
                 uri = "";
             }
+            String metadata = handler.getCurrentMetadata();
+            if (metadata == null) {
+                metadata = "";
+            }
             boolean hasMedia = uri.length() > 0;
             // 只读一次。原来 RelTime 与 AbsTime 各调一次 handler，
             // 每次都穿过整个链路去问 MediaPlayer —— 高频轮询下这是白费的开销。
@@ -960,7 +976,11 @@ public class UpnpHttpServer extends Thread {
             }
             return "<Track>" + (hasMedia ? 1 : 0) + "</Track>"
                     + "<TrackDuration>" + formatTime(durMs) + "</TrackDuration>"
-                    + "<TrackMetaData></TrackMetaData>"
+                    // TrackMetaData 与 GetMediaInfo 的 CurrentURIMetaData 是同一份东西
+                    // （规范里都指"当前媒体的元数据"），必须同源 —— 两处各回各的
+                    // 会出现"同一个媒体、两个接口给的元数据不一样"。
+                    // 同样要转义：它是一段嵌在 SOAP 里的 XML。
+                    + "<TrackMetaData>" + escapeXml(metadata) + "</TrackMetaData>"
                     + "<TrackURI>" + escapeXml(uri) + "</TrackURI>"
                     + "<RelTime>" + formatTime(posMs) + "</RelTime>"
                     + "<AbsTime>" + formatTime(posMs) + "</AbsTime>"
@@ -973,11 +993,18 @@ public class UpnpHttpServer extends Thread {
             if (uri == null) {
                 uri = "";
             }
+            String meta = handler.getCurrentMetadata();
+            if (meta == null) {
+                meta = "";
+            }
             boolean hasMedia = uri.length() > 0;
             return "<NrTracks>" + (hasMedia ? 1 : 0) + "</NrTracks>"
                     + "<MediaDuration>" + formatTime(handler.getDurationMs()) + "</MediaDuration>"
                     + "<CurrentURI>" + escapeXml(uri) + "</CurrentURI>"
-                    + "<CurrentURIMetaData></CurrentURIMetaData>"
+                    // 必须转义：元数据本身就是一段 XML（带 < > "），
+                    // 原样塞进 SOAP 响应会让**整条响应变成非法 XML** ——
+                    // 控制点那边是"整条报文解析失败"，而不是"少个字段"。
+                    + "<CurrentURIMetaData>" + escapeXml(meta) + "</CurrentURIMetaData>"
                     + "<NextURI></NextURI><NextURIMetaData></NextURIMetaData>"
                     + "<PlayMedium>" + (hasMedia ? "NETWORK" : "NONE") + "</PlayMedium>"
                     + "<RecordMedium>NOT_IMPLEMENTED</RecordMedium>"

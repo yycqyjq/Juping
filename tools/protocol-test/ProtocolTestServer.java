@@ -1,3 +1,4 @@
+import com.juping.cast.dlna.DidlLite;
 import com.juping.cast.dlna.EventDispatcher;
 import com.juping.cast.dlna.SsdpResponder;
 import com.juping.cast.dlna.UpnpHttpServer;
@@ -70,6 +71,15 @@ public class ProtocolTestServer {
     private static volatile String lastError = "";
 
     /**
+     * 最近一次收到的元数据原文。
+     *
+     * <p>真实服务里也是**原样存、原样回读** —— 靶机必须同样保真，
+     * 否则测出来的"回读一致"在真机上不成立（这正是「测试替身不能比被测对象宽容」
+     * 那条纪律的另一面：也不能比它更"理想"）。
+     */
+    private static volatile String currentMetadata = "";
+
+    /**
      * 业务回调里要能触发事件推送（和真实服务一样：状态一变就 notifyEvent）。
      * 服务对象本身在 handler 之后才构造出来，所以用个静态引用兜一下。
      */
@@ -83,7 +93,57 @@ public class ProtocolTestServer {
         }
     }
 
+    /**
+     * DidlLite 解析器自检 —— 在起服务**之前**跑。
+     *
+     * <p>放这里而不是单独写一个测试类：协议闸门反正要编译并运行这个文件，
+     * 挂在这里 = 解析器坏了协议闸门直接红，不需要新增任何脚本和闸门。
+     * 断言失败抛 AssertionError 退出（非 0），run.sh 会同样拦下来。
+     */
+    private static void didlSelftest() {
+        // 标题 / 艺术家，标准命名空间写法
+        String didl = "<DIDL-Lite xmlns:dc=\"http://purl.org/dc/elements/1.1/\" "
+                + "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">"
+                + "<item id=\"1\"><dc:title>夜曲</dc:title>"
+                + "<upnp:artist>周杰伦</upnp:artist>"
+                + "<upnp:class>object.item.audioItem.musicTrack</upnp:class></item></DIDL-Lite>";
+        expect("dc:title", "夜曲", DidlLite.title(didl));
+        expect("upnp:artist", "周杰伦", DidlLite.artist(didl));
+
+        // 无前缀写法也要认 —— 换个控制点就不带前缀，漏了的话界面上
+        // 会**悄悄**退回显示文件名，不报错、没人发现
+        expect("无前缀 title", "Don't Stop", DidlLite.title("<item><title>Don't Stop</title></item>"));
+
+        // 实体反转义。&amp; 只能替换一次（先换它会让 &amp;lt; 二次替换成 <）；
+        // &#39; 是 DIDL 里单引号的常见写法，歌名带单引号非常常见
+        expect("实体反转义", "Tom & Jerry '07",
+                DidlLite.title("<item><dc:title>Tom &amp; Jerry &#39;07</dc:title></item>"));
+
+        // 数字实体的十六进制写法
+        expect("十六进制实体", "'", DidlLite.title("<title>&#x27;</title>"));
+
+        // 空串 / null / 没有该元素 —— 一律空串，不抛异常。
+        // 界面靠"空串"判断要不要回退到文件名，抛异常会掀翻整条投屏流程
+        expect("空元数据", "", DidlLite.title(""));
+        expect("null 元数据", "", DidlLite.title(null));
+        expect("没有标题元素", "", DidlLite.title("<item><upnp:artist>x</upnp:artist></item>"));
+
+        // 未知实体原样保留 —— 悄悄吃掉会让问题藏起来，暴露出来才好修
+        expect("未知实体原样保留", "&nbsp;", DidlLite.title("<title>&nbsp;</title>"));
+
+        System.out.println("  DidlLite 自检：9 / 9 通过");
+    }
+
+    private static void expect(String what, String want, String got) {
+        if (!want.equals(got)) {
+            throw new AssertionError("DidlLite 自检失败: " + what
+                    + " 期望<" + want + "> 实际<" + got + ">");
+        }
+    }
+
     public static void main(String[] args) throws Exception {
+        didlSelftest();
+
         final int port = args.length > 0 ? Integer.parseInt(args[0]) : 49152;
         final String callLog = args.length > 1 ? args[1] : "/tmp/juping-calls.log";
         // SSDP 用临时端口，不去抢 1900 —— 免得和机器上真的 SSDP 服务打架
@@ -113,6 +173,8 @@ public class ProtocolTestServer {
                 rec("SetAVTransportURI", uri, metadata);
                 // 和真实服务保持一致：收到 URI 就记下来，GetMediaInfo 要回读它
                 currentUri = uri == null ? "" : uri;
+                // 元数据同样原样记住，供 GetMediaInfo / GetPositionInfo 回读
+                currentMetadata = metadata == null ? "" : metadata;
                 // 片源带 boom → 模拟一个播放错误（真实服务里是 onError 置的）
                 lastError = (uri != null && uri.contains("boom")) ? "模拟播放错误" : "";
                 transportState = "TRANSITIONING";
@@ -148,6 +210,9 @@ public class ProtocolTestServer {
             public void onStop() {
                 rec("Stop");
                 currentUri = "";
+                // 元数据一起清 —— 和真实服务保持一致：留着的话，
+                // GetMediaInfo 会在"没有媒体"的时候回一份上一部片子的元数据
+                currentMetadata = "";
                 lastError = "";
                 transportState = "STOPPED";
                 push("AVTransport");
@@ -182,6 +247,11 @@ public class ProtocolTestServer {
             @Override
             public String getCurrentUri() {
                 return currentUri;
+            }
+
+            @Override
+            public String getCurrentMetadata() {
+                return currentMetadata;
             }
 
             @Override

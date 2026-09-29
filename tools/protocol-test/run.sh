@@ -19,8 +19,21 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 cd "$ROOT"
 
-TOOLCHAIN="${ANDROID_BUILD_HOME:-$HOME/.android-build}"
-export JAVA_HOME="$TOOLCHAIN/jdk/Contents/Home"
+# JAVA_HOME 的选择顺序：
+# ① 环境里已有可用的 javac → 尊重它。CI 上 setup-java 会设；
+#    本地也可能指向系统 JDK。**不能无条件覆盖** —— 那样在
+#    没有本地工具链的机器上（CI runner）会直接 exit 2。
+# ② 否则用自包含工具链。注意布局差异：当初绕开 sdkmanager 下载的
+#    macOS 包解压出来是 Contents/Home 结构，Linux 的 tar.gz 没有 ——
+#    两种都要认，否则这套脚本换个平台就跑不了。
+if [ -z "${JAVA_HOME:-}" ] || [ ! -x "$JAVA_HOME/bin/javac" ]; then
+    TOOLCHAIN="${ANDROID_BUILD_HOME:-$HOME/.android-build}"
+    if [ -x "$TOOLCHAIN/jdk/Contents/Home/bin/javac" ]; then
+        export JAVA_HOME="$TOOLCHAIN/jdk/Contents/Home"
+    elif [ -x "$TOOLCHAIN/jdk/bin/javac" ]; then
+        export JAVA_HOME="$TOOLCHAIN/jdk"
+    fi
+fi
 JAVAC="$JAVA_HOME/bin/javac"
 JAVA="$JAVA_HOME/bin/java"
 
@@ -46,6 +59,7 @@ mkdir -p "$OUT/classes"
 if ! "$JAVAC" -nowarn -encoding UTF-8 -d "$OUT/classes" \
         "$HERE/android/util/Log.java" \
         app/src/main/java/com/juping/cast/dlna/NetUtil.java \
+        app/src/main/java/com/juping/cast/dlna/DidlLite.java \
         app/src/main/java/com/juping/cast/dlna/UpnpHttpServer.java \
         app/src/main/java/com/juping/cast/dlna/EventDispatcher.java \
         app/src/main/java/com/juping/cast/dlna/SsdpResponder.java \
