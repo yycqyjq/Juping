@@ -242,8 +242,12 @@ PY
         echo "=== 播放策略（同上，纯逻辑，不需要真机）==="
         verify_policy
         echo
-        echo "装机："
-        echo "  $ANDROID_HOME/platform-tools/adb install -r dist/juping-$VER-release.apk"
+        echo "装机 + 真机验收（一条命令）："
+        echo "  ./tools/verify-on-device.sh              # USB 连接的盒子"
+        echo "  ./tools/verify-on-device.sh 192.168.1.9  # 局域网 adb"
+        echo
+        echo "  它会安装、拉起服务、从日志里读出真实地址，再跑控制点自检。"
+        echo "  手工装：$ANDROID_HOME/platform-tools/adb install -r dist/juping-$VER-release.apk"
         ;;
 
     debug|*)

@@ -64,12 +64,14 @@ Juping/
     ├── build.sh              一键构建 + 出包前核验
     ├── check_api_compat.py   逐个核验平台 API 引用是否在目标版本里存在
     ├── make_icon.py          生成全部位图资源（纯标准库）
-    ├── probe-tv.sh           adb 探测盒子真实硬件信息
+    ├── probe-tv.sh           adb 探测盒子真实硬件信息（只读）
+    ├── verify-on-device.sh   一条命令真机验收：装包 → 起服务 → 自检
+    ├── dlna-probe.py         控制点视角自检（站在手机那一侧走完整链路）
     ├── apk_info.py           解析 APK 的包名 / minSdk
     ├── check_sources.py      无 JDK 环境下的源码结构检查
     ├── protocol-test/        DLNA 协议层端到端测试（桌面 JVM，不需要真机）
-    │   ├── run.sh            编译 → 起服务 → 驱动 → 收尾
-    │   ├── drive.py          85 项一致性检查（原始 socket 精确控字节）
+    │   ├── run.sh            编译 → 起服务 → 驱动 → 用同一靶机验证探测脚本
+    │   ├── drive.py          95 项一致性检查（原始 socket 精确控字节）
     │   ├── ProtocolTestServer.java  在桌面跑真实的 UpnpHttpServer + SsdpResponder
     │   └── android/util/Log.java    android.util.Log 的桌面替身
     └── policy-test/          播放重连策略测试（纯逻辑，不需要真机）
@@ -235,8 +237,8 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 当前结果：
 
 ```
-被引用的平台类 54 个 · 方法 177 个 · 字段 3 个
-结论：180 个平台引用全部命中，无 API 越界。
+被引用的平台类 55 个 · 方法 178 个 · 字段 3 个
+结论：181 个平台引用全部命中，无 API 越界。
 ```
 
 为什么要两道：lint 依赖内置数据库，而且本项目关掉了 8 项检查 ——
@@ -261,7 +263,7 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 ```
 
 ```
-协议一致性：85 / 85 通过
+协议一致性：95 / 95 通过
 ```
 
 覆盖两大故障场景 —— **「手机搜不到设备」和「投屏没反应」**：
@@ -270,12 +272,13 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 |---|---|
 | 1–2 | 设备描述 XML、三个服务的 SCPD 是否可取且合法 |
 | 3–5 | SOAP 控制指令、`SetAVTransportURI` 中文元数据、播放状态机 |
-| 6 | 健壮性：未知路径 / 缺失头 / 畸形报文后服务是否还活着 |
-| **7** | **SSDP 发现**：`ssdp:all` 要回全 6 个搜索目标；每个 ST 必须原样回、USN 格式正确；无关搜索与 NOTIFY 不能应答 |
-| **8** | **发现链路闭环**：顺着 LOCATION 抓 device.xml → 校验 UDN/deviceType 与 SSDP 一致 → 逐个抓 SCPDURL → 每个 controlURL 可达 |
-| 9 | 请求行变体：绝对形式（`GET http://host/path`）、多余空格、带查询串 |
+| **6** | **回读契约**：`CurrentURI` / `TrackURI` / `NrTracks` 三者必须自洽，带 `&` 的地址必须能原样回读 |
+| 7 | 健壮性：未知路径 / 缺失头 / 畸形报文后服务是否还活着 |
+| **8** | **SSDP 发现**：`ssdp:all` 要回全 6 个搜索目标；每个 ST 必须原样回、USN 格式正确；无关搜索与 NOTIFY 不能应答 |
+| **9** | **发现链路闭环**：顺着 LOCATION 抓 device.xml → 校验 UDN/deviceType 与 SSDP 一致 → 逐个抓 SCPDURL → 每个 controlURL 可达 |
+| 10 | 请求行变体：绝对形式（`GET http://host/path`）、多余空格、带查询串 |
 
-> **这套测试累计抓出五个真 bug**，每一个都能让投屏在真机上失效，
+> **这套测试累计抓出六个真 bug**，每一个都能让投屏在真机上失效，
 > 而真机上全都无从定位：
 >
 > **投屏侧（第 1–6 段）**
@@ -284,8 +287,17 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 >    socket 超时，**一个字节响应都不发**（真机上表现就是"投屏没反应"）。
 > ② `extractActionName()` 把 XML 属性名吞进了 action 名
 >    （`GetTransportInfo xmlns:u="..."`），导致指令全部无法匹配。
+> ⑥ `GetMediaInfo` **永远回一个空的 `CurrentURI`**，哪怕视频正在播 ——
+>    因为 `getCurrentUri()` 只写在服务类里，**没进 `CommandHandler` 接口**，
+>    协议层根本调不到它。规范要求 `CurrentURI` 反映当前媒体，只有
+>    `NO_MEDIA_PRESENT` 时才允许为空。后果不是"少个字段"这么轻：部分投屏
+>    SDK 会在 `SetAVTransportURI` 之后回读 `GetMediaInfo`，拿 `CurrentURI`
+>    与自己刚推的地址比对，**不一致就判定"这台设备没接收成功"，画面留在手机上不投了**。
+>    顺带发现同一处还有两个漏洞：`NrTracks` / `Track` 恒回 1（无媒体时也谎报有片），
+>    以及 URL 里的 `&` 未做 XML 转义 —— CDN 地址几乎必然带查询串，
+>    不转义会让**整份 SOAP 响应变成非法 XML**，控制点那边是"整条报文解析失败"。
 >
-> **发现侧（第 7–9 段）**
+> **发现侧（第 8–10 段）**
 > ③ SSDP 应答的 `ST` 写死成设备类型，**没有原样回控制点的搜索目标**。
 >    控制点是拿 ST 匹配应答的 —— 搜 `upnp:rootdevice` 却收到 `MediaRenderer`，
 >    这条应答会被直接丢弃，手机端显示"什么都没搜到"。
@@ -303,6 +315,29 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 > （`GET http://192.168.1.50:49152/upnp/device.xml HTTP/1.1`，RFC 7230 §5.3.2），
 > 而服务端必须接受。原来直接拿路径比较，绝对形式下返回 404 →
 > 手机「搜到了设备却投不了屏」。
+
+> **这些断言做过反向验证**：把 `getCurrentUri()` 临时改成恒返回空串，
+> 测试从 95/95 掉到 91/95，失败项正好是那 4 条"有媒体时必须有地址"的断言。
+> 一个只会说"通过"的断言是没有价值的。
+
+**自检脚本自己也要被测**
+
+`tools/dlna-probe.py` 是二夜在真机上唯一能用的排障工具 —— 站在手机那一侧，
+把「SSDP 发现 → 抓设备描述 → 核一致性 → 抓 SCPD → 发只读控制指令」整条链路走一遍。
+
+脚本自己报假警报，比没有工具更糟：会把「盒子没问题」误判成「盒子有问题」，
+于是去改本来正确的代码。所以 `protocol-test/run.sh` 在跑完驱动之后，
+**用同一个靶机再跑一遍这个脚本**，它不过就算失败：
+
+```
+── 用同一靶机验证 tools/dlna-probe.py（控制点视角自检）──
+  控制点自检：32 / 32 通过
+```
+
+这条自查立刻抓到过一个**脚本自身的 bug**：它拿「状态 ≠ `NO_MEDIA_PRESENT`」
+当作"有媒体"，而 `STOPPED` 同样是"没有内容"的合法状态（本实现 Stop 时会清空
+`CurrentURI`）—— 于是对着一台完全正常的设备报 FAIL。
+改成自洽性判据（`NrTracks` 与 `CurrentURI` 必须同进同退）后才对。
 >
 > **反向验证**：把 `ST` 改回写死的旧写法，10 条断言立刻变红。
 > 一个只会说"通过"的测试是没有价值的。
@@ -382,10 +417,47 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 - **乐联（LeLink）协议不支持**。B站、抖音、部分腾讯视频走的是乐播的私有闭源协议，开源界没有实现，无法对接。能收的是标准 DLNA / UPnP 推送。
 - **AirPlay 未实现**。iOS 侧目前只能用支持 DLNA 的 App 投。要做 AirPlay 接收需要移植 UxPlay（C/C++，GPLv3），是独立的一大块工作。
 - **镜像（Miracast）不做**。老盒子 Wi-Fi Direct 驱动不稳，正是断联根因，不值得修。
-- **从未在真机上运行过**。已通过七项静态核验（编译 / lint `NewApi` 零命中 /
-  API 引用 180 项全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
-  DLNA 协议 85 项通过 / 播放策略 26 项通过），
-  但真机上的组播收发、MediaPlayer 硬解、断联恢复都还没实测。
+- **从未在真机上运行过**。已通过八项桌面核验（编译 / lint `NewApi` 零命中 /
+  API 引用 181 项全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
+  DLNA 协议 95 项通过 / 播放策略 26 项通过 / 自检脚本 32 项通过），
+  但真机上的组播收发、MediaPlayer 硬解、断联恢复都还没实测 ——
+  `./tools/verify-on-device.sh` 已经就绪，插上盒子跑一条命令即可验。
+
+---
+
+## 真机验收
+
+前面四道闸全是**桌面端**跑的。它们能证明「代码自洽」，证明不了「盒子真的收得到投屏」。
+真机上只有三件事必须真机验，而且都验不了于桌面：
+
+1. **SSDP 组播收不收得到** —— 受 `MulticastLock`、网卡选择、路由器 IGMP 影响
+2. **MediaPlayer 能不能硬解 MT5880 上的真实码流**
+3. **断流自愈策略在真实网络下走不走得通**
+
+一条命令把它们压到一起：
+
+```bash
+./tools/verify-on-device.sh                 # USB 连接的盒子
+./tools/verify-on-device.sh 192.168.1.9     # 先局域网 adb connect
+./tools/verify-on-device.sh 192.168.1.9 --play 'http://x/y.mp4?a=1&b=2'
+```
+
+它按顺序做六件事：
+
+| 步 | 做什么 | 为什么这么做 |
+|---|---|---|
+| ① | 装包前先比 `minSdk` 与设备 API | 否则只会拿到一句 `INSTALL_FAILED_OLDER_SDK`，看不出差多少级 |
+| ② | `adb install -r` 覆盖安装 | 老设备上偶发 `ALREADY_EXISTS` |
+| ③ | 拉起 `MainActivity`（服务在 `onCreate` 里起） | 顺带把「已安装但从未启动过」这个自启前提解决掉 |
+| ④ | **从 logcat 里抠出真实地址** | 服务自己会把 `NetUtil` 实际选中的地址打进日志（`接收端已就绪：… 地址=http://IP:PORT/...`）。这比解析 `netcfg` / `ip addr` 可靠 —— 它反映的正是真正生效的那张网卡 |
+| ⑤ | 用这个地址跑 `dlna-probe.py` | 站在手机那一侧把发现链路完整走一遍 |
+| ⑥ | 抓 MediaPlayer 相关日志 | Android 4.0 上是 `AwesomePlayer`；出现 error 就该怀疑编码格式了 |
+
+自检没过时它会额外打网络诊断（盒子侧接口、组播锁状态）—— 「手机搜不到设备」
+九成就出在这两处。
+
+> 脚本能替你做上面六件事，但有三件替不了，只能你自己拿手机点：
+> **画面出不出得来 / 拖进度条会不会卡死 / 拔网线 20 秒再插上会不会自愈。**
 
 ---
 

@@ -51,6 +51,21 @@ public class UpnpHttpServer extends Thread {
         /** GetTransportInfo 用，返回 UPnP 标准状态串 */
         String getTransportState();
 
+        /**
+         * GetMediaInfo / GetPositionInfo 用 —— 当前正在播放的媒体 URL。
+         *
+         * <p>这个方法之前漏在接口外面，导致 GetMediaInfo 永远回一个空的
+         * {@code <CurrentURI></CurrentURI>}，**哪怕视频正在播**。规范要求
+         * CurrentURI 反映当前媒体；只有 {@code NO_MEDIA_PRESENT} 时才允许为空。
+         *
+         * <p>后果不是"少一个字段"这么轻：部分投屏 SDK 会在 SetAVTransportURI
+         * 之后回读 GetMediaInfo，拿 CurrentURI 与自己刚推的地址比对，不一致就
+         * 判定"这台设备没接收成功"，于是把画面停在手机上不投了。
+         *
+         * @return 当前媒体 URL；无媒体时返回空串（不是 null）
+         */
+        String getCurrentUri();
+
         void onSetVolume(int volume0to100);
 
         int getVolume0to100();
@@ -377,20 +392,36 @@ public class UpnpHttpServer extends Thread {
                     + "<CurrentSpeed>1</CurrentSpeed>";
         }
         if ("GetPositionInfo".equals(action)) {
-            return "<Track>1</Track>"
+            // Track 按规范是"当前选中轨号，无选中时为 0"。无媒体却回 1，
+            // 会让控制点认为已经选中了第一轨。
+            String uri = handler.getCurrentUri();
+            if (uri == null) {
+                uri = "";
+            }
+            boolean hasMedia = uri.length() > 0;
+            return "<Track>" + (hasMedia ? 1 : 0) + "</Track>"
                     + "<TrackDuration>" + formatTime(handler.getDurationMs()) + "</TrackDuration>"
                     + "<TrackMetaData></TrackMetaData>"
-                    + "<TrackURI></TrackURI>"
+                    + "<TrackURI>" + escapeXml(uri) + "</TrackURI>"
                     + "<RelTime>" + formatTime(handler.getPositionMs()) + "</RelTime>"
                     + "<AbsTime>" + formatTime(handler.getPositionMs()) + "</AbsTime>"
                     + "<RelCount>2147483647</RelCount><AbsCount>2147483647</AbsCount>";
         }
         if ("GetMediaInfo".equals(action)) {
-            return "<NrTracks>1</NrTracks>"
+            // 无媒体时 CurrentURI 允许为空，但 NrTracks 必须如实回 0 —— 控制点会拿
+            // NrTracks 判断"这台设备上现在有没有内容"，谎报 1 会让它以为已经有片子了。
+            String uri = handler.getCurrentUri();
+            if (uri == null) {
+                uri = "";
+            }
+            boolean hasMedia = uri.length() > 0;
+            return "<NrTracks>" + (hasMedia ? 1 : 0) + "</NrTracks>"
                     + "<MediaDuration>" + formatTime(handler.getDurationMs()) + "</MediaDuration>"
-                    + "<CurrentURI></CurrentURI><CurrentURIMetaData></CurrentURIMetaData>"
+                    + "<CurrentURI>" + escapeXml(uri) + "</CurrentURI>"
+                    + "<CurrentURIMetaData></CurrentURIMetaData>"
                     + "<NextURI></NextURI><NextURIMetaData></NextURIMetaData>"
-                    + "<PlayMedium>NETWORK</PlayMedium><RecordMedium>NOT_IMPLEMENTED</RecordMedium>"
+                    + "<PlayMedium>" + (hasMedia ? "NETWORK" : "NONE") + "</PlayMedium>"
+                    + "<RecordMedium>NOT_IMPLEMENTED</RecordMedium>"
                     + "<WriteStatus>NOT_IMPLEMENTED</WriteStatus>";
         }
         if ("GetVolume".equals(action)) {
@@ -605,6 +636,26 @@ public class UpnpHttpServer extends Thread {
         // 协议字段必须锁定成 ASCII。
         return String.format(java.util.Locale.ROOT, "%02d:%02d:%02d",
                 totalSec / 3600, (totalSec % 3600) / 60, totalSec % 60);
+    }
+
+    /**
+     * XML 转义。**嵌 URL 时必须过这一道**。
+     *
+     * <p>视频 CDN 的地址几乎必然带查询串，例如
+     * {@code http://cdn/x.mp4?token=abc&expire=123}。这个 {@code &} 直接写进
+     * {@code <CurrentURI>} 会让整份 SOAP 响应变成非法 XML —— 控制点那边不是
+     * "这一项读不到"，而是**整条报文解析失败**，表现为投屏后立刻报错。
+     * 同理 {@code <} {@code >} 出现在带签名的 URL 里也不罕见。
+     *
+     * <p>{@code &} 必须最先替换，否则会把后面刚生成的实体再转一遍
+     * （{@code &lt;} → {@code &amp;lt;}）。
+     */
+    private static String escapeXml(String s) {
+        if (s == null) {
+            return "";
+        }
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                .replace("\"", "&quot;").replace("'", "&apos;");
     }
 
     private static String unescapeXml(String s) {

@@ -346,9 +346,70 @@ check('Stop 之后状态是 STOPPED',
       'got=%r' % find_xml_text(body, 'CurrentTransportState'))
 
 
-# ══════════════════════════════════════════════════════════════ 6. 健壮性
+# ══════════════════════════════════════════════════════════════ 6. 回读契约
 
-print('\n── 6. 健壮性与边界 ──')
+print('\n── 6. 回读契约（CurrentURI / TrackURI / NrTracks）──')
+
+# 这一段守的是一个很容易漏的协议义务：控制点推完 URI 之后，不少投屏 SDK
+# 会回读 GetMediaInfo，拿 CurrentURI 与自己刚推的地址比对。回读为空 →
+# SDK 判定"这台设备没接收成功"，画面就停在手机上不投了。
+# 同时验收 XML 转义：带 & 的地址不转义，整份响应会变成非法 XML。
+
+# 此刻刚 Stop 过，应当处于无媒体状态
+st, hd, body = soap_post('GetMediaInfo', SVC_AVT, '')
+mi_uri = find_xml_text(body, 'CurrentURI')
+check('无媒体时 CurrentURI 节点存在且为空（不是缺节点）', mi_uri == '', 'got=%r' % mi_uri)
+check('无媒体时 NrTracks 为 0（不能谎报有片）',
+      find_xml_text(body, 'NrTracks') == '0',
+      'got=%r' % find_xml_text(body, 'NrTracks'))
+
+st, hd, body = soap_post('GetPositionInfo', SVC_AVT, '')
+check('无媒体时 Track 为 0',
+      find_xml_text(body, 'Track') == '0',
+      'got=%r' % find_xml_text(body, 'Track'))
+
+# 带 & 的地址是 CDN 的常态
+AMP_URI = 'http://192.168.1.9:8080/movie.mp4?token=abc&expire=1700000000&sig=x/y+z='
+
+before = len(read_calls())
+st, hd, body = soap_post('SetAVTransportURI', SVC_AVT,
+                         '<CurrentURI>%s</CurrentURI>\n'
+                         '<CurrentURIMetaData>%s</CurrentURIMetaData>'
+                         % (AMP_URI.replace('&', '&amp;'), PLAIN_META))
+check('带 & 的 URI 请求返回 200', st.startswith('HTTP/1.1 200'), st)
+
+new = read_calls()[before:]
+check('业务层收到的是解码后的完整地址（& 没被吃掉）',
+      len(new) >= 1 and unrec(new[0])[1] == AMP_URI,
+      'got=%r' % (unrec(new[0])[1] if new else None))
+
+st, hd, body = soap_post('GetMediaInfo', SVC_AVT, '')
+check('GetMediaInfo 的 CurrentURI 与发出的地址一致',
+      find_xml_text(body, 'CurrentURI') == AMP_URI,
+      'got=%r' % find_xml_text(body, 'CurrentURI'))
+check('有媒体时 NrTracks 为 1',
+      find_xml_text(body, 'NrTracks') == '1',
+      'got=%r' % find_xml_text(body, 'NrTracks'))
+
+st, hd, body = soap_post('GetPositionInfo', SVC_AVT, '')
+check('GetPositionInfo 的 TrackURI 与发出的地址一致',
+      find_xml_text(body, 'TrackURI') == AMP_URI,
+      'got=%r' % find_xml_text(body, 'TrackURI'))
+check('有媒体时 Track 为 1',
+      find_xml_text(body, 'Track') == '1',
+      'got=%r' % find_xml_text(body, 'Track'))
+
+# 复位，别影响后面的段落
+soap_post('Stop', SVC_AVT, '')
+st, hd, body = soap_post('GetMediaInfo', SVC_AVT, '')
+check('Stop 之后 CurrentURI 被清空',
+      find_xml_text(body, 'CurrentURI') == '',
+      'got=%r' % find_xml_text(body, 'CurrentURI'))
+
+
+# ══════════════════════════════════════════════════════════════ 7. 健壮性
+
+print('\n── 7. 健壮性与边界 ──')
 
 st, hd, body = raw_request('GET', '/upnp/nonexistent.xml')
 check('未知路径返回 404', '404' in st, st)
@@ -462,7 +523,7 @@ def short(st):
     return st.replace('urn:schemas-upnp-org:', '').replace('uuid:' + DEV_UUID, 'uuid:<本机>')
 
 
-print('\n── 7. SSDP 设备发现（手机搜不搜得到这台设备）──')
+print('\n── 8. SSDP 设备发现（手机搜不搜得到这台设备）──')
 
 if SSDP_PORT <= 0:
     check('SSDP 端口可用', False, '服务端没报告绑上的端口（网卡选择失败？）')
@@ -527,7 +588,7 @@ else:
 
 # ══════════════════════════════════════════════════════════════ 发现链路闭环
 
-print('\n── 8. 发现链路闭环（SSDP → 设备描述 → 服务描述）──')
+print('\n── 9. 发现链路闭环（SSDP → 设备描述 → 服务描述）──')
 print('   控制点真实走的就是这条链：搜到设备 → 按 LOCATION 抓描述 → 按 SCPDURL 抓服务。')
 print('   任何一环断开，表现都是「搜到了却投不了屏」。')
 
@@ -596,7 +657,7 @@ if dev is not None:
 
 # ══════════════════════════════════════════════════════════════ 请求行变体
 
-print('\n── 9. 请求行变体（RFC 7230 §5.3 要求服务端都接受）──')
+print('\n── 10. 请求行变体（RFC 7230 §5.3 要求服务端都接受）──')
 
 
 def raw_line(request_line, timeout=10):

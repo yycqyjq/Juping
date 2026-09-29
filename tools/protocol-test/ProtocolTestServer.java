@@ -31,6 +31,7 @@ public class ProtocolTestServer {
     private static final long FAKE_DURATION_MS = 7200000L;  // 02:00:00
 
     private static volatile String transportState = "NO_MEDIA_PRESENT";
+    private static volatile String currentUri = "";
     private static volatile int volume = 42;
 
     public static void main(String[] args) throws Exception {
@@ -61,6 +62,8 @@ public class ProtocolTestServer {
             @Override
             public void onSetUri(String uri, String metadata) {
                 rec("SetAVTransportURI", uri, metadata);
+                // 和真实服务保持一致：收到 URI 就记下来，GetMediaInfo 要回读它
+                currentUri = uri == null ? "" : uri;
                 transportState = "TRANSITIONING";
             }
 
@@ -79,6 +82,7 @@ public class ProtocolTestServer {
             @Override
             public void onStop() {
                 rec("Stop");
+                currentUri = "";
                 transportState = "STOPPED";
             }
 
@@ -100,6 +104,11 @@ public class ProtocolTestServer {
             @Override
             public String getTransportState() {
                 return transportState;
+            }
+
+            @Override
+            public String getCurrentUri() {
+                return currentUri;
             }
 
             @Override

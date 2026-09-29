@@ -99,7 +99,28 @@ ACTUAL_SSDP_PORT="$(echo "$READY_LINE" | awk '{print $3}')"
 python3 "$HERE/drive.py" "$HTTP_PORT" "$CALL_LOG" "$ACTUAL_SSDP_PORT"
 RC=$?
 
-# ── 5. 失败时把服务端日志带出来 ──
+# ── 5. 拿同一个靶机验证 dlna-probe.py 自身 ──
+# 探测脚本是二夜在真机上唯一能用的排障工具。脚本自己报假警报，比没有工具更糟：
+# 会把「盒子没问题」误判成「盒子有问题」，于是去改本来正确的代码。
+# 所以它也得进回归 —— 而它恰好可以被这套靶机完整覆盖。
+echo
+echo "── 用同一靶机验证 tools/dlna-probe.py（控制点视角自检）──"
+PROBE_LOG="$OUT/probe.log"
+PROBE_RC=0
+python3 "$ROOT/tools/dlna-probe.py" 127.0.0.1 \
+    --ssdp-port "$ACTUAL_SSDP_PORT" --http-port "$HTTP_PORT" \
+    --play 'http://127.0.0.1:9/probe.mp4?token=a&expire=1' \
+    >"$PROBE_LOG" 2>&1 || PROBE_RC=$?
+
+if [ "$PROBE_RC" -eq 0 ]; then
+    echo "  $(grep '控制点自检：' "$PROBE_LOG" | tail -1 | sed 's/^ *//')"
+else
+    echo "  dlna-probe.py 未全过 —— 注意这是**脚本自身**的问题，不是被测代码的：" >&2
+    grep -E '\[FAIL\]' "$PROBE_LOG" >&2 || true
+    RC=1
+fi
+
+# ── 6. 失败时把服务端日志带出来 ──
 if [ "$RC" -ne 0 ]; then
     echo
     echo "── 服务端日志（最后 40 行）──"

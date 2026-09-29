@@ -136,6 +136,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             infoAddress.setText("—");
             infoNetwork.setText("—");
             infoState.setText(R.string.state_starting);
+            applyStatusDot(false);
             return;
         }
 
@@ -146,6 +147,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         infoState.setText(describeState());
 
         boolean playing = isPlaying();
+        applyStatusDot(playing);
         if (playing != lastPlaying) {
             lastPlaying = playing;
             applyMode(playing);
@@ -177,13 +179,42 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         overlay.setVisibility(playing ? View.VISIBLE : View.GONE);
 
         String uri = service == null ? null : service.getCurrentUri();
-        if (uri != null && uri.length() > 0) {
-            rowSource.setVisibility(View.VISIBLE);
+        boolean hasSource = uri != null && uri.length() > 0;
+        // 两个分支都要设可见性。只设 VISIBLE、不设 GONE 的话，
+        // 停止播放后「片源」那一行会一直留在面板上，显示上一部片子的地址。
+        rowSource.setVisibility(hasSource ? View.VISIBLE : View.GONE);
+        if (hasSource) {
             infoSource.setText(uri);
         }
         if (playing) {
             bindSurfaceIfReady();
         }
+    }
+
+    /**
+     * 状态圆点：绿＝就绪等待，蓝＝播放中，红＝未就绪或出错。
+     *
+     * <p>这个点原本是**固定的绿色**，等于一直在说「一切正常」——
+     * 而组播没绑上（手机根本搜不到设备）时它照样是绿的，
+     * 恰好把最需要被看见的那个故障盖住了。电视上圆点比小字好认得多
+     * （三米外一眼可辨），所以必须让它说真话。
+     */
+    private void applyStatusDot(boolean playing) {
+        int dot;
+        String err = service == null ? null : service.getLastError();
+        if (service == null) {
+            dot = R.drawable.dot_error;
+        } else if (err != null && err.length() > 0) {
+            dot = R.drawable.dot_error;
+        } else if (!service.isDiscoveryReady()) {
+            // 组播没就绪 —— 手机搜不到设备，这是最该被一眼看见的状态
+            dot = R.drawable.dot_error;
+        } else if (playing) {
+            dot = R.drawable.dot_playing;
+        } else {
+            dot = R.drawable.dot_online;
+        }
+        statusDot.setBackgroundResource(dot);
     }
 
     private String describeState() {
@@ -212,11 +243,24 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return getString(R.string.state_waiting);
     }
 
+    /**
+     * 秒 → 时钟文本。
+     *
+     * <p>超过一小时要显示成 {@code h:mm:ss}。原来写死 {@code "%02d:%02d"}，
+     * 一部两小时的电影会显示成 {@code "120:00"} —— 不难懂，但不像个时长，
+     * 而长片恰恰是老盒子最常放的场景。
+     */
     private static String formatClock(int seconds) {
         if (seconds < 0) {
             seconds = 0;
         }
-        return String.format(java.util.Locale.ROOT, "%02d:%02d", seconds / 60, seconds % 60);
+        int hours = seconds / 3600;
+        int minutes = (seconds % 3600) / 60;
+        int secs = seconds % 60;
+        if (hours > 0) {
+            return String.format(java.util.Locale.ROOT, "%d:%02d:%02d", hours, minutes, secs);
+        }
+        return String.format(java.util.Locale.ROOT, "%02d:%02d", minutes, secs);
     }
 
     /** 长 URL 在电视上没法看，截成「开头 … 结尾」的形式 */

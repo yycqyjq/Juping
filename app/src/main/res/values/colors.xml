@@ -12,4 +12,11 @@
     <color name="accent">#FF3DDC84</color>
     <color name="accent_dim">#FF16301F</color>
     <color name="overlay">#B3000000</color>
+
+    <!-- 状态圆点用色。
+         圆点在电视上的作用很实际：站在三米外一眼就能看出设备到底就绪没有，
+         不用凑近读小字。所以它必须真的会变色 ——
+         固定不变的颜色等于骗人。 -->
+    <color name="dot_playing">#FF4C9AFF</color>
+    <color name="dot_error">#FFE5484D</color>
 </resources>

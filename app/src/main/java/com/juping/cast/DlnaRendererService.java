@@ -191,6 +191,15 @@ public class DlnaRendererService extends Service
             player.stop();
         }
         transportState = "STOPPED";
+        // 必须把当前片源清掉。
+        // MainActivity.isPlaying() 在时长归零后会退化成「有没有 URI」来判断，
+        // 而这个字段不清就永远非空 —— 结果是用户按了停止，电视上却还停在
+        // 「正在播放」形态（面板隐藏、只剩播放条）。describeState() 同理，
+        // 它也会因为 URI 非空而继续报「正在播放」。
+        currentUri = "";
+        // 一并清掉上一次的错误：已经停止的传输不该继续挂着旧报错，
+        // 否则 describeState() 会优先显示那句陈旧的「出错：…」。
+        lastError = "";
     }
 
     @Override
@@ -277,15 +286,33 @@ public class DlnaRendererService extends Service
         return lastError;
     }
 
+    /**
+     * 当前媒体 URL。
+     *
+     * <p>这个方法身兼两职：界面拿它显示"正在播放什么"，协议层拿它回答
+     * GetMediaInfo / GetPositionInfo 的 CurrentURI、TrackURI。**必须是同一个
+     * 出处** —— 否则界面显示的和报给控制点的会不一致，排障时极难发现。
+     */
+    @Override
     public String getCurrentUri() {
         return currentUri;
+    }
+
+    /**
+     * 组播是否已就绪。
+     *
+     * <p>没就绪就等于「手机搜不到设备」—— 这是用户最常遇到的故障，
+     * 所以单独暴露成一个明确的布尔值，而不是让界面去解析状态字符串。
+     */
+    public boolean isDiscoveryReady() {
+        return ssdp != null && ssdp.isBound();
     }
 
     public String getBoundInterfaceName() {
         if (ssdp == null) {
             return "(未启动)";
         }
-        if (ssdp.isBound()) {
+        if (isDiscoveryReady()) {
             return ssdp.getBoundInterfaceName();
         }
         // 没绑上时把候选网卡列出来 —— 这才是排障真正需要的信息。
