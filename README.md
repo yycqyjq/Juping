@@ -64,7 +64,12 @@ Juping/
     ├── make_icon.py          生成全部位图资源（纯标准库）
     ├── probe-tv.sh           adb 探测盒子真实硬件信息
     ├── apk_info.py           解析 APK 的包名 / minSdk
-    └── check_sources.py      无 JDK 环境下的源码结构检查
+    ├── check_sources.py      无 JDK 环境下的源码结构检查
+    └── protocol-test/        DLNA 协议层端到端测试（桌面 JVM，不需要真机）
+        ├── run.sh            编译 → 起服务 → 驱动 → 收尾
+        ├── drive.py          43 项一致性检查（原始 socket 精确控字节）
+        ├── ProtocolTestServer.java  在桌面跑真实的 UpnpHttpServer
+        └── android/util/Log.java    android.util.Log 的桌面替身
 ```
 
 ---
@@ -79,20 +84,22 @@ Juping/
 ./tools/build.sh dist         # 两个都编，跑全部核验，成品归集到 dist/
 ./tools/build.sh lint         # 跑 lint（API 兼容性检查）
 ./tools/build.sh checkapi     # 逐个核验平台 API 引用是否在目标版本里存在
+./tools/build.sh protocol     # 跑 DLNA 协议层一致性测试（不需要真机）
 ./tools/build.sh clean
 ```
 
 产物：
 
 ```
-dist/juping-0.1.0-release.apk   ← 装机用这个（43K，已签名）
-dist/juping-0.1.0-debug.apk     ← 排障用（49K，带 debuggable 标记）
+dist/juping-0.1.0-release.apk   ← 装机用这个（44K，已签名）
+dist/juping-0.1.0-debug.apk     ← 排障用（74K，带 debuggable 标记）
 ```
 
-`dist` 目标会在归集后**自动跑两项核验**，任何一项不过就报错退出 —— 免得把一个装不上的包交出去：
+`dist` 目标会在归集后**自动跑三项核验**，任何一项不过就报错退出 —— 免得把一个装不上的包交出去：
 
 1. **签名**：以 API 15 为目标验证（`apksigner verify --min-sdk-version 15`）
 2. **API 兼容性**：逐个核对 dex 里引用的每个平台成员在目标版本里是否真的存在
+3. **协议层**：把真实的 UPnP 服务编到桌面 JVM 上，发真实 DLNA 报文核对响应
 
 如果工具链已在 PATH 里，也可以直接用 wrapper：
 
@@ -195,7 +202,7 @@ adb install -r dist/juping-0.1.0-release.apk
 | `MediaCodec` | API 16 才有 —— 本项目全程不碰它 |
 | AndroidX 任何组件 | 普遍要求 minSdk 19+ → 直接编译不过 |
 
-### 两道独立的验证
+### 三道独立的验证
 
 光靠编译过是不够的 —— 对着新版 android.jar 编译，调用新 API 完全不会报错。
 
@@ -218,8 +225,8 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 当前结果：
 
 ```
-被引用的平台类 51 个 · 方法 161 个 · 字段 3 个
-结论：164 个平台引用全部命中，无 API 越界。
+被引用的平台类 52 个 · 方法 164 个 · 字段 3 个
+结论：167 个平台引用全部命中，无 API 越界。
 ```
 
 为什么要两道：lint 依赖内置数据库，而且本项目关掉了 8 项检查 ——
@@ -229,6 +236,34 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 > （`MediaPlayer.setPlaybackParams`），javac 编译毫无怨言，而检查器精准抓出了它。
 > 一个只会说"通过"的检查器是没有价值的。
 
+**第三道：DLNA 协议层端到端测试**
+
+前两道只管「装得上、跑不崩」，管不了「手机投得进来」。而整套 UPnP
+（SSDP 组播发现 / 设备描述 XML / 三个 SOAP 服务）是**手写的、没用任何库**，
+是全项目最容易出错、又最难在真机上调的部分。
+
+好在 `dlna` 包对 Android 的依赖只有 `android.util.Log` 一个类 ——
+补一个桌面替身，就能把**真实的** `UpnpHttpServer` 编到桌面 JVM 上，
+用原始 socket 发真实 DLNA 报文核对响应：
+
+```bash
+./tools/build.sh protocol
+```
+
+```
+协议一致性：43 / 43 通过
+```
+
+> 这套测试一上来就抓出了两个真 bug：
+> ① 用 `BufferedReader.read(char[])` 读 HTTP body —— 那是**字符数**，
+>    而 `Content-Length` 是**字节数**。含中文标题的投屏请求会一直阻塞到
+>    socket 超时，**一个字节响应都不发**（真机上表现就是"投屏没反应"）。
+> ② `extractActionName()` 把 XML 属性名吞进了 action 名
+>    （`GetTransportInfo xmlns:u="..."`），导致指令全部无法匹配。
+>
+> 这两个 bug 在真机上极难定位 —— 手机端只会显示"投屏失败"，
+> 盒子端没有报错。能在这里拦住，是这套测试最大的价值。
+
 ---
 
 ## 已知边界
@@ -236,8 +271,8 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 - **乐联（LeLink）协议不支持**。B站、抖音、部分腾讯视频走的是乐播的私有闭源协议，开源界没有实现，无法对接。能收的是标准 DLNA / UPnP 推送。
 - **AirPlay 未实现**。iOS 侧目前只能用支持 DLNA 的 App 投。要做 AirPlay 接收需要移植 UxPlay（C/C++，GPLv3），是独立的一大块工作。
 - **镜像（Miracast）不做**。老盒子 Wi-Fi Direct 驱动不稳，正是断联根因，不值得修。
-- **从未在真机上运行过**。已通过五项静态核验（编译 / lint `NewApi` 零命中 /
-  API 引用 164 项全命中 / DEX 版本 035 / 签名在 API 15 上有效），
+- **从未在真机上运行过**。已通过六项静态核验（编译 / lint `NewApi` 零命中 /
+  API 引用 167 项全命中 / DEX 版本 035 / 签名在 API 15 上有效 / DLNA 协议 43 项通过），
   但真机上的组播收发、MediaPlayer 硬解、断联恢复都还没实测。
 
 ---

@@ -2,10 +2,10 @@ package com.juping.cast.dlna;
 
 import android.util.Log;
 
-import java.io.BufferedReader;
+import java.io.BufferedInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -105,13 +105,42 @@ public class UpnpHttpServer extends Thread {
     private void handleConnection(Socket socket) {
         try {
             socket.setSoTimeout(10000);
-            BufferedReader in = new BufferedReader(
-                    new InputStreamReader(socket.getInputStream(), "UTF-8"), 8192);
 
-            String requestLine = in.readLine();
-            if (requestLine == null || requestLine.length() == 0) {
+            // 整个请求按**字节**读，不要用 BufferedReader。
+            //
+            // 这里踩过一个致命的坑：Content-Length 是**字节数**，而 Reader 数的是
+            // **字符数**。用 `in.read(char[], off, contentLength)` 的话，只要 body 里有
+            // 非 ASCII 字符（UTF-8 下一个汉字占 3 字节），读到的字符数就永远凑不够
+            // contentLength，于是阻塞在 read 上直到 socket 超时 —— 结果是连接被关掉，
+            // **一个字节的响应都不发**，控制点那边表现为「投屏失败」。
+            //
+            // 而 SetAVTransportURI 的 CurrentURIMetaData 是一段 DIDL-Lite XML，
+            // 里面几乎必然带着中文片名。也就是说这个 bug 会让绝大多数中文视频
+            // 的投屏直接失败，而日志里只留下一句 Read timed out。
+            InputStream in = new BufferedInputStream(socket.getInputStream(), 8192);
+
+            // ---- 逐字节读请求头，直到空行 ----
+            ByteArrayOutputStream headBuf = new ByteArrayOutputStream(1024);
+            int c;
+            int p1 = -1, p2 = -1, p3 = -1;
+            while ((c = in.read()) >= 0) {
+                headBuf.write(c);
+                if (p3 == '\r' && p2 == '\n' && p1 == '\r' && c == '\n') {
+                    break;
+                }
+                p3 = p2;
+                p2 = p1;
+                p1 = c;
+            }
+
+            // 请求头是纯 ASCII（字段名与值都是 token / URI），用 ISO-8859-1 解不会有
+            // 编码歧义，也不会因为字节被当成非法 UTF-8 而替换成 U+FFFD
+            String head = new String(headBuf.toByteArray(), "ISO-8859-1");
+            String[] headLines = head.split("\r\n");
+            if (headLines.length == 0 || headLines[0].trim().length() == 0) {
                 return;
             }
+            String requestLine = headLines[0];
             Log.d(TAG, "<< " + requestLine);
 
             String[] parts = requestLine.split(" ");
@@ -123,8 +152,11 @@ public class UpnpHttpServer extends Thread {
 
             int contentLength = 0;
             String soapAction = null;
-            String line;
-            while ((line = in.readLine()) != null && line.length() > 0) {
+            for (int i = 1; i < headLines.length; i++) {
+                String line = headLines[i];
+                if (line.length() == 0) {
+                    continue;
+                }
                 // 必须指定 Locale.ROOT。HTTP 头名是 ASCII 协议字段，不属于任何自然语言。
                 // 用默认 locale 的话，土耳其语环境里 "Content-Length".toLowerCase() 会得到
                 // "content-length" 之外的怪东西（I -> ı），头名匹配不上 → 读不到 body →
@@ -137,19 +169,18 @@ public class UpnpHttpServer extends Thread {
                 }
             }
 
-            String body = "";
-            if (contentLength > 0) {
-                char[] buf = new char[contentLength];
-                int read = 0;
-                while (read < contentLength) {
-                    int n = in.read(buf, read, contentLength - read);
-                    if (n < 0) {
-                        break;
-                    }
-                    read += n;
+            // ---- 按字节精确读 body：一个字节不多、一个字节不少 ----
+            byte[] bodyBytes = new byte[contentLength];
+            int read = 0;
+            while (read < contentLength) {
+                int n = in.read(bodyBytes, read, contentLength - read);
+                if (n < 0) {
+                    break;
                 }
-                body = new String(buf, 0, read);
+                read += n;
             }
+            // body 才是可能含非 ASCII 的部分，按 UTF-8 解
+            String body = new String(bodyBytes, 0, read, "UTF-8");
 
             OutputStream out = socket.getOutputStream();
             if ("GET".equals(method)) {
@@ -227,13 +258,48 @@ public class UpnpHttpServer extends Thread {
 
     // --------------------------------------------------------------- POST
 
+    /**
+     * 能应答的 action 白名单。不在这张表里的按 UPnP 规范回 401 Fault。
+     *
+     * <p>为什么要有这张表：原来对未知 action 是「回 200 + 空参数」。
+     * 后果是控制点发来一个我们根本不认识的指令，却收到一个语法上合法、
+     * 语义上毫无意义的响应 —— 手机端只能显示一个笼统的失败，问题无从定位。
+     * 规范要求回 401 Invalid Action，这样控制点至少能给出准确的原因。
+     *
+     * <p>表里除了真正实现的指令，还刻意收了一批「无副作用的探测指令」
+     * （GetTransportSettings / GetDeviceCapabilities / ListPresets 等）——
+     * 它们不需要真正做什么，但控制点经常会先问一遍。对这些回 401 会让
+     * 手机端误判成「这台设备有问题」，所以给它们一个合法的空响应。
+     */
+    private static final String[] KNOWN_ACTIONS = {
+            // AVTransport
+            "SetAVTransportURI", "GetMediaInfo", "GetTransportInfo", "GetPositionInfo",
+            "GetDeviceCapabilities", "GetTransportSettings", "GetCurrentTransportActions",
+            "Stop", "Play", "Pause", "Seek", "Next", "Previous",
+            "SetPlayMode", "SetPlaySpeed",
+            // ConnectionManager
+            "GetProtocolInfo", "GetCurrentConnectionIDs", "GetCurrentConnectionInfo",
+            // RenderingControl
+            "GetVolume", "SetVolume", "GetMute", "SetMute", "ListPresets", "SelectPreset",
+    };
+
+    private static boolean isKnownAction(String action) {
+        for (int i = 0; i < KNOWN_ACTIONS.length; i++) {
+            if (KNOWN_ACTIONS[i].equals(action)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void handlePost(String path, String soapAction, String body, OutputStream out)
             throws IOException {
         String service = lastSegment(path);
         String action = extractActionName(soapAction, body);
         Log.i(TAG, "控制指令: service=" + service + " action=" + action);
 
-        if (action == null) {
+        if (action == null || !isKnownAction(action)) {
+            Log.w(TAG, "不支持的 action，回 401 Fault: " + action);
             writeSoapFault(out, service, "401", "Invalid Action");
             return;
         }
@@ -318,6 +384,24 @@ public class UpnpHttpServer extends Thread {
                     + "<PeerConnectionID>-1</PeerConnectionID>"
                     + "<Direction>Input</Direction><Status>OK</Status>";
         }
+        // ---- 下面这几个是「探测型」指令，控制点常问，但不需要真正做什么。
+        //      回一个语法合法的空壳，比回 401 Fault 更不容易让手机端误判设备有问题。----
+        if ("GetTransportSettings".equals(action)) {
+            return "<PlayMode>NORMAL</PlayMode>"
+                    + "<RecQualityMode>NOT_IMPLEMENTED</RecQualityMode>";
+        }
+        if ("GetDeviceCapabilities".equals(action)) {
+            return "<PlayMedia>NETWORK</PlayMedia>"
+                    + "<RecMedia>NOT_IMPLEMENTED</RecMedia>"
+                    + "<RecQualityModes>NOT_IMPLEMENTED</RecQualityModes>";
+        }
+        if ("GetCurrentTransportActions".equals(action)) {
+            // 如实声明支持的动作，控制点据此决定要不要把暂停键画出来
+            return "<Actions>Play,Stop,Pause,Seek</Actions>";
+        }
+        if ("ListPresets".equals(action)) {
+            return "<CurrentPresetNameList>FactoryDefaults</CurrentPresetNameList>";
+        }
         return "";
     }
 
@@ -337,11 +421,29 @@ public class UpnpHttpServer extends Thread {
             if (open >= 0) {
                 int end = body.indexOf('>', open);
                 if (end > open) {
-                    return body.substring(open + 3, end).trim();
+                    // 只取元素名，不能把属性一起吞进来。
+                    // 原始报文形如：<u:GetTransportInfo xmlns:u="urn:...">
+                    // 如果直接 substring 到 '>'，拿到的会是
+                    //   GetTransportInfo xmlns:u="urn:..."
+                    // 这个字符串既匹配不上任何 action，也会被原样写进响应的标签名里，
+                    // 生成一份畸形 XML。
+                    int i = open + 3;
+                    while (i < end && isXmlNameChar(body.charAt(i))) {
+                        i++;
+                    }
+                    String name = body.substring(open + 3, i);
+                    return name.length() > 0 ? name : null;
                 }
             }
         }
         return null;
+    }
+
+    /** XML 元素名允许的字符 */
+    private static boolean isXmlNameChar(char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                || (c >= '0' && c <= '9')
+                || c == '-' || c == '_' || c == '.' || c == ':';
     }
 
     /** 朴素地抽出 &lt;Tag&gt;value&lt;/Tag&gt; 形式的参数 */

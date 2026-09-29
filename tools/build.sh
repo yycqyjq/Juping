@@ -11,6 +11,7 @@
 #   ./tools/build.sh dist         # 两个都编，跑全部核验，成品归集到 dist/
 #   ./tools/build.sh lint         # 跑 lint（API 兼容性检查）
 #   ./tools/build.sh checkapi     # 逐个核验平台 API 引用是否在目标版本里存在
+#   ./tools/build.sh protocol     # 跑 DLNA 协议层一致性测试（桌面 JVM，不需要真机）
 #   ./tools/build.sh clean        # 清理构建产物
 #
 # 产物：
@@ -112,7 +113,32 @@ verify_api() {
     rm -f "$out"; return 1
 }
 
+# 协议层一致性核验：把真实的 UpnpHttpServer / SsdpResponder 编到桌面 JVM 上，
+# 用原始 socket 发真实 DLNA 报文，核对响应是否合规。
+# 这是第三道判据 —— 前两道（签名、API）只管"装得上、跑不崩"，
+# 这一道管"手机投得进来"。整套 UPnP 是手写的，最容易出错又最难在真机上调，
+# 而它恰好完全不依赖 Android 运行时，所以可以在这里拦住。
+verify_protocol() {
+    if [ ! -x tools/protocol-test/run.sh ]; then
+        echo "  DLNA: 跳过（没有 tools/protocol-test/run.sh）"
+        return 0
+    fi
+    local out
+    out="$(mktemp)"
+    if tools/protocol-test/run.sh >"$out" 2>&1; then
+        echo "  DLNA: $(grep -oE '协议一致性：.*' "$out" | head -1)"
+        rm -f "$out"; return 0
+    fi
+    echo "  !! 协议层核验未通过 —— 手机可能投不进来：" >&2
+    tail -60 "$out" >&2
+    rm -f "$out"; return 1
+}
+
 case "${1:-debug}" in
+    protocol)
+        verify_protocol
+        ;;
+
     clean)
         "$GRADLE_BIN" clean
         rm -rf dist
@@ -184,6 +210,9 @@ PY
             verify_api "$f"
             echo
         done
+        echo "=== 协议层（与芯片/系统版本无关，只需核一次）==="
+        verify_protocol
+        echo
         echo "装机："
         echo "  $ANDROID_HOME/platform-tools/adb install -r dist/juping-$VER-release.apk"
         ;;
