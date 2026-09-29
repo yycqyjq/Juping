@@ -82,8 +82,27 @@ public class MediaPlayerController {
     private boolean userPaused;
     private int retryCount;
     private int stallCount;
-    private long lastPosition = -1L;
-    private long lastProgressAt;
+
+    /**
+     * 看门狗的基准：上一次看到的位置，以及那一刻的时刻。
+     *
+     * <p>{@code volatile} 是必须的：{@code seekTo()} 在控制点的指令线程上跑，
+     * 会刷新 {@link #lastProgressAt}；而 {@link #checkStall()} 在主线程上读它。
+     * 不加的话，指令线程刚写的值主线程可能看不见 —— 表现成「拖完进度条
+     * 立刻被判卡死并重连」，而且**时有时无**，是最难复现的那类 bug。
+     */
+    private volatile long lastPosition = -1L;
+    private volatile long lastProgressAt;
+
+    /**
+     * 最后一次从播放器读到的有效位置，给「未就绪期间」兜底用。
+     *
+     * <p>重连会释放播放器，那段时间 {@code getCurrentPosition()} 读不到东西。
+     * 原来这里返回 0 —— 控制点碰上一次几百毫秒的重连，就会看到进度条
+     * **跳回开头**，恢复后又跳回来。改报最后已知位置，观感上只是"卡了一下"，
+     * 而不是"进度没了"。
+     */
+    private volatile int lastKnownPosition;
 
     /**
      * 已下发但还没落地的 seek 目标（毫秒）；-1 表示当前没有待决的 seek。
@@ -159,10 +178,31 @@ public class MediaPlayerController {
         }
     }
 
-    /** 开始播放一个 URL。重复调用同一 URL 会先停掉旧的。 */
-    public synchronized void play(String url) {
+    /**
+     * 开始播放一个 URL。**同一个 URL 重复调用是幂等的**。
+     *
+     * @return true 表示这次真的重新起了播放；false 表示被幂等忽略
+     */
+    public synchronized boolean play(String url) {
         if (url == null || url.length() == 0) {
-            return;
+            return false;
+        }
+        // ---- 幂等：控制点把同一个地址又发了一遍 ----
+        //
+        // 这不是理论上的边角情况。腾讯视频这类控制点**拖拽进度条时**会重发
+        // SetAVTransportURI（同一个 URL）再跟一条 Seek。而 startInternal()
+        // 第一句就是 releasePlayer()，照单全收的话每次拖拽都会：
+        //   ① 释放 MediaPlayer → 视频层关闭 → 电视上闪一下蓝屏
+        //   ② 重新 prepareAsync → 重新缓冲、位置归零 → 用户看到的"断开重连"
+        //
+        // UPnP AVTransport:1 规范写得很明确：SetAVTransportURI 传入与 CurrentURI
+        // **相同**的地址时，设备不应改变传输状态。所以这里直接忽略。
+        //
+        // 判据是「同地址 **且** 播放器还在」：出过错、已经停掉的播放器必须允许
+        // 重建，否则重发同地址就再也救不回来了。
+        if (url.equals(currentUrl) && (prepared || preparing)) {
+            Log.i(TAG, "收到与当前相同的地址，幂等忽略（不重建播放器）");
+            return false;
         }
         // 先掐掉上一次排期的重连：否则它会在一两秒后拿**旧 URL** 再起一次播放，
         // 把用户刚投上来的新视频顶掉。表现就是"投了新视频，画面跳回上一个"。
@@ -174,7 +214,10 @@ public class MediaPlayerController {
         // 换了片源，上一次的 seek 目标立刻作废 ——
         // 不清的话，新片子的「当前位置」会先报成上一部片子拖到的进度。
         pendingSeekMs = -1L;
+        // 兜底位置同理：不清的话，新片子起播前会先报上一部的进度
+        lastKnownPosition = 0;
         startInternal();
+        return true;
     }
 
     private void startInternal() {
@@ -329,10 +372,31 @@ public class MediaPlayerController {
         if (player == null || !prepared || userPaused) {
             return;
         }
-        // seek 待决期间位置本来就不会动 —— 那是 seek 还没落地，不是卡死。
+        // ---- seek 待决：既豁免看门狗，也负责在超时之后收尾 ----
+        //
+        // 位置在 seek 落地前本来就不会动 —— 那是"还没跳过去"，不是卡死。
         // 不豁免的话，一次慢 seek（老芯片上要好几秒）会被判成卡死并触发重连，
-        // 而重连会把播放拉回开头。用户看到的就是"拖了一下，电视跳回去了"。
-        if (pendingSeekMs >= 0) {
+        // 而重连会把播放拉回开头：用户看到的就是"拖了一下，电视跳回去了"。
+        //
+        // 「清 pendingSeekMs」只在这里做（外加 seekTo / stop / release 那几处显式
+        // 重置）。放到 getPosition() 里会让两个线程同时改这个状态，而它同时又
+        // 兼着看门狗的豁免开关 —— 那种竞态只会表现为"偶发重连"，最难查。
+        long pending = pendingSeekMs;
+        if (pending >= 0) {
+            if (PlaybackPolicy.isSeekExpired(System.currentTimeMillis() - pendingSeekAtMs)) {
+                Log.w(TAG, "seek 到 " + pending + "ms 超过 "
+                        + PlaybackPolicy.SEEK_PENDING_TIMEOUT_MS + "ms 仍未落地，放弃等待");
+                pendingSeekMs = -1L;
+                // 放弃之后必须**立刻把基准对齐到当前位置**。
+                // 不对齐的话，"seek 期间位置没动"这段静止会被下一轮检查直接
+                // 算成卡死 —— 于是超时兜底反而制造出一次多余的重连。
+                lastProgressAt = System.currentTimeMillis();
+                try {
+                    lastPosition = player.getCurrentPosition();
+                } catch (Exception ignored) {
+                    // 读不到就保持原值，下一轮会自行对齐
+                }
+            }
             return;
         }
         try {
@@ -434,6 +498,25 @@ public class MediaPlayerController {
         // 停了就没有"待决的 seek"可言。不清的话，下一次播放的当前位置
         // 会先报成上一次拖到的那个位置。
         pendingSeekMs = -1L;
+        // 兜底位置同理归零：用户已经停止投屏了，界面上不该再挂着进度。
+        // （注意 releasePlayer() 里**不能**清它 —— 重连也会走那条路，
+        //   清了就等于重连期间又跳回 0，正是这次要修的现象。）
+        lastKnownPosition = 0;
+        // 先显式解绑 Surface，再释放播放器。
+        //
+        // 顺序有意义：setSurface(null) 让解码器先交出输出面、视频层随即关闭；
+        // 直接 release() 的话，某些平台上那一层会残留一段时间，
+        // 屏幕上表现为"停了之后还蓝着一块"。
+        //
+        // 只在 stop() 里做，**不放进 releasePlayer()** —— 重连也走那条路，
+        // 而重连期间解绑画面会多闪一次蓝，正是要避免的。
+        if (player != null) {
+            try {
+                player.setSurface(null);
+            } catch (Exception e) {
+                Log.w(TAG, "解绑 Surface 失败", e);
+            }
+        }
         releasePlayer();
         notifyState("STOPPED");
     }
@@ -468,9 +551,12 @@ public class MediaPlayerController {
     public int getPosition() {
         try {
             if (player == null || !prepared) {
-                return 0;
+                // 未就绪（含重连中）→ 报**最后已知位置**，而不是 0。
+                // 报 0 会让控制点的进度条直接跳回开头，而重连往往只要几百毫秒。
+                return lastKnownPosition;
             }
             int raw = player.getCurrentPosition();
+            lastKnownPosition = raw;
             long pending = pendingSeekMs;
             if (pending < 0) {
                 return raw;
@@ -484,12 +570,16 @@ public class MediaPlayerController {
                 // 落地了（真实位置追上来了）或超时了 → 交回真实位置。
                 // 超时这条是诚实兜底：万一这次 seek 永远落不了地，
                 // 不能一直报乐观值 —— 那是谎报军情。
-                pendingSeekMs = -1L;
+                //
+                // **这里刻意不清 pendingSeekMs**：清它等于同时撤销看门狗的豁免，
+                // 而这一句跑在 HTTP 连接线程上、看门狗在主线程 —— 一个字段被两个
+                // 线程读写、读的那方还顺手改状态，就是竞态的温床。
+                // 收尾统一交给 checkStall() 的超时分支。
                 return raw;
             }
             return (int) pending;
         } catch (Exception e) {
-            return 0;
+            return lastKnownPosition;
         }
     }
 

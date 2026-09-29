@@ -270,6 +270,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // 音乐层与画面层互斥。两者同时可见时，不透明的那层会盖住另一层，
         // 表面看"正常"，但底下还在渲染 —— 0.6GB 的盒子上不该浪费这份开销。
         music.setVisibility(mode == MODE_AUDIO ? View.VISIBLE : View.GONE);
+
+        // SurfaceView 在空闲态必须**藏起来**。这不是省资源，是修一个真故障：
+        //
+        // 停止投屏时 MediaPlayer 被释放，视频层随之关闭 —— 而在这类老平台
+        // （MTK 尤其明显）上，视频层没有内容时硬件输出的是一屏**蓝色**。
+        // SurfaceView 一直 match_parent 可见的话，那层蓝就压在面板底下，
+        // 用户看到的是「断开投屏后电视直接蓝屏」，而不是「回到投屏之前的界面」。
+        //
+        // 藏起来会触发 surfaceDestroyed → Surface 被销毁 → 视频层真正移除，
+        // 露出下面的面板。
+        surfaceView.setVisibility(idle ? View.GONE : View.VISIBLE);
         applyTopBar(mode);
 
         String uri = service == null ? null : service.getCurrentUri();

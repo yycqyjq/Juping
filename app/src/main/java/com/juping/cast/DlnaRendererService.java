@@ -186,13 +186,19 @@ public class DlnaRendererService extends Service
         Log.i(TAG, "收到投屏地址: " + uri);
         currentUri = uri;
         lastError = "";
-        transportState = "TRANSITIONING";
         kindFromMetadata = kindOf(metadata);
         // 还没 prepare，先按元数据猜一个；等 onPrepared 拿到真实视频尺寸再定论。
         // 这样从"收到投屏"到"画面出来"这段时间界面形态就是对的，不会先黑一下再跳。
         audioOnly = (kindFromMetadata == KIND_AUDIO);
-        if (player != null) {
-            player.play(uri);
+        boolean restarted = (player != null) && player.play(uri);
+        if (restarted) {
+            transportState = "TRANSITIONING";
+        } else {
+            // 同一个地址又下发了一遍（控制点拖进度条时的常见行为）。
+            // 播放**没有**被打断，状态就不该假装成"正在切换"——
+            // 报 TRANSITIONING 会让顶部条闪一下，控制点也可能据此重画进度条，
+            // 而画面其实一秒都没断。
+            Log.i(TAG, "同一地址重复下发，播放未中断，状态保持不变");
         }
         // 一收到地址就报一次：控制点那边「已收到」的反馈全靠它
         notifyEvent("AVTransport");
@@ -340,13 +346,27 @@ public class DlnaRendererService extends Service
         Map<String, String> vars = new HashMap<String, String>();
         if ("AVTransport".equals(service)) {
             vars.put("TransportState", transportState);
-            // 规范里 TransportStatus 描述"传输是否出错"，正常就是 OK。
-            // 播放失败时应该报 ERROR_OCCURRED，但我们把错误留给 GetTransportInfo
-            // 和界面去说 —— 事件里谎报 OK 是可接受的，谎报状态才是问题。
-            vars.put("TransportStatus", "OK");
+            // 如实报"出没出错"。原来这里写死 "OK" ——
+            // 而「状态字段必须反映现在」是这个项目一以贯之的纪律（见 onPrepared 里
+            // 清 lastError 的那段说明）。控制点拿到 OK 就不会提示用户，
+            // 于是一个正在反复重连的设备在它眼里是"一切正常"。
+            boolean failed = lastError != null && lastError.length() > 0;
+            vars.put("TransportStatus", failed ? "ERROR_OCCURRED" : "OK");
             vars.put("CurrentTrackURI", currentUri == null ? "" : currentUri);
             vars.put("CurrentTrackDuration",
                     UpnpHttpServer.formatTime(getDurationMs()));
+            // 当前位置也进事件。
+            //
+            // 为什么必须带：一部分控制点（国产投屏 SDK 居多）**不轮询
+            // GetPositionInfo**，而是靠事件里的 RelativeTimePosition 更新进度条。
+            // 不给这个字段，它的进度条就从头到尾不动 —— 而设备这边看起来一切正常，
+            // 日志里也全是 200，排查时完全没有线索。
+            //
+            // 事件只在状态变化时发，所以它不会退化成每秒一次的位置流
+            // （那是轮询该干的事）；它的作用是让控制点在**状态切换的那一刻**
+            // 拿到一个正确的位置基准，而不是从 0 开始重新推。
+            vars.put("RelativeTimePosition",
+                    UpnpHttpServer.formatTime(getPositionMs()));
             return vars;
         }
         if ("RenderingControl".equals(service)) {
@@ -388,6 +408,19 @@ public class DlnaRendererService extends Service
             transportState = "STOPPED";
         } else if ("PREPARING".equals(state)) {
             transportState = "TRANSITIONING";
+        } else if ("RECONNECTING".equals(state)) {
+            // 重连中必须报 TRANSITIONING，**不能漏**。
+            //
+            // 漏掉的话 transportState 会停留在上一次的值（通常就是 PLAYING），
+            // 而这段时间播放器已经被释放、位置读不到 —— 控制点看到的是
+            // 「状态说正在播放，进度却一直不动」，它的进度条就卡住了。
+            // 这是"手机上进度条不跟着走"的来源之一。
+            transportState = "TRANSITIONING";
+        } else if ("ERROR".equals(state)) {
+            // 出错同样不能停留在 PLAYING，否则控制点会一直以为还在播。
+            // 注意 TransportState 的合法取值里没有 ERROR ——
+            // "出没出错"是 TransportStatus 的事（见 eventedVars）。
+            transportState = "STOPPED";
         }
         // 这就是 GENA 存在的理由：播放/暂停一变就告诉控制点，
         // 不然手机上的按钮状态要等用户手动刷新才更新。

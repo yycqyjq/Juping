@@ -85,7 +85,7 @@ Juping/
     │   ├── verify-device-selftest.sh  用假 adb 验 verify-on-device.sh 的管道
     │   └── android/util/Log.java    android.util.Log 的桌面替身
     └── policy-test/          播放重连策略测试（纯逻辑，不需要真机）
-        ├── run.sh            编译 + 46 项断言 + 80 条源码级不变量守卫
+        ├── run.sh            编译 + 46 项断言 + 124 条源码级不变量守卫
         └── PolicyTest.java   46 项断言 + 「卡死→重连→又卡死」循环模拟
 ```
 
@@ -109,8 +109,8 @@ Juping/
 产物：
 
 ```
-dist/juping-0.1.1-release.apk   ← 装机用这个（已签名）
-dist/juping-0.1.1-debug.apk     ← 排障用（带 debuggable 标记）
+dist/juping-0.1.2-release.apk   ← 装机用这个（已签名）
+dist/juping-0.1.2-debug.apk     ← 排障用（带 debuggable 标记）
 ```
 
 `dist` 目标会在归集后**自动跑五道闸**，任何一道不过就报错退出 —— 免得把一个装不上的、投不进来的、断联后恢复不了的、或者带着签名密钥的包交出去：
@@ -171,7 +171,7 @@ release 密钥在 `keystore/juping-release.jks`，密码在 `keystore.properties
 可以用这个命令确认：
 
 ```bash
-unzip -p dist/juping-0.1.1-release.apk META-INF/MANIFEST.MF | grep Digest
+unzip -p dist/juping-0.1.2-release.apk META-INF/MANIFEST.MF | grep Digest
 # 应该看到 SHA1-Digest: ...，而不是 SHA-256-Digest
 ```
 
@@ -191,7 +191,7 @@ unzip -p dist/juping-0.1.1-release.apk META-INF/MANIFEST.MF | grep Digest
 
 ```bash
 adb connect <盒子IP>:5555        # 或 USB 连接
-adb install -r dist/juping-0.1.1-release.apk
+adb install -r dist/juping-0.1.2-release.apk
 ```
 
 局域网 adb 需要盒子侧已经开着网络调试并在监听 5555 —— 零售盒子默认是关的，
@@ -199,7 +199,7 @@ adb install -r dist/juping-0.1.1-release.apk
 
 ### 路径 B：U 盘（最通用，不依赖任何调试通道）
 
-1. 把 `dist/juping-0.1.1-release.apk` 拷到 U 盘。**用 FAT32** ——
+1. 把 `dist/juping-0.1.2-release.apk` 拷到 U 盘。**用 FAT32** ——
    老盒子对 exFAT / NTFS 的支持看 ROM 心情，FAT32 是唯一稳的
 2. U 盘插上盒子，用盒子自带的「文件管理 / 本地媒体 / USB 设备」找到这个文件
 3. 点它安装
@@ -213,7 +213,7 @@ adb install -r dist/juping-0.1.1-release.apk
   和源文件比一下大小，不一致就重拷一遍：
 
   ```bash
-  ls -l dist/juping-0.1.1-release.apk   # 记下这个字节数，再和 U 盘里那个比
+  ls -l dist/juping-0.1.2-release.apk   # 记下这个字节数，再和 U 盘里那个比
   # 两个数一致就说明拷完整了。
   # 刻意不写死具体数字 —— 每次重新构建都会变，写死的那份迟早对不上，
   # 反而会让人以为文件拷坏了（这里原来就写着一个过期的字节数）。
@@ -225,7 +225,7 @@ adb install -r dist/juping-0.1.1-release.apk
 
 ```bash
 cd dist && python3 -m http.server 8000
-# 盒子浏览器打开 http://<Mac 的 IP>:8000/juping-0.1.1-release.apk
+# 盒子浏览器打开 http://<Mac 的 IP>:8000/juping-0.1.2-release.apk
 ```
 
 ### 共同前提：允许「未知来源」
@@ -385,7 +385,7 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 
 ```
 被引用的平台类 63 个 · 方法 211 个 · 字段 3 个
-结论：215 个平台引用全部命中，无 API 越界。
+结论：221 个平台引用全部命中，无 API 越界。
 ```
 
 为什么要两道：lint 依赖内置数据库，而且本项目关掉了 8 项检查 ——
@@ -770,6 +770,71 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 > 现在所有源码检查都先过一道 `strip_comments()`（字符串字面量保留）。
 > **凡是「检查源码」的工具，都要先想一遍「它会不会读到注释」。**
 
+### 第九组：投屏基础体验（真机实测报上来的）
+
+2026-09-29 在真机上试出来的三个问题。共同点还是那句话：**编译、运行、日志
+全都正常**，只是功能悄悄失效 —— 而这次连「日志正常」本身都成了障碍，
+因为设备端看不出任何异常，问题全在控制点那一侧的表现里。
+
+**① 网易云音乐搜不到这台设备**
+
+只应答 M-SEARCH、不主动广播的设备，在**被动发现**类控制点眼里等于不存在。
+腾讯视频 / B站 会主动发搜索，所以它们搜得到 —— 于是这个 bug 极容易被误判成
+「某个 App 的兼容性问题」。
+
+修法：按 UPnP DA 1.0 §1.2.2 补上主动广播。加入组播成功后立刻对**每个** NT
+（`upnp:rootdevice` / `uuid:xxx` / 设备类型 / 三个服务类型）各发一次
+`NOTIFY ssdp:alive`，每条重复 3 次对抗 UDP 丢包，之后每 `max-age / 2`
+（900 秒）重播一轮；`shutdown()` 时发 `ssdp:byebye`。
+
+> NOTIFY 与 M-SEARCH 应答有三个关键差异，写错任何一个整条广播都会被**静默丢弃**：
+> 请求行写 `NOTIFY * HTTP/1.1`（不是路径）、用 `NT` + `NTS` 两个头（不是 `ST`）、
+> 并且**必须**带 `HOST` 头（应答里反而没有这个头）。
+
+**② 拖拽进度条 → 电视先蓝屏、再「重连」**
+
+控制点拖进度条时会重发 `SetAVTransportURI`（**同一个** URL）。而 `play()` 原来
+不比较 URL 就调 `startInternal()`，它第一句是 `releasePlayer()` ——
+播放器被释放重建：视频层关闭（蓝屏）+ 重新缓冲（"重连"观感）+ 位置归零。
+
+UPnP AVTransport:1 规范写得很明确：SetAVTransportURI 传入与 CurrentURI
+**相同**的地址时，设备不应改变传输状态。所以 `play()` 改成幂等，
+判据是「同地址 **且** 播放器还在（`prepared || preparing`）」——
+只比 URL 不比状态的话，出错停掉的播放器会再也重建不起来。
+
+**③ 手机上断开连接 → 电视直接蓝屏，不回投屏之前的界面**
+
+两层叠加：`stop()` 释放 MediaPlayer 后视频层关闭，而在这类老平台（MTK 尤其明显）
+上**视频层没有内容时硬件输出的就是一屏蓝色**；偏偏 `SurfaceView` 从不隐藏、
+`panel` 又是透明的 —— 那层蓝就一直压在面板底下。
+
+修法三处配合：空闲态把 `SurfaceView` 藏起来（触发 surface 销毁、视频层真正移除）、
+给 `panel` 补不透明背景、`stop()` 里先 `setSurface(null)` 再 `releasePlayer()`。
+
+**④ 顺带修掉三处「进度同步」的状态机缺陷**
+
+手机上的进度条不跟着走，除了上面几条，还有三个独立成因：
+
+- `onStateChanged` 不处理 `RECONNECTING` / `ERROR` → `transportState` 停留在
+  上一次的值（通常就是 `PLAYING`），而这段时间位置读不到 ——
+  控制点看到的是「正在播放但进度不动」，进度条就卡住了；
+- `getPosition()` 在未就绪时恒返回 `0`，一次几百毫秒的重连就足以让进度条
+  **跳回开头** —— 改成报「最后已知位置」；
+- 事件里没有 `RelativeTimePosition`：一部分控制点（国产投屏 SDK 居多）
+  不轮询 `GetPositionInfo`，只靠事件里的这个字段更新进度条。
+
+> 顺带把 `TransportStatus` 从写死的 `"OK"` 改成如实报 `ERROR_OCCURRED`。
+> 写死的话，一个正在反复重连的设备在控制点眼里是「一切正常」。
+> （`GetTransportInfo` 的 `CurrentTransportStatus` 仍是 `OK`，是已知的不一致，
+> 见「已知边界」。）
+
+> 这一轮又证伪了 **8 处**，每处依然只让**恰好 1 条**断言变红、无连带误伤。
+> 其中一条是**断言自己写错**：判据用了裸的 `'ST: '`，而 `"HOST: "` 里正好
+> 含着 `ST: ` 这个子串（H-O-**ST: **），于是无论代码怎么写它都是红的 ——
+> 判据必须带上引号、落在「构造出来的头名」上。
+> 另有一条是因为**两条断言重叠**（一条是另一条的前提）被合并掉的：
+> 删掉那行会让两条同时变红，而「红了多条」说明分工不清，定位不出问题。
+
 ---
 
 ## 已知边界
@@ -777,12 +842,18 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 - **乐联（LeLink）协议不支持**。B站、抖音、部分腾讯视频走的是乐播的私有闭源协议，开源界没有实现，无法对接。能收的是标准 DLNA / UPnP 推送。
 - **AirPlay 未实现**。iOS 侧目前只能用支持 DLNA 的 App 投。要做 AirPlay 接收需要移植 UxPlay（C/C++，GPLv3），是独立的一大块工作。
 - **镜像（Miracast）不做**。老盒子 Wi-Fi Direct 驱动不稳，正是断联根因，不值得修。
-- **从未在真机上运行过**。已通过九项桌面核验（编译 / lint `NewApi` 零命中 /
-  API 引用 215 项全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
-  DLNA 协议 154 项通过 / 播放策略 46 项断言 + 80 条源码级不变量通过 /
-  控制点自检脚本 33 项通过 / 真机验收脚本管道自测 6 项通过），
-  但真机上的组播收发、MediaPlayer 硬解、断联恢复都还没实测 ——
-  `./tools/verify-on-device.sh` 已经就绪，插上盒子跑一条命令即可验。
+- **`GetTransportInfo` 的 `CurrentTransportStatus` 仍是写死的 `OK`**，和事件里的
+  `TransportStatus`（已改成如实报）不一致。要修得给协议层的 `CommandHandler`
+  加一个方法，会连带改动测试靶机，所以留到下一轮。
+- **真机已经跑过一轮，但覆盖面还很窄**。2026-09-29 在目标盒子上实测过
+  （Android 4.0.4 / MT5880 / 0.6GB），一轮就暴露并修掉了三个基础体验问题
+  （见上面「投屏基础体验」）。桌面核验现在是十项全绿：编译 / lint `NewApi` 零命中 /
+  API 引用 221 项全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
+  DLNA 协议 154 项通过 / 播放策略 46 项断言 + 124 条源码级不变量通过 /
+  控制点自检脚本 33 项通过 / 真机验收脚本管道自测 6 项通过 / 密钥核查干净。
+  但**长时间稳定性**（连续投几小时）、**多控制点同时操作**、
+  **各种编码格式的硬解**都还没验证过 —— `./tools/verify-on-device.sh`
+  一条命令可以跑完基础验收。
 
 ---
 
@@ -859,5 +930,37 @@ adb logcat | grep -E "MediaPlayerController|DlnaRendererService"
   请求被暂存、等准备完成后补发。正常应该紧跟一条
   `prepare 完成，补发暂存的 seek …ms`；**只有前者没有后者**，
   说明 prepare 那一步卡住了（去上面找 `播放错误` 或 `重连`）。
+- **`收到与当前相同的地址，幂等忽略（不重建播放器）`** —— 控制点把**同一个**
+  URL 又下发了一遍（拖进度条时的常见行为）。这条同样是**正常**的：
+  旧代码在这里会释放并重建播放器，电视上先闪一下蓝屏、再重新缓冲 ——
+  用户看到的就是「拖一下就断开重连」。
+- **`已广播 ssdp:alive（6 个 NT × 3 轮）`** —— 启动时的主动广播。
+  **没有这一行**，就意味着网易云音乐那类「只监听广播、不主动搜索」的控制点
+  根本看不到这台设备 —— 而腾讯视频会主动搜索，所以照样搜得到。
+- **`已广播 ssdp:byebye`** —— 服务关闭时通知控制点「我走了」。
+  不发的话，设备会在 App 的列表里挂到缓存过期（最长 30 分钟）。
+
+### 排查「手机上的进度条不跟着走」
+
+这类问题**只能**靠日志定位，而它默认是**关着**的 —— 位置轮询是每秒一次的高频动作，
+无条件打日志会在 0.6GB 的盒子上刷屏、并拖慢响应。需要时动态打开：
+
+```bash
+adb shell setprop log.tag.UpnpHttpServer DEBUG
+adb logcat | grep -E "GetPositionInfo|控制指令"
+```
+
+- **`GetPositionInfo → RelTime=… TrackDuration=… hasMedia=…`** ——
+  控制点每次轮询位置都会打一条。据此可以判断两件事：
+  - **一条都没有** → 控制点压根没在轮询。那它多半是等事件里的
+    `RelativeTimePosition`，问题不在我们这一侧；
+  - **有，但 `RelTime` 一直不变** → 要么位置真的没在走（回去查卡死 / 重连），
+    要么 `TrackDuration` 是 `00:00:00`（拿不到总时长，控制点算不出比例，
+    进度条就画不出来）。
+- **`控制指令: service=AVTransport action=…`** —— 控制点发来的每一条 SOAP。
+  拖进度条时如果看到的是 `SetAVTransportURI` 而不是 `Seek`，
+  就正好印证了上面那条幂等修复要挡的就是这个行为。
+
+> 关掉：`adb shell setprop log.tag.UpnpHttpServer ""`（或重启服务）。
 
 遥控器按「重启服务」可以原地重启整个接收端，不用拔电。

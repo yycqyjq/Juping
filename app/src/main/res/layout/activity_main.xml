@@ -78,11 +78,16 @@
             android:textSize="15sp" />
     </LinearLayout>
 
-    <!-- 主面板：等待投屏时显示 -->
+    <!-- 主面板：等待投屏时显示。
+         这里的 background 必须**不透明**，和上面 music 层是同一个道理：
+         它底下压着 SurfaceView，而停止播放之后那个 Surface 可能残留一层
+         平台特有的底色（老 MTK 上是蓝的）。面板透明的话底色会直接透出来，
+         看起来就像"停止投屏把电视搞坏了"。 -->
     <LinearLayout
         android:id="@+id/panel"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
+        android:background="@color/bg"
         android:orientation="vertical"
         android:gravity="center_vertical"
         android:paddingLeft="48dp"

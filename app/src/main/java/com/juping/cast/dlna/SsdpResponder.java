@@ -68,6 +68,25 @@ public class SsdpResponder extends Thread {
      */
     private static final long BOOT_ID = System.currentTimeMillis() / 1000L;
 
+    /**
+     * 设备描述的有效期（秒）。控制点在这个时间内不会再重新拉描述。
+     *
+     * <p>它和 {@link #ANNOUNCE_INTERVAL_SEC} 是一对：规范要求主动广播的间隔
+     * **不得超过 max-age 的一半**，否则控制点会在两次广播之间把设备判为过期。
+     * 两个数字必须一起看，所以放得这么近。
+     */
+    private static final long CACHE_MAX_AGE_SEC = 1800L;
+
+    /**
+     * 主动广播（{@code ssdp:alive}）的重播间隔（秒）= max-age / 2。
+     *
+     * <p>为什么必须**定期**重播，而不是启动时发一轮就完事：
+     * 被动发现类控制点（网易云音乐等）是**监听广播**来构建设备列表的，
+     * 而 UDP 广播本身会丢包、控制点的缓存也会过期。只发一轮的话，
+     * 「设备明明在线却搜不到」会在每次丢包之后重新出现。
+     */
+    private static final long ANNOUNCE_INTERVAL_SEC = CACHE_MAX_AGE_SEC / 2;
+
     private final String uuid;
     private final String location;   // 设备描述 XML 的 URL
     private final String serverName;
@@ -165,6 +184,16 @@ public class SsdpResponder extends Thread {
             Log.i(TAG, "SSDP 已加入组播组 " + SSDP_ADDR + ":" + boundPort
                     + "，网卡=" + boundInterface.getName()
                     + "（候选 " + candidates.size() + " 张）");
+
+            // 加入组播成功之后**立刻主动广播一轮 ssdp:alive**。
+            //
+            // 这一步是「被动发现」类控制点（网易云音乐等）唯一的入口：
+            // 它们不主动发 M-SEARCH，只监听广播来构建设备列表 ——
+            // 只应答不广播的话，在它们眼里这台设备根本不存在。
+            // 而腾讯视频 / B站 会主动搜索，所以只有前者受影响，
+            // 表现为「有些 App 搜得到、有些搜不到」，极易被误判成 App 的兼容性问题。
+            announceAlive();
+            startAnnouncer();
 
             byte[] buf = new byte[2048];
             while (running) {
@@ -304,10 +333,154 @@ public class SsdpResponder extends Thread {
         }
     }
 
+    // ------------------------------------------------ 主动广播（NOTIFY）
+
+    /**
+     * 广播一轮 {@code ssdp:alive}。
+     *
+     * <p>按 UPnP DA 1.0 §1.2.2，设备入网时要对**每个** NT 各发一次；
+     * 又因为 UDP 不可靠，每条要重复发 3 次（后两次前各等 100ms / 200ms）。
+     *
+     * <p>「每个 NT 都要发」这条和 M-SEARCH 的应答规则是同一个道理：
+     * 控制点靠 NT / USN 建索引，少一个 NT 就等于少一种被发现的方式。
+     */
+    private void announceAlive() {
+        if (socket == null || socket.isClosed()) {
+            return;
+        }
+        // 显式指定从哪张网卡发出去。多网卡设备（盒子同时插着网线和 Wi-Fi）上
+        // 不指定的话，广播可能从另一张网卡发走 —— 手机在 wlan 那一侧就收不到。
+        try {
+            socket.setNetworkInterface(boundInterface);
+        } catch (Exception e) {
+            Log.w(TAG, "设置组播出口网卡失败（继续）: " + e.getMessage());
+        }
+        List<String> targets = announceTargets();
+        for (int round = 0; round < 3; round++) {
+            for (int i = 0; i < targets.size(); i++) {
+                sendNotify(targets.get(i), "ssdp:alive");
+            }
+            if (round < 2) {
+                try {
+                    Thread.sleep(100L * (round + 1));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+        Log.i(TAG, "已广播 ssdp:alive（" + targets.size() + " 个 NT × 3 轮）");
+    }
+
+    /**
+     * 广播 {@code ssdp:byebye} —— 告诉控制点「我走了」。
+     *
+     * <p>不发的话，控制点会一直把设备留在列表里，直到 max-age 过期
+     * （最长 30 分钟）。用户看到的是「App 里挂着个设备，点进去投不了」——
+     * 而这时设备其实早就关掉了，只能靠人去猜。
+     */
+    private void announceByeBye() {
+        if (socket == null || socket.isClosed() || boundInterface == null) {
+            return;
+        }
+        try {
+            socket.setNetworkInterface(boundInterface);
+        } catch (Exception ignored) {
+            // 发得出去就行，指定网卡失败不影响
+        }
+        List<String> targets = announceTargets();
+        for (int i = 0; i < targets.size(); i++) {
+            sendNotify(targets.get(i), "ssdp:byebye");
+        }
+        Log.i(TAG, "已广播 ssdp:byebye（" + targets.size() + " 个 NT）");
+    }
+
+    /** 主动广播要覆盖的 NT 集合 —— 与 M-SEARCH 里 {@code ssdp:all} 的应答集合保持一致 */
+    private List<String> announceTargets() {
+        List<String> out = new ArrayList<String>();
+        out.add("upnp:rootdevice");
+        out.add("uuid:" + uuid);
+        out.add(DEVICE_TYPE);
+        for (int i = 0; i < SERVICE_TYPES.length; i++) {
+            out.add(SERVICE_TYPES[i]);
+        }
+        return out;
+    }
+
+    /**
+     * 定期重播 alive 的守护线程。
+     *
+     * <p>它必须和接收循环分开：接收循环会阻塞在 {@code socket.receive()} 上，
+     * 塞进同一个线程就永远轮不到发送。
+     */
+    private void startAnnouncer() {
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                while (running) {
+                    try {
+                        Thread.sleep(ANNOUNCE_INTERVAL_SEC * 1000L);
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                    if (!running) {
+                        return;
+                    }
+                    announceAlive();
+                }
+            }
+        }, "ssdp-announcer");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private void sendNotify(String nt, String nts) {
+        try {
+            byte[] payload = buildNotify(nt, nts).getBytes("UTF-8");
+            DatagramPacket packet = new DatagramPacket(
+                    payload, payload.length, InetAddress.getByName(SSDP_ADDR), port);
+            socket.send(packet);
+        } catch (Exception e) {
+            Log.w(TAG, "发送 NOTIFY(" + nts + ") 失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 构造一条 NOTIFY 报文。
+     *
+     * <p>和 M-SEARCH 应答有三个关键差异，写错任何一个都会让整条广播被控制点丢弃：
+     * <ol>
+     *   <li>请求行是 {@code NOTIFY * HTTP/1.1} —— 目标写 {@code *}，不是路径</li>
+     *   <li>用 {@code NT} + {@code NTS} 两个头，而应答用的是单个 {@code ST}</li>
+     *   <li>{@code HOST} 头**必须**有（应答里反而没有这个头）</li>
+     * </ol>
+     *
+     * <p>{@code ssdp:byebye} 按规范不带 LOCATION / CACHE-CONTROL / SERVER ——
+     * 设备都要走了，报地址没有意义。
+     */
+    String buildNotify(String nt, String nts) {
+        boolean alive = "ssdp:alive".equals(nts);
+        StringBuilder sb = new StringBuilder();
+        sb.append("NOTIFY * HTTP/1.1\r\n");
+        sb.append("HOST: ").append(SSDP_ADDR).append(":").append(port).append("\r\n");
+        if (alive) {
+            sb.append("CACHE-CONTROL: max-age=").append(CACHE_MAX_AGE_SEC).append("\r\n");
+            sb.append("LOCATION: ").append(location).append("\r\n");
+            sb.append("SERVER: ").append(serverName).append(" UPnP/1.0 Juping/1.0\r\n");
+        }
+        sb.append("NT: ").append(nt).append("\r\n");
+        sb.append("NTS: ").append(nts).append("\r\n");
+        sb.append("USN: ").append(usnFor(nt)).append("\r\n");
+        sb.append("BOOTID.UPNP.ORG: ").append(BOOT_ID).append("\r\n");
+        sb.append("CONFIGID.UPNP.ORG: 1\r\n");
+        sb.append("\r\n");
+        return sb.toString();
+    }
+
     /** 构造一条 M-SEARCH 应答。ST / USN 必须与本次搜索目标对应 */
     String buildResponse(String st) {
         return "HTTP/1.1 200 OK\r\n"
-                + "CACHE-CONTROL: max-age=1800\r\n"
+                + "CACHE-CONTROL: max-age=" + CACHE_MAX_AGE_SEC + "\r\n"
                 + "EXT:\r\n"
                 + "LOCATION: " + location + "\r\n"
                 + "SERVER: " + serverName + " UPnP/1.0 Juping/1.0\r\n"
@@ -343,6 +516,8 @@ public class SsdpResponder extends Thread {
 
     public void shutdown() {
         running = false;
+        // 必须在关 socket **之前**发 byebye —— 关了就没法发出去了。
+        announceByeBye();
         closeQuietly();
     }
 

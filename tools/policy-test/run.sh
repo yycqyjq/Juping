@@ -772,6 +772,294 @@ if ib:
 sys.exit(1 if failed else 0)
 PY
 
+# ── 9. 投屏基础体验的源码级不变量 ──
+# 守二夜真机实测报上来的三个现象。它们和前面几节有个共同点：
+# 编译、运行、日志**全都正常**，只是功能悄悄失效。
+#
+#   ·「网易云音乐根本搜不到这台设备」
+#     只应答 M-SEARCH、不主动广播 NOTIFY 的设备，在**被动发现**类控制点眼里
+#     等于不存在。而腾讯视频 / B站 会主动搜索，所以搜得到 ——
+#     于是这个 bug 极易被误判成"某个 App 的兼容性问题"。
+#
+#   ·「拖拽进度条 → 电视先蓝屏断开、再重连」
+#     控制点拖进度条时会重发 SetAVTransportURI（同一个 URL）。play() 若不比较
+#     URL 就 startInternal()，而它第一句是 releasePlayer() ——
+#     播放器被释放重建：视频层关闭（蓝屏）+ 重新缓冲（"重连"观感）+ 位置归零。
+#
+#   ·「手机上断开连接 → 电视直接蓝屏，不回投屏之前的界面」
+#     SurfaceView 从不隐藏、而 panel 是透明的 —— 停止之后那层已经没有内容的
+#     surface 还压在面板底下。
+python3 - "$CTRL" "$SVC" "$ACT" "$LAYOUT" "$HTTP" <<'PY' || RC=1
+import re, sys, pathlib
+ctrl_path, svc_path, act_path, layout_path, http_path = sys.argv[1:6]
+ctrl = pathlib.Path(ctrl_path).read_text(encoding='utf-8')
+svc = pathlib.Path(svc_path).read_text(encoding='utf-8')
+act = pathlib.Path(act_path).read_text(encoding='utf-8')
+layout = pathlib.Path(layout_path).read_text(encoding='utf-8')
+http = pathlib.Path(http_path).read_text(encoding='utf-8')
+ssdp = pathlib.Path('app/src/main/java/com/juping/cast/dlna/SsdpResponder.java'
+                    ).read_text(encoding='utf-8')
+failed = []
+
+def report(name, ok, detail=''):
+    print('  [%s] %s%s' % ('PASS' if ok else 'FAIL', name,
+                           ('\n         ' + detail) if detail else ''))
+    if not ok:
+        failed.append(name)
+
+def strip_comments(src):
+    """去掉 // 与 /* */ 注释（字符串字面量原样保留）。
+
+    不剥离的话，检查器会匹配到**注释里**的字符串 —— 而注释里恰恰最常写
+    「我们为什么不用 X」，于是"不用 X"被读成"用了 X"。同第 7 / 8 节。
+    """
+    out, i, n = [], 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == '/' and i + 1 < n and src[i + 1] == '/':
+            j = src.find('\n', i)
+            i = n if j < 0 else j
+        elif c == '/' and i + 1 < n and src[i + 1] == '*':
+            j = src.find('*/', i + 2)
+            i = n if j < 0 else j + 2
+        elif c == '"' or c == "'":
+            quote, j = c, i + 1
+            while j < n:
+                if src[j] == '\\':
+                    j += 2
+                    continue
+                if src[j] == quote:
+                    break
+                j += 1
+            out.append(src[i:j + 1])
+            i = j + 1
+        else:
+            out.append(c)
+            i += 1
+    return ''.join(out)
+
+def body_of(src, marker):
+    i = src.find(marker)
+    if i < 0:
+        return None
+    j = src.find('{', i)
+    if j < 0:
+        return None
+    depth, k = 0, j
+    while k < len(src):
+        if src[k] == '{':
+            depth += 1
+        elif src[k] == '}':
+            depth -= 1
+            if depth == 0:
+                return src[j:k + 1]
+        k += 1
+    return None
+
+ssdp_c = strip_comments(ssdp)
+ctrl_c = strip_comments(ctrl)
+svc_c = strip_comments(svc)
+act_c = strip_comments(act)
+http_c = strip_comments(http)
+
+# ---- ① 网易云搜不到：必须有**主动**广播，而不只是应答 ----
+aa = body_of(ssdp_c, 'private void announceAlive()')
+report('SsdpResponder.announceAlive 方法体已找到', aa is not None,
+       '锚点：private void announceAlive()')
+if aa:
+    # 判据落在"真的发出去了"，而不是"有个叫 announceAlive 的方法"——
+    # 空方法同样能骗过后一种写法。
+    report('announceAlive 真的调用了 sendNotify',
+           'sendNotify(' in aa,
+           '只留一个空壳方法的话，设备依然只能被动应答，网易云那类控制点照样搜不到')
+    report('announceAlive 对每个 NT 都发，且重复 3 轮（对抗 UDP 丢包）',
+           'announceTargets()' in aa and re.search(r'round\s*<\s*3', aa) is not None,
+           'UPnP DA 1.0 §1.2.2：每个 NT 各发一次，且每条重复 3 次')
+
+run = body_of(ssdp_c, 'public void run()')
+report('SsdpResponder.run 方法体已找到', run is not None, '锚点：public void run()')
+if run:
+    report('加入组播成功之后才广播 alive',
+           re.search(r'boundPort\s*=\s*actualPort[\s\S]*?announceAlive\(\)',
+                     run) is not None,
+           '必须发生在 joinGroup 成功之后 —— 早于它的话组播还没通，发出去没人收得到')
+    report('有定期重播，不是只发一轮',
+           'startAnnouncer()' in run,
+           'UDP 会丢包、控制点缓存也会过期；只发一轮的话"在线却搜不到"会反复出现')
+
+an = body_of(ssdp_c, 'private void startAnnouncer()')
+report('SsdpResponder.startAnnouncer 方法体已找到', an is not None,
+       '锚点：private void startAnnouncer()')
+if an:
+    report('重播线程真的在循环里调 announceAlive',
+           'announceAlive()' in an,
+           '只 sleep 不发广播的话，重播等于没有')
+
+bn = body_of(ssdp_c, 'String buildNotify(String nt, String nts)')
+report('SsdpResponder.buildNotify 方法体已找到', bn is not None,
+       '锚点：String buildNotify(String nt, String nts)')
+if bn:
+    # 下面三条是 NOTIFY 与 M-SEARCH 应答的**关键差异**。写错任何一个，
+    # 整条广播都会被控制点丢掉 —— 而且丢得毫无提示，日志里什么都看不到。
+    report('NOTIFY 请求行写 *（不是路径）',
+           'NOTIFY * HTTP/1.1' in bn,
+           '规范要求目标写 *；写成路径的话控制点不认')
+    # 判据必须**带引号**，落在"构造的头名"上。
+    # 用裸的 'ST: ' 会误伤 —— "HOST: " 里正好含着 ST: 这个子串
+    # （H-O-S-T-:-空格），于是无论代码怎么写这条都是红的。
+    # 第一版就是这么写的，跑出来才发现：断言写错和代码写错一样费时间。
+    report('NOTIFY 用 NT + NTS 两个头（不是 ST）',
+           '"NT: "' in bn and '"NTS: "' in bn and '"ST: "' not in bn,
+           '应答用 ST、广播用 NT + NTS —— 混用会让报文被直接丢弃')
+    report('NOTIFY 带 HOST 头',
+           'HOST: ' in bn,
+           'HOST 在广播里是**必需**头（应答里反而没有）')
+    report('LOCATION 只出现在 alive 分支（byebye 不带）',
+           re.search(r'alive[\s\S]*?LOCATION', bn) is not None,
+           '设备都要走了，报地址没有意义 —— 规范里 byebye 不带 LOCATION')
+
+sd = body_of(ssdp_c, 'public void shutdown()')
+report('SsdpResponder.shutdown 方法体已找到', sd is not None,
+       '锚点：public void shutdown()')
+if sd:
+    report('shutdown 在关 socket 之前发 byebye',
+           re.search(r'announceByeBye\(\)[\s\S]*?closeQuietly\(\)', sd) is not None,
+           '顺序反了就发不出去（socket 已经关了）。不发 byebye 的话，'
+           '控制点会把设备一直留在列表里直到 max-age 过期，最长 30 分钟')
+
+# ---- ② 拖拽蓝屏：play() 必须幂等 ----
+pl = body_of(ctrl_c, 'public synchronized boolean play(String url)')
+report('MediaPlayerController.play 已改成返回 boolean（可幂等）', pl is not None,
+       '锚点：public synchronized boolean play(String url)')
+if pl:
+    report('play 里比较了 URL',
+           'url.equals(currentUrl)' in pl,
+           '不比较 URL 的话，控制点重发同一个地址就会被当成"换片源"')
+    report('幂等判据要求播放器还在（prepared / preparing）',
+           'prepared' in pl and 'preparing' in pl,
+           '只比 URL 不比状态的话，出错停掉的播放器会再也重建不起来 ——'
+           '重发同地址就彻底救不回来了')
+    # 位置判据：幂等判断必须发生在 startInternal() **之前**。
+    # 只查"有没有 url.equals"是不够的 —— 放到 startInternal 之后的话，
+    # 播放器已经重建完了才 return，等于什么都没拦。
+    idem = pl.find('url.equals(currentUrl)')
+    start = pl.find('startInternal()')
+    report('幂等判断发生在 startInternal 之前（否则拦不住）',
+           idem >= 0 and start >= 0 and idem < start,
+           '放到 startInternal() 之后的话，播放器已经重建完了才返回 ——'
+           '蓝屏和"重连"照样发生。而只看 URL 比较存不存在的断言，'
+           '对这种写法完全无感')
+    report('幂等分支真的 return，不是只打日志',
+           re.search(r'url\.equals\(currentUrl\)[\s\S]{0,400}?return\s+false',
+                     pl) is not None,
+           '只打日志不 return 等于没拦')
+
+osu = body_of(svc_c, 'public void onSetUri(String uri, String metadata)')
+report('DlnaRendererService.onSetUri 方法体已找到', osu is not None,
+       '锚点：public void onSetUri(String uri, String metadata)')
+if osu:
+    report('onSetUri 用 play() 的返回值决定要不要报 TRANSITIONING',
+           'restarted' in osu and 'player.play(uri)' in osu,
+           '同地址重发时播放并没有被打断，却报 TRANSITIONING 的话，'
+           '顶部条会闪一下、控制点还可能据此重画进度条')
+
+# ---- ③ 停止后回面板：SurfaceView 必须藏起来 + panel 必须不透明 ----
+am = body_of(act_c, 'private void applyMode(int mode)')
+report('MainActivity.applyMode 方法体已找到', am is not None,
+       '锚点：private void applyMode(int mode)')
+if am:
+    # 只留这一条强判据，不再单列「调用了 setVisibility」——
+    # 后者是前者的前提，删掉那一行会让两条同时变红，而"红了多条"
+    # 说明判据有重叠，反而定位不出到底哪儿坏了。
+    report('SurfaceView 的可见性跟着 idle 走（空闲时藏起来）',
+           re.search(r'surfaceView\.setVisibility\(idle\s*\?\s*View\.GONE',
+                     am) is not None,
+           '不隐藏的话，停止播放后那个已经没有内容的 Surface 还压在面板底下 ——'
+           '老平台上视频层空着时输出的是**蓝色**，'
+           '用户看到的就是"断开投屏后电视蓝屏"；'
+           '写成恒 VISIBLE、或反过来（idle 时 VISIBLE），同样等于没修')
+
+pm = re.search(r'<LinearLayout\s+android:id="@\+id/panel"[\s\S]{0,400}?>', layout)
+report('layout 里找得到 panel 节点', pm is not None, '锚点：@+id/panel')
+if pm:
+    report('panel 有不透明背景（不是透明面板）',
+           'android:background="@color/bg"' in pm.group(0),
+           '透明面板盖不住底下的 Surface —— 面板显示出来了，'
+           '用户看到的却还是那层蓝')
+
+st = body_of(ctrl_c, 'public synchronized void stop()')
+report('MediaPlayerController.stop 方法体已找到', st is not None,
+       '锚点：public synchronized void stop()')
+if st:
+    report('stop 里显式解绑 Surface，且在 releasePlayer 之前',
+           re.search(r'setSurface\(null\)[\s\S]*?releasePlayer\(\)', st) is not None,
+           '先交出输出面再释放，视频层才会立刻关闭；'
+           '直接 release 的话某些平台上那一层会残留一段时间')
+
+# ---- ④ 进度同步：状态映射 + 位置兜底 + 事件带位置 ----
+sc = body_of(svc_c, 'public void onStateChanged(String state)')
+report('DlnaRendererService.onStateChanged 方法体已找到', sc is not None,
+       '锚点：public void onStateChanged(String state)')
+if sc:
+    report('onStateChanged 认得 RECONNECTING',
+           'RECONNECTING' in sc,
+           '漏掉它的话 transportState 会停留在上一次的值（通常就是 PLAYING），'
+           '而这段时间位置读不到 —— 控制点看到"正在播放但进度不动"，'
+           '它的进度条就卡住了')
+    report('onStateChanged 认得 ERROR',
+           'ERROR' in sc,
+           '出错时同样不能停留在 PLAYING，否则控制点会一直以为还在播')
+
+ev = body_of(svc_c, 'public Map<String, String> eventedVars(String service)')
+report('DlnaRendererService.eventedVars 方法体已找到', ev is not None,
+       '锚点：public Map<String, String> eventedVars(String service)')
+if ev:
+    report('AVTransport 事件里带 RelativeTimePosition',
+           'RelativeTimePosition' in ev,
+           '一部分控制点（国产投屏 SDK 居多）不轮询 GetPositionInfo，'
+           '只靠事件里的这个字段更新进度条 —— 不给就从头到尾不动')
+    report('TransportStatus 如实反映出错与否',
+           re.search(r'TransportStatus[\s\S]{0,200}?ERROR_OCCURRED', ev) is not None,
+           '写死 OK 的话，一个正在反复重连的设备在控制点眼里是"一切正常"')
+
+scpd = re.search(r'SCPD_AV_TRANSPORT =[\s\S]*?</scpd>', http_c)
+report('SCPD_AV_TRANSPORT 找得到', scpd is not None, '锚点：SCPD_AV_TRANSPORT =')
+if scpd:
+    report('SCPD 里 RelativeTimePosition 声明为可事件化',
+           re.search(r'stateVar\("RelativeTimePosition",\s*"string",\s*true\)',
+                     scpd.group(0)) is not None,
+           'SCPD 里没声明的话，事件体里给了控制点也不会用 ——'
+           '声明与实现必须成对出现')
+
+gp = body_of(ctrl_c, 'public int getPosition()')
+report('MediaPlayerController.getPosition 方法体已找到', gp is not None,
+       '锚点：public int getPosition()')
+if gp:
+    report('未就绪时返回最后已知位置，而不是 0',
+           re.search(r'!\s*prepared[\s\S]{0,120}?return\s+lastKnownPosition',
+                     gp) is not None,
+           '返回 0 的话，一次几百毫秒的重连就足以让控制点的进度条**跳回开头**')
+    # 收敛 / 超时的收尾必须交给看门狗，不能在 getPosition 里顺手改状态 ——
+    # 它跑在 HTTP 线程上，看门狗在主线程，两边同时改一个字段就是竞态。
+    report('getPosition 不再自己清 pendingSeekMs（收尾交给看门狗）',
+           re.search(r'isSeekSettled[\s\S]{0,400}?pendingSeekMs\s*=\s*-1',
+                     gp) is None,
+           'getPosition 跑在 HTTP 连接线程上，在这里清字段等于同时撤销看门狗的豁免，'
+           '而豁免开关被两个线程读写只会表现为"偶发重连"')
+
+cs = body_of(ctrl_c, 'private void checkStall()')
+report('MediaPlayerController.checkStall 方法体已找到', cs is not None,
+       '锚点：private void checkStall()')
+if cs:
+    report('seek 超时收尾时把看门狗基准对齐',
+           re.search(r'isSeekExpired[\s\S]{0,500}?lastProgressAt\s*=',
+                     cs) is not None,
+           '不对齐的话，"seek 期间位置没动"这段静止会被下一轮检查直接算成卡死 ——'
+           '于是超时兜底反而制造出一次多余的重连')
+
+sys.exit(1 if failed else 0)
+PY
+
 echo
 if [ "$RC" -ne 0 ]; then
     echo "播放策略核验未通过。" >&2

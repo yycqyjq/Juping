@@ -615,12 +615,30 @@ public class UpnpHttpServer extends Thread {
                 uri = "";
             }
             boolean hasMedia = uri.length() > 0;
+            // 只读一次。原来 RelTime 与 AbsTime 各调一次 handler，
+            // 每次都穿过整个链路去问 MediaPlayer —— 高频轮询下这是白费的开销。
+            long posMs = handler.getPositionMs();
+            long durMs = handler.getDurationMs();
+            // 诊断开关：默认**不打**（isLoggable 为 false 时零开销），
+            // 需要时执行
+            //     adb shell setprop log.tag.UpnpHttpServer DEBUG
+            // 再抓一次 logcat 就能看到控制点每次轮询到底拿到了什么。
+            //
+            // 为什么必须留这个口子：「手机上进度条不动」这类问题**只能**靠这三个数
+            // 定位 —— 到底是控制点压根没来轮询，还是来了但我们报的值不对。
+            // 而无条件打日志不行：位置轮询是每秒一次的高频动作，
+            // 在 0.6GB 的盒子上会刷屏并拖慢响应。
+            if (Log.isLoggable(TAG, Log.DEBUG)) {
+                Log.d(TAG, "GetPositionInfo → RelTime=" + formatTime(posMs)
+                        + " TrackDuration=" + formatTime(durMs)
+                        + " hasMedia=" + hasMedia);
+            }
             return "<Track>" + (hasMedia ? 1 : 0) + "</Track>"
-                    + "<TrackDuration>" + formatTime(handler.getDurationMs()) + "</TrackDuration>"
+                    + "<TrackDuration>" + formatTime(durMs) + "</TrackDuration>"
                     + "<TrackMetaData></TrackMetaData>"
                     + "<TrackURI>" + escapeXml(uri) + "</TrackURI>"
-                    + "<RelTime>" + formatTime(handler.getPositionMs()) + "</RelTime>"
-                    + "<AbsTime>" + formatTime(handler.getPositionMs()) + "</AbsTime>"
+                    + "<RelTime>" + formatTime(posMs) + "</RelTime>"
+                    + "<AbsTime>" + formatTime(posMs) + "</AbsTime>"
                     + "<RelCount>2147483647</RelCount><AbsCount>2147483647</AbsCount>";
         }
         if ("GetMediaInfo".equals(action)) {
@@ -970,6 +988,10 @@ public class UpnpHttpServer extends Thread {
                     + stateVar("TransportStatus", "string", true)
                     + stateVar("CurrentTrackURI", "string", true)
                     + stateVar("CurrentTrackDuration", "string", true)
+                    // 当前位置也必须声明为可事件化：一部分控制点（国产投屏 SDK 居多）
+                    // 不轮询 GetPositionInfo，而是靠事件里的 RelativeTimePosition
+                    // 更新进度条。SCPD 里不声明的话，事件体里就算给了它也不会用。
+                    + stateVar("RelativeTimePosition", "string", true)
                     + stateVar("CurrentURI", "string", false)
                     + stateVar("CurrentURIMetaData", "string", false)
                     + " </serviceStateTable>\n"
