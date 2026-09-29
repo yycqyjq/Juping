@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- TV 界面用深色：客厅观看环境下比浅色舒服，也更符合大屏习惯 -->
+    <color name="bg">#FF0F1419</color>
+    <color name="card">#FF1B2229</color>
+    <color name="card_border">#FF2A343D</color>
+
+    <color name="text_primary">#FFF2F5F7</color>
+    <color name="text_secondary">#FF8B9AA6</color>
+    <color name="text_hint">#FF5C6B77</color>
+
+    <color name="accent">#FF3DDC84</color>
+    <color name="accent_dim">#FF16301F</color>
+    <color name="overlay">#B3000000</color>
+</resources>

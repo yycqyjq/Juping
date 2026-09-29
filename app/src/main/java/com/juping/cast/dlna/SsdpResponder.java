@@ -159,7 +159,11 @@ public class SsdpResponder extends Thread {
                 if (!nif.isUp() || nif.isLoopback()) {
                     continue;
                 }
-                String name = nif.getName().toLowerCase();
+                // 必须指定 Locale.ROOT。默认 locale 下 "eth0".toUpperCase() 在土耳其语环境里
+                // 会得到 "ETH0" 没问题，但 'i'/'I' 的映射会翻转（"wifi" -> "wİFİ"），
+                // 结果就是网卡匹配不到、组播绑不上 —— 表现为「手机搜不到设备」。
+                // 这类 bug 在中文环境永远复现不出来，所以必须提前掐掉。
+                String name = nif.getName().toLowerCase(java.util.Locale.ROOT);
                 if (name.startsWith("eth")) {
                     return nif;             // 有线优先
                 }

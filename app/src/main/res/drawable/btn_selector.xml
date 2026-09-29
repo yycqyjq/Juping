@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  遥控器焦点态：TV 上必须靠 D-pad 操作，焦点必须一眼可见，
+  否则用户根本不知道自己选中的是哪个按钮。
+-->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_focused="true">
+        <shape android:shape="rectangle">
+            <solid android:color="@color/accent" />
+            <corners android:radius="6dp" />
+        </shape>
+    </item>
+    <item android:state_pressed="true">
+        <shape android:shape="rectangle">
+            <solid android:color="@color/accent_dim" />
+            <stroke android:width="1dp" android:color="@color/accent" />
+            <corners android:radius="6dp" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#00000000" />
+            <stroke android:width="1dp" android:color="@color/card_border" />
+            <corners android:radius="6dp" />
+        </shape>
+    </item>
+</selector>

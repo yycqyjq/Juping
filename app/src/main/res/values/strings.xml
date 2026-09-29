@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">聚屏</string>
+    <string name="app_subtitle">投屏接收端</string>
+
+    <string name="label_device">设备名</string>
+    <string name="label_address">地址</string>
+    <string name="label_network">网络</string>
+    <string name="label_state">状态</string>
+    <string name="label_source">片源</string>
+
+    <string name="guide_title">在手机上开始投屏</string>
+    <string name="guide_body">打开腾讯视频 / 哔哩哔哩 / 爱奇艺 / QQ音乐，\n点右上角「投屏」图标，选择下面这个名字</string>
+
+    <string name="btn_restart">重启服务</string>
+
+    <string name="state_starting">启动中…</string>
+    <string name="state_waiting">等待投屏</string>
+    <string name="state_playing">正在播放</string>
+    <string name="state_paused">已暂停</string>
+
+    <!-- 带占位符的格式串。
+         放进资源而不是在代码里拼字符串，是因为拼接出来的文本无法翻译，
+         也无法适配从右到左的语言。 -->
+    <string name="fmt_address">%1$s:%2$d</string>
+    <string name="fmt_progress">%1$s / %2$s</string>
+    <string name="fmt_state_error">出错：%1$s</string>
+
+    <string name="toast_restarted">服务已重启</string>
+    <string name="notify_title">聚屏运行中</string>
+    <string name="notify_text">等待投屏 · 点击打开界面</string>
+</resources>

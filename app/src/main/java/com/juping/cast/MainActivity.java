@@ -5,35 +5,50 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
-import android.graphics.Color;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
-import android.util.TypedValue;
-import android.view.Gravity;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
-import android.view.ViewGroup;
-import android.widget.FrameLayout;
+import android.view.View;
+import android.widget.Button;
+import android.widget.LinearLayout;
 import android.widget.TextView;
+import android.widget.Toast;
 
 /**
- * 接收端界面。
+ * 主界面。
  *
- * <p>老盒子上的界面只有两个作用：
- * <ol>
- *   <li>提供一块 {@link SurfaceView} 给解码器输出画面</li>
- *   <li>显示设备名、IP、绑定的网卡、当前状态 —— 这些是排障时唯一能看到的东西</li>
- * </ol>
- * 所以刻意不做花哨 UI：布局用代码拼，零资源文件，减少出错面。
+ * <p>两种形态，靠播放状态自动切换：
+ * <ul>
+ *   <li><b>等待投屏</b> —— 显示引导 + 设备信息卡片，用户照着做就行</li>
+ *   <li><b>播放中</b> —— 隐藏面板、全屏出画面，顶部留一条半透明状态条</li>
+ * </ul>
+ *
+ * <p>界面刻意做得极简：0.6GB 内存的设备上，每一点 UI 开销都是奢侈的。
+ * 所以没有列表、没有动画、没有图片资源，全部是纯色 shape + 文字。
  */
 public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
+    private static final long REFRESH_INTERVAL_MS = 1500L;
+
     private SurfaceView surfaceView;
-    private TextView statusView;
+    private LinearLayout panel;
+    private LinearLayout overlay;
+    private LinearLayout rowSource;
+    private View statusDot;
+
+    private TextView infoDevice;
+    private TextView infoAddress;
+    private TextView infoNetwork;
+    private TextView infoState;
+    private TextView infoSource;
+    private TextView playingText;
+    private Button btnRestart;
 
     private DlnaRendererService service;
     private boolean bound;
+    private boolean lastPlaying;
 
     private final Handler handler = new Handler();
 
@@ -42,14 +57,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         public void onServiceConnected(ComponentName name, IBinder binder) {
             service = ((DlnaRendererService.LocalBinder) binder).getService();
             bound = true;
-            // Surface 可能还没创建完成。只有 isValid 时才绑定，
-            // 否则交给 surfaceCreated / surfaceChanged 回调去做。
-            SurfaceHolder holder = surfaceView.getHolder();
-            if (service.getPlayer() != null && holder.getSurface() != null
-                    && holder.getSurface().isValid()) {
-                service.getPlayer().setSurface(holder.getSurface());
-            }
-            refreshStatus();
+            bindSurfaceIfReady();
+            refresh();
         }
 
         @Override
@@ -59,92 +68,177 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
     };
 
-    private final Runnable statusTicker = new Runnable() {
+    private final Runnable ticker = new Runnable() {
         @Override
         public void run() {
-            refreshStatus();
-            handler.postDelayed(this, 2000);
+            refresh();
+            handler.postDelayed(this, REFRESH_INTERVAL_MS);
         }
     };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
 
-        FrameLayout root = new FrameLayout(this);
-        root.setBackgroundColor(Color.BLACK);
+        surfaceView = (SurfaceView) findViewById(R.id.surface);
+        panel = (LinearLayout) findViewById(R.id.panel);
+        overlay = (LinearLayout) findViewById(R.id.overlay);
+        rowSource = (LinearLayout) findViewById(R.id.row_source);
+        statusDot = findViewById(R.id.status_dot);
 
-        surfaceView = new SurfaceView(this);
+        infoDevice = (TextView) findViewById(R.id.info_device);
+        infoAddress = (TextView) findViewById(R.id.info_address);
+        infoNetwork = (TextView) findViewById(R.id.info_network);
+        infoState = (TextView) findViewById(R.id.info_state);
+        infoSource = (TextView) findViewById(R.id.info_source);
+        playingText = (TextView) findViewById(R.id.playing_text);
+        btnRestart = (Button) findViewById(R.id.btn_restart);
+
         surfaceView.getHolder().addCallback(this);
-        root.addView(surfaceView, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        statusView = new TextView(this);
-        statusView.setTextColor(Color.WHITE);
-        statusView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        statusView.setPadding(24, 16, 24, 16);
-        statusView.setBackgroundColor(0x88000000);
-        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.gravity = Gravity.TOP;
-        root.addView(statusView, lp);
-
-        setContentView(root);
+        btnRestart.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                restartService();
+            }
+        });
 
         Intent intent = new Intent(this, DlnaRendererService.class);
         startService(intent);
         bindService(intent, connection, Context.BIND_AUTO_CREATE);
+
+        // 让遥控器一进来就有落点，否则 D-pad 方向键没有反应
+        btnRestart.requestFocus();
     }
 
-    /** 状态面板：排障时全靠它 */
-    private void refreshStatus() {
-        StringBuilder sb = new StringBuilder();
-        if (service == null) {
-            sb.append("服务启动中…\n");
-        } else {
-            sb.append("设备名  : ").append(service.getFriendlyName()).append('\n');
-            sb.append("地址    : ").append(service.getLocalIp()).append(":49152\n");
-            sb.append("组播网卡: ").append(service.getBoundInterfaceName()).append('\n');
-            sb.append("状态    : ").append(currentState()).append('\n');
-            String uri = service.getCurrentUri();
-            if (uri != null && uri.length() > 0) {
-                sb.append("片源    : ").append(uri).append('\n');
-            }
-            String err = service.getLastError();
-            if (err != null && err.length() > 0) {
-                sb.append("最近错误: ").append(err).append('\n');
-            }
-        }
-        sb.append("\n在手机的腾讯视频 / B站 里点「投屏」，选择上面的设备名。");
-        statusView.setText(sb.toString());
+    private void restartService() {
+        Intent intent = new Intent(this, DlnaRendererService.class);
+        stopService(intent);
+        startService(intent);
+        Toast.makeText(this, R.string.toast_restarted, Toast.LENGTH_SHORT).show();
     }
 
-    private String currentState() {
+    /** Surface 就绪时才绑定，避免拿到未初始化的 Surface 导致「黑屏但有声音」 */
+    private void bindSurfaceIfReady() {
         if (service == null || service.getPlayer() == null) {
-            return "未就绪";
+            return;
         }
-        return service.getPlayer().getDuration() > 0
-                ? "已连接（" + service.getPlayer().getPosition() / 1000 + "s / "
-                    + service.getPlayer().getDuration() / 1000 + "s）"
-                : "等待投屏";
+        SurfaceHolder holder = surfaceView.getHolder();
+        if (holder.getSurface() != null && holder.getSurface().isValid()) {
+            service.getPlayer().setSurface(holder.getSurface());
+        }
+    }
+
+    private void refresh() {
+        if (service == null) {
+            infoDevice.setText("—");
+            infoAddress.setText("—");
+            infoNetwork.setText("—");
+            infoState.setText(R.string.state_starting);
+            return;
+        }
+
+        infoDevice.setText(service.getFriendlyName());
+        infoAddress.setText(getString(R.string.fmt_address,
+                service.getLocalIp(), service.getHttpPort()));
+        infoNetwork.setText(service.getBoundInterfaceName());
+        infoState.setText(describeState());
+
+        boolean playing = isPlaying();
+        if (playing != lastPlaying) {
+            lastPlaying = playing;
+            applyMode(playing);
+        }
+
+        if (playing && service.getPlayer() != null) {
+            int pos = service.getPlayer().getPosition() / 1000;
+            int dur = service.getPlayer().getDuration() / 1000;
+            playingText.setText(dur > 0
+                    ? getString(R.string.fmt_progress, formatClock(pos), formatClock(dur))
+                    : shortName(service.getCurrentUri()));
+        }
+    }
+
+    private boolean isPlaying() {
+        if (service == null || service.getPlayer() == null) {
+            return false;
+        }
+        if (service.getPlayer().getDuration() > 0) {
+            return true;
+        }
+        String uri = service.getCurrentUri();
+        return uri != null && uri.length() > 0;
+    }
+
+    /** 切换「等待」与「播放」两种形态 */
+    private void applyMode(boolean playing) {
+        panel.setVisibility(playing ? View.GONE : View.VISIBLE);
+        overlay.setVisibility(playing ? View.VISIBLE : View.GONE);
+
+        String uri = service == null ? null : service.getCurrentUri();
+        if (uri != null && uri.length() > 0) {
+            rowSource.setVisibility(View.VISIBLE);
+            infoSource.setText(uri);
+        }
+        if (playing) {
+            bindSurfaceIfReady();
+        }
+    }
+
+    private String describeState() {
+        if (service == null || service.getPlayer() == null) {
+            return getString(R.string.state_starting);
+        }
+        String err = service.getLastError();
+        if (err != null && err.length() > 0) {
+            return getString(R.string.fmt_state_error, err);
+        }
+        // 用 UPnP 传输状态机判断，而不是靠「有没有时长」去猜：
+        //   1) 暂停时 getDuration() 照样 > 0，原来那套判断会把「已暂停」显示成「正在播放」
+        //   2) HLS 直播的 getDuration() 恒为 0，会被误判成「等待投屏」
+        String ts = service.getTransportState();
+        if ("PAUSED_PLAYBACK".equals(ts)) {
+            return getString(R.string.state_paused);
+        }
+        if ("PLAYING".equals(ts) || "TRANSITIONING".equals(ts)) {
+            return getString(R.string.state_playing);
+        }
+        // 兜底：地址已下发但播放器还没进入 PLAYING（缓冲/重连中），也算「正在播放」
+        String uri = service.getCurrentUri();
+        if (uri != null && uri.length() > 0) {
+            return getString(R.string.state_playing);
+        }
+        return getString(R.string.state_waiting);
+    }
+
+    private static String formatClock(int seconds) {
+        if (seconds < 0) {
+            seconds = 0;
+        }
+        return String.format(java.util.Locale.ROOT, "%02d:%02d", seconds / 60, seconds % 60);
+    }
+
+    /** 长 URL 在电视上没法看，截成「开头 … 结尾」的形式 */
+    private static String shortName(String uri) {
+        if (uri == null || uri.length() <= 60) {
+            return uri == null ? "" : uri;
+        }
+        return uri.substring(0, 30) + " … " + uri.substring(uri.length() - 26);
     }
 
     // ---------------------------------------------- SurfaceHolder.Callback
 
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
-        if (service != null && service.getPlayer() != null) {
-            service.getPlayer().setSurface(holder.getSurface());
-        }
+        bindSurfaceIfReady();
     }
 
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-        // Surface 尺寸变化（分辨率切换）时必须重新绑定，
-        // 否则会出现「有声音没画面」—— 老设备上非常典型的一个坑。
-        if (service != null && service.getPlayer() != null) {
-            service.getPlayer().setSurface(holder.getSurface());
-        }
+        // 分辨率切换时 Surface 会重建，必须重新绑定，
+        // 否则出现「有声音没画面」—— 老设备上的典型现象
+        bindSurfaceIfReady();
     }
 
     @Override
@@ -157,13 +251,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     protected void onResume() {
         super.onResume();
-        handler.post(statusTicker);
+        handler.post(ticker);
     }
 
     @Override
     protected void onPause() {
         super.onPause();
-        handler.removeCallbacks(statusTicker);
+        handler.removeCallbacks(ticker);
     }
 
     @Override

@@ -25,8 +25,12 @@ release/
 # 签名文件 —— 绝对不要入库
 *.jks
 *.keystore
+keystore/
 keystore.properties
 signing.properties
+
+# 成品归集目录（里面的 apk 已被上面的规则忽略）
+dist/
 
 # 系统文件
 .DS_Store

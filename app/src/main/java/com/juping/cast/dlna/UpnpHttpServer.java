@@ -125,7 +125,11 @@ public class UpnpHttpServer extends Thread {
             String soapAction = null;
             String line;
             while ((line = in.readLine()) != null && line.length() > 0) {
-                String lower = line.toLowerCase();
+                // 必须指定 Locale.ROOT。HTTP 头名是 ASCII 协议字段，不属于任何自然语言。
+                // 用默认 locale 的话，土耳其语环境里 "Content-Length".toLowerCase() 会得到
+                // "content-length" 之外的怪东西（I -> ı），头名匹配不上 → 读不到 body →
+                // SOAP 控制命令全部静默失败，而日志里看起来一切正常。
+                String lower = line.toLowerCase(java.util.Locale.ROOT);
                 if (lower.startsWith("content-length:")) {
                     contentLength = parseInt(line.substring(15).trim(), 0);
                 } else if (lower.startsWith("soapaction:")) {
@@ -457,7 +461,11 @@ public class UpnpHttpServer extends Thread {
             return "00:00:00";
         }
         long totalSec = ms / 1000;
-        return String.format("%02d:%02d:%02d", totalSec / 3600, (totalSec % 3600) / 60, totalSec % 60);
+        // 指定 Locale.ROOT：%d 在阿拉伯语等 locale 下会输出阿拉伯-印度数字（٠١٢…），
+        // 手机端拿到 "٠٠:٠١:٢٣" 这种时长字符串会直接解析失败。
+        // 协议字段必须锁定成 ASCII。
+        return String.format(java.util.Locale.ROOT, "%02d:%02d:%02d",
+                totalSec / 3600, (totalSec % 3600) / 60, totalSec % 60);
     }
 
     private static String unescapeXml(String s) {

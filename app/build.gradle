@@ -1,5 +1,25 @@
 apply plugin: 'com.android.application'
 
+// ---------------------------------------------------------------------------
+// release 签名配置
+//
+// 密钥库密码不写在构建脚本里，而是从根目录的 keystore.properties 读 ——
+// 那个文件已被 .gitignore 忽略，不会跟着代码一起泄露出去。
+//
+// 为什么密钥用 SHA1withRSA 而不是 SHA256withRSA：
+//   目标设备是 Android 4.0.4（API 15）。API 18 以下的平台对签名算法的支持很窄，
+//   SHA1withRSA 是唯一能确定被认的。keytool 会警告「SHA1 是弱算法」——
+//   这个警告在这里是刻意接受的：这把密钥只用于本地侧载，不参与任何信任链，
+//   SHA-1 的碰撞攻击面在「自己签自己」的场景下不构成实际风险。
+//   兼容性 > 理论强度，这是老设备上的取舍。
+// ---------------------------------------------------------------------------
+def keystorePropsFile = rootProject.file('keystore.properties')
+def keystoreProps = new Properties()
+def hasSigningConfig = keystorePropsFile.exists()
+if (hasSigningConfig) {
+    keystorePropsFile.withInputStream { keystoreProps.load(it) }
+}
+
 android {
     namespace 'com.juping.cast'
     compileSdkVersion 33
@@ -16,6 +36,21 @@ android {
         versionName "0.1.0"
     }
 
+    if (hasSigningConfig) {
+        signingConfigs {
+            release {
+                storeFile rootProject.file(keystoreProps['storeFile'])
+                storePassword keystoreProps['storePassword']
+                keyAlias keystoreProps['keyAlias']
+                keyPassword keystoreProps['keyPassword']
+                // 显式打开 v1（JAR）签名。Android 7.0 以下只认 v1，
+                // 而本机是 4.0.4 —— v2/v3 在这台设备上等于没有签名。
+                v1SigningEnabled true
+                v2SigningEnabled true
+            }
+        }
+    }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_1_8
         targetCompatibility JavaVersion.VERSION_1_8
@@ -24,12 +59,60 @@ android {
     buildTypes {
         release {
             minifyEnabled false
+            if (hasSigningConfig) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 
-    lintOptions {
+    lint {
+        // 构建不要被 lint 拦下来（老 targetSdk 注定会有一堆「过时」提示）
         abortOnError false
         checkReleaseBuilds false
+
+        // ------------------------------------------------------------------
+        // 下面这些是**刻意保留**的 lint 警告，不是漏掉的。
+        // 每一条都写明理由，免得以后有人看到警告顺手「修」出一个真机崩溃。
+        // ------------------------------------------------------------------
+        disable(
+                // targetSdk 19 是刻意选的：本机是 Android 4.0.4，
+                // 抬高 targetSdk 只会引入 5.0+ 的运行时权限与后台限制，有害无益。
+                'ExpiredTargetSdkVersion',
+                'OldTargetApi',
+
+                // PendingIntent 的 FLAG_IMMUTABLE / FLAG_MUTABLE 是 API 23 才有的常量。
+                // 本机 API 15，加上去会在真机上 NoSuchFieldError 直接崩。
+                'UnspecifiedImmutableFlag',
+
+                // layout_marginStart / paddingStart 是 API 17 才有的属性。
+                // 本机 API 15，只能继续用 Left/Right。
+                'RtlHardcoded',
+
+                // 提示「要 Wi-Fi 权限会限制纯以太网电视」—— 但这里躲不掉：
+                // SSDP 需要的 MulticastLock 只有 WifiManager 能提供，
+                // 即使盒子走网线也一样。不是可选项。
+                'LeanbackUsesWifi',
+
+                // 提示「改用 apply()」—— 但 apply() 是异步落盘，
+                // 而这个服务随时可能被低内存杀手干掉，UUID 必须同步写进去。
+                'ApplySharedPref',
+
+                // 通知栏图标是刻意做的纯白剪影（ic_notify），
+                // lint 只看「图标里有非白像素」就报，属于误报。
+                'IconColors',
+
+                // TV 横幅按 Google 规范只有 xhdpi 一档（320×180），
+                // lint 却要求每个密度目录都放一份，属于误报。
+                'IconDensities',
+
+                // android:banner 是 API 21+ 的属性，本机 API 15 上会被忽略。
+                // 但留着它对老设备无害，对 Android TV 设备有用，所以保留。
+                'UnusedAttribute',
+
+                // 根布局的底色与主题底色重叠，多一次全屏填充。
+                // 在老盒子上这点开销可以忽略，而拿掉底色会让面板切换时露出花屏。
+                'Overdraw'
+        )
     }
 }
 

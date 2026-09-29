@@ -105,12 +105,22 @@ public class DlnaRendererService extends Service
             return saved;
         }
         String generated = UUID.randomUUID().toString();
+        //noinspection ApplySharedPref
+        // 这里刻意用 commit() 而不是 apply()：
+        // apply() 是异步落盘，而这个服务随时可能被低内存杀手（LMK）干掉。
+        // 一旦 UUID 没写进去，下次启动就会换一个新的 —— 手机端会看到一堆重复设备。
+        // 一次同步写盘的开销（几毫秒，且只发生一次）远比 UUID 丢失划算。
         sp.edit().putString(KEY_UUID, generated).commit();
         return generated;
     }
 
     private void acquireLocks() {
-        WifiManager wm = (WifiManager) getSystemService(Context.WIFI_SERVICE);
+        // 必须用 getApplicationContext()，不能用 Service 自己的 getSystemService()。
+        // Android N 之前，从 Service 取 WIFI_SERVICE 拿到的 WifiManager 会持有该 Service 的
+        // Context 引用，而 Service 又被 WifiLock/MulticastLock 反向持有 —— 形成引用环，
+        // Service 实例永远回收不掉。这台盒子只有 0.6GB 内存，漏一个 Service 就是致命的。
+        WifiManager wm = (WifiManager) getApplicationContext()
+                .getSystemService(Context.WIFI_SERVICE);
         if (wm == null) {
             Log.e(TAG, "拿不到 WifiManager，组播锁无法获取");
             return;
@@ -133,13 +143,20 @@ public class DlnaRendererService extends Service
 
     private void startForegroundNotification() {
         Intent intent = new Intent(this, MainActivity.class);
+        //noinspection UnspecifiedImmutableFlag
+        // 这里刻意不加 FLAG_IMMUTABLE / FLAG_MUTABLE：
+        // 那两个常量是 API 23 (Android 6.0) 才引入的，本机是 API 15。
+        // 加了会在真机上直接 NoSuchFieldError 崩溃 —— 这就是 lint 警告必须无视的原因。
         PendingIntent pi = PendingIntent.getActivity(
                 this, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT);
         Notification notification = new Notification.Builder(this)
-                .setContentTitle("投屏接收端运行中")
-                .setContentText(friendlyName)
-                .setSmallIcon(android.R.drawable.ic_menu_share)
+                .setContentTitle(getString(R.string.notify_title))
+                .setContentText(getString(R.string.notify_text))
+                // 通知栏小图标必须是「纯白剪影」，不能用带颜色的应用图标：
+                // 从 Android 5.0 起系统会把非白色部分全部涂掉，彩色图标会显示成一个白方块。
+                .setSmallIcon(R.drawable.ic_notify)
                 .setContentIntent(pi)
+                .setOngoing(true)
                 .getNotification();
         startForeground(1, notification);
     }
@@ -275,6 +292,11 @@ public class DlnaRendererService extends Service
 
     public String getLocalIp() {
         return localIp;
+    }
+
+    /** HTTP 端口。暴露出来是为了让界面显示地址时不必再硬编码一遍端口号。 */
+    public int getHttpPort() {
+        return HTTP_PORT;
     }
 
     public String getLastError() {
