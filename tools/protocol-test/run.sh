@@ -130,12 +130,22 @@ python3 "$ROOT/tools/dlna-probe.py" 127.0.0.1 \
     --play 'http://127.0.0.1:9/probe.mp4?token=a&expire=1' \
     >"$PROBE_LOG" 2>&1 || PROBE_RC=$?
 
-if [ "$PROBE_RC" -eq 0 ]; then
-    echo "  $(grep '控制点自检：' "$PROBE_LOG" | tail -1 | sed 's/^ *//')"
-else
+# 断言总数守卫 —— probe 的断言有条件分支，「总数」本身可能被悄悄改变：
+# 实测一条关键断言（播放态回读非空）因分支不再执行，33→32，全过照样全过。
+# 总数对不上就拦下，有意增删后同步这里的期望值。
+PROBE_LINE="$(grep '控制点自检：' "$PROBE_LOG" | tail -1 | sed 's/^ *//')"
+
+if [ "$PROBE_RC" -ne 0 ]; then
     echo "  dlna-probe.py 未全过 —— 注意这是**脚本自身**的问题，不是被测代码的：" >&2
     grep -E '\[FAIL\]' "$PROBE_LOG" >&2 || true
     RC=1
+elif [ "$PROBE_LINE" != "控制点自检：33 / 33 通过" ]; then
+    echo "  !! probe 断言总数变了：期望「控制点自检：33 / 33 通过」，实际「${PROBE_LINE:-（没找到）}」" >&2
+    echo "     总数变少几乎必然是有一条断言被静默跳过或删掉 —— 先查清楚，" >&2
+    echo "     确认是有意增删后再同步这里的期望值。" >&2
+    RC=1
+else
+    echo "  $PROBE_LINE"
 fi
 
 # ── 6. 再验一遍「真机验收脚本」自己 ──

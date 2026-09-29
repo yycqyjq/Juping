@@ -162,7 +162,19 @@ verify_protocol() {
     local out
     out="$(mktemp)"
     if tools/protocol-test/run.sh >"$out" 2>&1; then
-        echo "  DLNA: $(grep -oE '协议一致性：.*' "$out" | head -1)"
+        # 断言总数守卫 —— 防的是「断言被静默删掉」。probe 那次实测：
+        # 一条关键断言因条件分支不再执行，总数 33→32，闸门照样绿 ——
+        # 「全部通过」和「该测的都测了」是两回事。断言只会越写越多，
+        # 总数变少几乎必然有问题；有意增删后同步更新这里的期望值即可。
+        local summary
+        summary="$(grep -oE '协议一致性：[0-9]+ / [0-9]+' "$out" | head -1)"
+        if [ "$summary" != "协议一致性：219 / 219" ]; then
+            echo "  !! 协议断言总数变了：期望「协议一致性：219 / 219」，实际「${summary:-（没找到）}」" >&2
+            echo "     总数变少几乎必然是有一条断言被静默删掉或跳过 —— 先查清楚，" >&2
+            echo "     确认是有意增删后再同步这里的期望值。" >&2
+            rm -f "$out"; return 1
+        fi
+        echo "  DLNA: $summary"
         rm -f "$out"; return 0
     fi
     echo "  !! 协议层核验未通过 —— 手机可能投不进来：" >&2
@@ -172,6 +184,7 @@ verify_protocol() {
     # tail -60 之后什么线索都不剩（第一版就是这样）。
     grep '\[FAIL\]' "$out" >&2 || true
     grep -E '^  · ' "$out" >&2 || true
+    grep '!!' "$out" >&2 || true
     tail -15 "$out" >&2
     rm -f "$out"; return 1
 }
@@ -197,6 +210,7 @@ verify_policy() {
     # 证伪实测：破坏一个中部守卫，tail -60 之后一条线索都不剩。
     grep '\[FAIL\]' "$out" >&2 || true
     grep -E '^  · ' "$out" >&2 || true
+    grep '!!' "$out" >&2 || true
     tail -15 "$out" >&2
     rm -f "$out"; return 1
 }
