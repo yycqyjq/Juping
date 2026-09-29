@@ -35,8 +35,8 @@ android {
         // versionCode 随每次「要拿去装机」的包递增。
         // 覆盖安装本身不看它，但「设置 → 应用信息」里能靠它一眼分辨
         // 装的是哪一版 —— 真机排障时很有用（分不清新旧会白试一轮）。
-        versionCode 3
-        versionName "0.1.2"
+        versionCode 4
+        versionName "0.1.3"
     }
 
     if (hasSigningConfig) {
@@ -61,7 +61,18 @@ android {
 
     buildTypes {
         release {
-            minifyEnabled false
+            // R8：压缩 + 混淆 + 优化。
+            //
+            // 为什么敢在 minSdk 14 上开：本项目**零反射、零第三方依赖**，
+            // 所有引用都是编译期确定的，R8 的静态分析能看全 ——
+            // 不存在"被裁掉但运行时又需要"的东西。规则文件几乎是空的，
+            // 唯一的作用是保住行号和源文件名，见 app/proguard-rules.pro。
+            //
+            // 另一条硬要求：**不能**顺手加 -assumenosideeffects 去删 Log。
+            // 这个项目的排障全靠 logcat，理由写在规则文件里了。
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android.txt'),
+                    'proguard-rules.pro'
             if (hasSigningConfig) {
                 signingConfig signingConfigs.release
             }

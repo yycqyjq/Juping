@@ -11,6 +11,7 @@
 #   ./tools/build.sh dist         # 两个都编，跑全部核验，成品归集到 dist/
 #   ./tools/build.sh lint         # 跑 lint（API 兼容性检查）
 #   ./tools/build.sh checkapi     # 逐个核验平台 API 引用是否在目标版本里存在
+#   ./tools/build.sh dex          # 核验 dex 里框架回调/Thread 子类/协议常量是否完好
 #   ./tools/build.sh protocol     # 跑 DLNA 协议层一致性测试（桌面 JVM，不需要真机）
 #   ./tools/build.sh policy       # 跑播放重连策略测试（纯逻辑 + 源码不变量守卫）
 #   ./tools/build.sh clean        # 清理构建产物
@@ -89,6 +90,11 @@ verify_apk() {
 
 collect() {
     mkdir -p dist
+    # 先清掉旧的。不清的话，升过版本之后 dist/ 里会同时躺着 0.1.2 和 0.1.3 两个包 ——
+    # 而下面那个 `for f in dist/*.apk` 会把**旧的也核一遍**（核的是上一轮的代码，
+    # 却在报告里和新的混在一起，看着像"四个包都验过了"）。
+    # 更糟的是装机时挑错文件：文件名只差一个数字，眼睛一扫就过去了。
+    rm -f dist/*.apk
     cp -f app/build/outputs/apk/release/app-release.apk "dist/juping-$VER-release.apk"
     cp -f app/build/outputs/apk/debug/app-debug.apk     "dist/juping-$VER-debug.apk"
 }
@@ -115,6 +121,31 @@ verify_api() {
     fi
     echo "  !! API 越界 —— 目标版本里不存在这些成员，真机上必崩：" >&2
     sed -n '/找不到/,$p' "$out" >&2
+    rm -f "$out"; return 1
+}
+
+# dex 入口点核验：开了 R8 之后，包里的名字会被改。**编译期能确定的引用**
+# 改得一致就没问题，但框架靠名字回调的那些（Activity 生命周期、Runnable.run、
+# MediaPlayer 的各种 Listener……）改不得 —— 改了就是"装得上、点开就崩"。
+#
+# 这是第五道判据，补的是前面几道**结构上就看不见**的盲区：
+#   · 编译期看不到（源码里名字是对的）
+#   · lint 看不到
+#   · check_api_compat 看不到（它查"平台成员在不在"，不查"我们的名字对不对"）
+#   · 协议层 / 策略层看不到（它们编译的是源码，不是 dex）
+verify_dex() {
+    local apk="$1" out
+    if [ ! -f tools/check_dex_entrypoints.py ]; then
+        echo "  dex入口: 跳过（没有 tools/check_dex_entrypoints.py）"
+        return 0
+    fi
+    out="$(mktemp)"
+    if python3 tools/check_dex_entrypoints.py "$apk" >"$out" 2>&1; then
+        echo "  dex入口: $(grep -oE '结论：.*' "$out" | head -1)"
+        rm -f "$out"; return 0
+    fi
+    echo "  !! dex 入口点核查未通过 —— 这个包装上会崩：" >&2
+    grep -E '^\s+\[FAIL\]' -A 2 "$out" >&2
     rm -f "$out"; return 1
 }
 
@@ -237,6 +268,16 @@ PY
         python3 tools/check_api_compat.py "$APK" 15
         ;;
 
+    dex)
+        APK="app/build/outputs/apk/release/app-release.apk"
+        [ -f "$APK" ] || APK="app/build/outputs/apk/debug/app-debug.apk"
+        if [ ! -f "$APK" ]; then
+            echo "还没有编译产物，先跑 ./tools/build.sh" >&2
+            exit 1
+        fi
+        python3 tools/check_dex_entrypoints.py "$APK"
+        ;;
+
     release)
         if [ ! -f keystore.properties ]; then
             echo "!! 缺少 keystore.properties，release 包会没有签名、装不上。" >&2
@@ -247,6 +288,7 @@ PY
         echo
         echo "=== release APK ==="
         verify_apk app/build/outputs/apk/release/app-release.apk
+        verify_dex app/build/outputs/apk/release/app-release.apk
         ;;
 
     dist)
@@ -263,6 +305,7 @@ PY
             echo "$(basename "$f")"
             verify_apk "$f"
             verify_api "$f"
+            verify_dex "$f"
             echo
         done
         echo "=== 协议层（与芯片/系统版本无关，只需核一次）==="
