@@ -48,6 +48,7 @@ Juping/
 │   ├── java/com/juping/cast/
 │   │   ├── MainActivity.java        电视界面：等待 / 视频 / 音乐 三形态
 │   │   ├── BootReceiver.java        开机自启
+│   │   ├── RenameReceiver.java      设备改名（adb 广播，全项目唯一 exported 指令面）
 │   │   ├── DlnaRendererService.java 前台服务心脏（DLNA + 播放器都挂这儿）
 │   │   ├── dlna/
 │   │   │   ├── NetUtil.java         网卡选择的唯一出处（SSDP 与 LOCATION 共用）
@@ -71,7 +72,7 @@ Juping/
     ├── check_dex_entrypoints.py  反汇编 dex，核 R8 有没有把框架回调名改坏
     ├── protocol-test/        DLNA 协议层端到端测试（桌面 JVM，不需要真机）
     │   ├── run.sh            编译 → 起服务 → 驱动 → 验证两个自检脚本
-    │   ├── drive.py          219 项一致性检查（原始 socket 精确控字节）
+    │   ├── drive.py          230 项一致性检查（原始 socket 精确控字节）
     │   ├── ProtocolTestServer.java  在桌面跑真实的 UpnpHttpServer + SsdpResponder
     │   ├── verify-device-selftest.sh  用假 adb 验 verify-on-device.sh 的管道
     │   └── android/util/Log.java    android.util.Log 的桌面替身
@@ -1378,3 +1379,18 @@ adb logcat | grep -E "GetPositionInfo|控制指令"
 > 关掉：`adb shell setprop log.tag.UpnpHttpServer ""`（或重启服务）。
 
 遥控器按「重启服务」可以原地重启整个接收端，不用拔电。
+
+### 改名
+
+家里有多台盒子时，设备列表里两个「聚屏-MT5880」分不清谁是谁。改名走 adb
+（电视上没有可靠的输入法，弹输入框是给用户添堵）：
+
+```bash
+adb shell am broadcast -a com.juping.cast.APPLY_RENAME --es name "客厅盒子"
+adb shell am broadcast -a com.juping.cast.APPLY_RENAME --es name ""   # 恢复默认名
+```
+
+名字立即生效（服务原地重建两条链路），存盘持久，重启、开机自启后不变；
+改名不影响 UUID，手机端对这台设备的记忆不会断。名字会被剔除控制字符、
+限长 32 字符——这是全项目唯一的 exported 指令面，入口处就该把明显非法
+的输入拒掉。

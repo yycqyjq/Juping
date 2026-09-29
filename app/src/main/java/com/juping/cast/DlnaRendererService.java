@@ -52,9 +52,7 @@ public class DlnaRendererService extends Service
     private static final String TAG = "DlnaRendererService";
 
     private static final String PREFS = "juping";
-    private static final String KEY_UUID = "device_uuid";
-
-    /** DLNA 服务端口。用固定端口方便排查，冲突概率很低。 */
+    private static final String KEY_UUID = "device_uuid";    /** DLNA 服务端口。用固定端口方便排查，冲突概率很低。 */
     private static final int HTTP_PORT = 49152;
 
     /**
@@ -246,7 +244,7 @@ public class DlnaRendererService extends Service
         Log.i(TAG, "服务创建");
 
         uuid = loadOrCreateUuid();
-        friendlyName = "聚屏-" + android.os.Build.MODEL;
+        friendlyName = loadFriendlyName();
         serverName = "Android/" + android.os.Build.VERSION.RELEASE;
         // 必须把 this 传进去：播放器要用它调 MediaPlayer.setWakeMode()，
         // 那一步是"息屏后音乐还能继续放"的唯一保障（理由见
@@ -349,6 +347,42 @@ public class DlnaRendererService extends Service
         // 一次同步写盘的开销（几毫秒，且只发生一次）远比 UUID 丢失划算。
         sp.edit().putString(KEY_UUID, generated).commit();
         return generated;
+    }
+
+    /**
+     * 设备名：改名过的读改名，没改过的用默认「聚屏-&lt;型号&gt;」。
+     *
+     * <p>存盘侧在 {@link RenameReceiver}（adb 广播通道）—— 电视上没有
+     * 可靠的输入法，弹 EditText 是给用户添堵。改名不影响 UUID，
+     * 控制点对这台设备的记忆（订阅、缓存）不会断。
+     */
+    private String loadFriendlyName() {
+        SharedPreferences sp = getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        String saved = sp.getString(RenameReceiver.KEY_FRIENDLY_NAME, "");
+        if (saved != null && saved.trim().length() > 0) {
+            return saved.trim();
+        }
+        return "聚屏-" + android.os.Build.MODEL;
+    }
+
+    /**
+     * 应用改名：重读名字，变了就重建两条链路。
+     *
+     * <p>由 {@code onStartCommand} 在收到 {@link RenameReceiver#ACTION_APPLY_RENAME}
+     * 时调。重建走的是与网络自愈同一条 restartHttp / restartSsdp 路径 ——
+     * 那边已经处理好了「先关旧的再开新的」「图标重给」「SSDP 重播 alive」，
+     * 这里不许另写一份。名字没变（重复广播）就什么都不动。
+     */
+    private void applyRename() {
+        String old = friendlyName;
+        friendlyName = loadFriendlyName();
+        if (friendlyName.equals(old)) {
+            Log.i(TAG, "设备名未变化（" + friendlyName + "），无需重建");
+            return;
+        }
+        restartHttp("设备改名");
+        restartSsdp("设备改名");
+        Log.i(TAG, "设备已改名：" + old + " → " + friendlyName);
     }
 
     private void acquireLocks() {
@@ -1049,6 +1083,11 @@ public class DlnaRendererService extends Service
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // 改名广播：重读名字并重建两条链路，让新名字立即出现在
+        // device.xml 与 SSDP 应答里，不用等重启。
+        if (intent != null && RenameReceiver.ACTION_APPLY_RENAME.equals(intent.getAction())) {
+            applyRename();
+        }
         // 被系统杀掉后自动重启，这是「不断联」的第二道保险
         return START_STICKY;
     }

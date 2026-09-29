@@ -84,5 +84,19 @@
             </intent-filter>
         </receiver>
 
+        <!-- 设备改名（adb 广播通道），用法见 README「改名」一节：
+             am broadcast 用 action com.juping.cast.APPLY_RENAME、extra "name" 传新名。
+             exported=true 是必须的：am shell 广播来自 shell（root 级），不导出收不到。
+             这是全项目唯一的 exported 指令面 —— 入口侧的清洗（控制字符/限长）
+             在 RenameReceiver.sanitize，XML 侧的转义在 device.xml 生成处，两道护栏。 -->
+        <receiver
+            android:name=".RenameReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.juping.cast.APPLY_RENAME" />
+            </intent-filter>
+        </receiver>
+
     </application>
 </manifest>

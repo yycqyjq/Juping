@@ -1750,6 +1750,26 @@ if od2:
            '不注销的话系统一直持有 Receiver，而它内部持有 Service 实例 —— '
            '0.6GB 的盒子上这就是一个永远回收不掉的 Service')
 
+# ---- (9b) 设备改名：先落盘再拉服务，重建走既有路径 ----
+rr_raw = pathlib.Path('app/src/main/java/com/juping/cast/RenameReceiver.java'
+                      ).read_text(encoding='utf-8')
+rr = strip_comments(rr_raw)
+ar = body_of(svc, 'private void applyRename()')
+report('改名先落盘、再拉服务（顺序不能反）',
+       rr is not None and 'putString' in rr
+       and rr.find('putString') < rr.find('startService'),
+       '顺序反了的话，服务 onCreate 读到的还是旧名字 —— 广播等于白发。'
+       '服务被拉起后才读到新名，用户看到的还是「改名失败」')
+report('改名清洗：剔除控制字符、限长（exported 指令面的入口护栏）',
+       rr is not None and '0x20' in rr and 'MAX_LEN' in rr and 'escapeXml' not in rr,
+       'exported 意味着任何应用都能发这条广播。device.xml 侧另有 escapeXml '
+       '兜底，但入口处就该拒掉明显非法的输入；在这里转义反而会把 & 弄成两层转义')
+report('改名重建走 restartHttp/restartSsdp（不另写一份重建）',
+       ar is not None and 'restartHttp("设备改名")' in ar
+       and 'restartSsdp("设备改名")' in ar and 'new UpnpHttpServer' not in ar,
+       '网络自愈那边已经处理好「先关旧的再开新的 / 图标重给 / SSDP 重播 alive」'
+       '—— 同一段重建逻辑写两份，迟早有一处忘了改')
+
 # ---- (10) 媒体元数据：原样回读 + 正确转义 ----
 report('GetMediaInfo 回读元数据且做了转义',
        'getCurrentMetadata()' in http and 'escapeXml(meta)' in http,
