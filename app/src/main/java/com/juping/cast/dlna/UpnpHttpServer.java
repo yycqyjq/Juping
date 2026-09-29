@@ -293,15 +293,17 @@ public class UpnpHttpServer extends Thread {
             return "<CurrentMute>0</CurrentMute>";
         }
         if ("GetProtocolInfo".equals(action)) {
-            // 声明我们能吃哪些格式。老设备能力有限，别吹牛，
-            // 声明过宽会导致控制点推来解不了的流。
+            // 声明能吃的格式。0.6GB 内存 + MT5880 的现实决定了必须「保守声明」：
+            // 声明过宽 → 控制点推来解不动或解不了的流 → 直接卡死或黑屏。
+            // 所以刻意不声明 MKV / MPEG-PS 这类容器解析吃内存的格式。
             return "<Source></Source>"
                     + "<Sink>http-get:*:video/mp4:*,"
-                    + "http-get:*:video/x-matroska:*,"
-                    + "http-get:*:video/mpeg:*,"
                     + "http-get:*:application/vnd.apple.mpegurl:*,"
+                    + "http-get:*:application/x-mpegURL:*,"
                     + "http-get:*:audio/mpeg:*,"
-                    + "http-get:*:image/jpeg:*</Sink>";
+                    + "http-get:*:audio/mp4:*,"
+                    + "http-get:*:image/jpeg:*,"
+                    + "http-get:*:image/png:*</Sink>";
         }
         if ("GetCurrentConnectionIDs".equals(action)) {
             return "<ConnectionIDs>0</ConnectionIDs>";

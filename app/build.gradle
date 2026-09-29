@@ -6,8 +6,8 @@ android {
 
     defaultConfig {
         applicationId "com.juping.cast"
-        // 目标就是 Android 4.0（API 14/15）。如果你实测盒子是 4.2/4.4，
-        // 可以把它调高到 17/19 —— 但先别急着调，低 minSdk 不会有坏处。
+        // 目标设备已实测确认：Android 4.0.4（API 15）、MediaTek MT5880、0.6GB RAM。
+        // minSdk 14 保持不变 —— 覆盖 4.0.4 的同时不排除更老的设备，没有坏处。
         minSdkVersion 14
         // 刻意压低 targetSdk：避免 Android 5.0+ 的运行时权限模型、
         // 后台服务限制等新行为落到这个老设备上。

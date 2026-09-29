@@ -31,10 +31,20 @@ public class MediaPlayerController {
 
     /** 看门狗轮询间隔 */
     private static final long WATCHDOG_INTERVAL_MS = 5000L;
-    /** 位置超过这么久没变，判定为卡死 */
-    private static final long STALL_THRESHOLD_MS = 20000L;
-    /** 最大重连次数，超过后放弃并回调失败 */
+    /** 点播流（时长已知）的卡死判定阈值：位置超过这么久没变就认定卡死 */
+    private static final long STALL_THRESHOLD_VOD_MS = 20000L;
+    /**
+     * 直播流 / 时长未知流的卡死判定阈值。
+     *
+     * <p>HLS 直播和部分分段流上 getCurrentPosition() 可能长时间不增长
+     * （甚至恒为 0）。若沿用点播的 20s 阈值，会把正常播放疯狂误判成卡死，
+     * 反复重连反而把播放打断。所以这里放宽到 60s。
+     */
+    private static final long STALL_THRESHOLD_LIVE_MS = 60000L;
+    /** 错误重连的最大次数，超过后放弃并回调失败 */
     private static final int MAX_RETRY = 5;
+    /** 连续卡死重连的上限 —— 防止「卡死→重连→又卡死」无限循环 */
+    private static final int MAX_STALL_RETRY = 3;
 
     public interface Listener {
         void onStateChanged(String state);
@@ -54,6 +64,7 @@ public class MediaPlayerController {
     private boolean prepared;
     private boolean userPaused;
     private int retryCount;
+    private int stallCount;
     private long lastPosition = -1L;
     private long lastProgressAt;
 
@@ -88,6 +99,7 @@ public class MediaPlayerController {
         }
         currentUrl = url;
         retryCount = 0;
+        stallCount = 0;
         userPaused = false;
         startInternal();
     }
@@ -109,6 +121,7 @@ public class MediaPlayerController {
                 public void onPrepared(MediaPlayer mp) {
                     prepared = true;
                     retryCount = 0;
+                    stallCount = 0;
                     lastPosition = -1L;
                     lastProgressAt = System.currentTimeMillis();
                     mp.start();
@@ -206,14 +219,31 @@ public class MediaPlayerController {
                 lastProgressAt = now;
                 return;
             }
-            if (now - lastProgressAt > STALL_THRESHOLD_MS) {
-                Log.w(TAG, "检测到卡死（位置停在 " + pos + "ms），主动重连");
-                if (listener != null) {
-                    listener.onError("播放卡死，正在重连");
-                }
-                retryCount = 0;     // 卡死是网络问题，重连次数清零
-                scheduleRetry();
+            // 时长已知 → 点播流，用严格阈值；时长未知或为 0 → 直播/分段流，放宽
+            int duration = player.getDuration();
+            long threshold = (duration > 0) ? STALL_THRESHOLD_VOD_MS : STALL_THRESHOLD_LIVE_MS;
+            if (now - lastProgressAt <= threshold) {
+                return;
             }
+
+            stallCount++;
+            if (stallCount > MAX_STALL_RETRY) {
+                Log.w(TAG, "连续卡死 " + stallCount + " 次，停止重连");
+                if (listener != null) {
+                    listener.onError("播放持续卡死，已停止重试");
+                }
+                notifyState("ERROR");
+                return;
+            }
+
+            Log.w(TAG, "检测到卡死（位置停在 " + pos + "ms，时长 " + duration
+                    + "ms），第 " + stallCount + " 次重连");
+            if (listener != null) {
+                listener.onError("播放卡死，正在重连（第 " + stallCount + " 次）");
+            }
+            retryCount = 0;             // 卡死按网络问题处理，错误重连计数清零
+            lastProgressAt = now;       // 重置计时，避免下一轮立刻重复触发
+            scheduleRetry();
         } catch (Exception e) {
             Log.w(TAG, "看门狗检查异常", e);
         }
@@ -251,6 +281,7 @@ public class MediaPlayerController {
     public synchronized void stop() {
         userPaused = false;
         currentUrl = null;
+        stallCount = 0;
         handler.removeCallbacks(watchdog);
         releasePlayer();
         notifyState("STOPPED");
