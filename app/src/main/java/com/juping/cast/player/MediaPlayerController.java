@@ -104,6 +104,24 @@ public class MediaPlayerController {
     private MediaPlayer player;
     private Surface surface;
 
+    /**
+     * native 播放器已不可碰（已 release 或停在错误态）。
+     *
+     * <p>为什么必须有：在错误态/已释放的 MediaPlayer 上调用任何方法
+     * （getDuration/getPosition/……）都会触发一次 -38 错误回调 →
+     * onError → 事件推送又要读播放器 → 再触发…… 25 次/秒的
+     * ERROR 刷屏死循环（真机网易云切歌实测）。置位后所有访问器
+     * 走缓存值，直到 startInternal 造出新实例。
+     */
+    private volatile boolean playerReleased;
+
+    /**
+     * native 播放器已停在错误态且重连已放弃 —— 同样不可碰。
+     * 与 playerReleased 的区别：这个由「重连次数已达上限」置位，
+     * startInternal 造出新实例时解除。
+     */
+    private volatile boolean nativePlayerDead;
+
     private String currentUrl;
     private boolean prepared;
 
@@ -293,9 +311,11 @@ public class MediaPlayerController {
 
     private void startInternal() {
         releasePlayer();
-
+        // 新实例创建时解除「native 不可碰」—— 上一轮错误态的豁免到此为止
+        nativePlayerDead = false;
         try {
             player = new MediaPlayer();
+            playerReleased = false;
             player.setAudioStreamType(AudioManager.STREAM_MUSIC);
             // 把记住的音量与静音状态应用到新的 MediaPlayer 实例上。
             // 重连会重建实例，不重放的话一次断流就会把音量拉回满格、静音也丢了。
@@ -476,6 +496,12 @@ public class MediaPlayerController {
         long delay = PlaybackPolicy.retryDelayMs(retryCount);
         if (delay < 0) {
             Log.w(TAG, "重连次数已达上限（" + PlaybackPolicy.MAX_RETRY + " 次），放弃");
+            // 放弃后**必须置 nativePlayerDead**：放弃意味着播放器停在错误态，
+            // 而此时任何 getDuration/getPosition 调用都会再触发一次 -38 错误
+            // → onError → notifyState("ERROR") → 事件推送又要 getDuration……
+            // 25 次/秒的 ERROR 刷屏死循环（真机网易云切歌实测）。置位后
+            // 所有访问器走缓存/中性值，不再碰 native 播放器。
+            nativePlayerDead = true;
             notifyState("ERROR");
             return;
         }
@@ -667,7 +693,7 @@ public class MediaPlayerController {
      * 光靠错误回调是救不回来的，必须主动探测。
      */
     private void checkStall() {
-        if (player == null || !prepared || userPaused) {
+        if (player == null || playerReleased || nativePlayerDead || !prepared || userPaused) {
             return;
         }
         // ---- seek 待决：既豁免看门狗，也负责在超时之后收尾 ----
@@ -747,7 +773,7 @@ public class MediaPlayerController {
 
     public synchronized void pause() {
         userPaused = true;
-        if (player != null) {
+        if (player != null && !playerReleased && !nativePlayerDead) {
             try {
                 if (player.isPlaying()) {
                     player.pause();
@@ -870,7 +896,7 @@ public class MediaPlayerController {
         hiRaw = ms;
         hiWall = System.currentTimeMillis();
 
-        if (player != null && prepared) {
+        if (player != null && prepared && !playerReleased && !nativePlayerDead) {
             try {
                 player.seekTo(ms);
                 lastProgressAt = pendingSeekAtMs;
@@ -897,9 +923,11 @@ public class MediaPlayerController {
 
     public int getPosition() {
         try {
-            if (player == null || !prepared) {
+            if (player == null || playerReleased || nativePlayerDead || !prepared) {
                 // 未就绪（含重连中）→ 报**最后已知位置**，而不是 0。
                 // 报 0 会让控制点的进度条直接跳回开头，而重连往往只要几百毫秒。
+                // nativePlayerDead：错误态/已释放的播放器碰一下就触发 -38
+                // → onError → ERROR 刷屏死循环（网易云切歌真机踩过）。
                 return lastKnownPosition;
             }
             int raw = player.getCurrentPosition();
@@ -957,7 +985,7 @@ public class MediaPlayerController {
 
     /** 是否真的在播（暂停 / 未就绪 / 释放中都不算）—— 位置外推的前提 */
     private boolean isActivelyPlaying() {
-        if (userPaused || player == null || !prepared) {
+        if (userPaused || player == null || playerReleased || nativePlayerDead || !prepared) {
             return false;
         }
         try {
@@ -969,7 +997,11 @@ public class MediaPlayerController {
 
     public int getDuration() {
         try {
-            return (player != null && prepared) ? player.getDuration() : 0;
+            if (player == null || playerReleased || nativePlayerDead || !prepared) {
+                // 同 getPosition：错误态/已释放的播放器碰一下就是 -38 循环
+                return 0;
+            }
+            return player.getDuration();
         } catch (Exception e) {
             return 0;
         }
@@ -1009,7 +1041,7 @@ public class MediaPlayerController {
      * 于是出现「设了静音、改一下音量就又有声音了」这类只在特定顺序下复现的 bug。
      */
     private void applyVolume() {
-        if (player == null) {
+        if (player == null || playerReleased || nativePlayerDead) {
             return;
         }
         try {
@@ -1054,6 +1086,8 @@ public class MediaPlayerController {
 
     private void releasePlayer() {
         prepared = false;
+        // 释放后 native 播放器不可再碰（任何方法调用都会触发 -38 错误回调）
+        playerReleased = true;
         // 外推锚点随实例一起作废 —— 不清的话，新片源开头的正常位置
         // 会被当成「冻结」而误触发外推。
         hiRaw = -1;

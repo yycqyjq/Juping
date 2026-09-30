@@ -994,14 +994,15 @@ public class DlnaRendererService extends Service
     @Override
     public void onStateChanged(String state) {
         Log.i(TAG, "播放状态: " + state);
+        String mapped = transportState;
         if ("PLAYING".equals(state)) {
-            transportState = "PLAYING";
+            mapped = "PLAYING";
         } else if ("PAUSED".equals(state)) {
-            transportState = "PAUSED_PLAYBACK";
+            mapped = "PAUSED_PLAYBACK";
         } else if ("STOPPED".equals(state)) {
-            transportState = "STOPPED";
+            mapped = "STOPPED";
         } else if ("PREPARING".equals(state)) {
-            transportState = "TRANSITIONING";
+            mapped = "TRANSITIONING";
         } else if ("RECONNECTING".equals(state)) {
             // 重连中必须报 TRANSITIONING，**不能漏**。
             //
@@ -1009,13 +1010,23 @@ public class DlnaRendererService extends Service
             // 而这段时间播放器已经被释放、位置读不到 —— 控制点看到的是
             // 「状态说正在播放，进度却一直不动」，它的进度条就卡住了。
             // 这是"手机上进度条不跟着走"的来源之一。
-            transportState = "TRANSITIONING";
+            mapped = "TRANSITIONING";
         } else if ("ERROR".equals(state)) {
             // 出错同样不能停留在 PLAYING，否则控制点会一直以为还在播。
             // 注意 TransportState 的合法取值里没有 ERROR ——
             // "出没出错"是 TransportStatus 的事（见 eventedVars）。
-            transportState = "STOPPED";
+            mapped = "STOPPED";
         }
+        // 状态去重：没变化就不推事件。
+        //
+        // 不是省流量 —— 是掐断一个真死循环：播放器放弃重连进入错误态后，
+        // 事件推送要读播放器，读一下触发一次 -38 错误 → onError → 又推
+        // ERROR → 又要读…… 25 次/秒刷屏（网易云切歌真机实测）。
+        // LastChange 的语义本来就是「变了才推」。
+        if (mapped.equals(transportState)) {
+            return;
+        }
+        transportState = mapped;
         // 这就是 GENA 存在的理由：播放/暂停一变就告诉控制点，
         // 不然手机上的按钮状态要等用户手动刷新才更新。
         notifyEvent("AVTransport");
