@@ -162,6 +162,20 @@ public class SsdpResponder extends Thread {
     private static final int MAX_PENDING_REPLIES = 32;
 
     /**
+     * 跳过组播加入的开关 —— **仅用于测试基础设施**。
+     *
+     * <p>置位（{@code JUPING_SSDP_NO_MULTICAST=1}）时，{@link #tryBindOnce()}
+     * 只绑定 UDP 端口、**不尝试** {@code joinGroup}。用途是：在本地模拟
+     * 「CI 靶机（Azure VM）所在网络不转发组播」的环境，好让这个修复能被
+     * 验证而不是靠推理。
+     *
+     * <p><b>真机不受影响</b>：Android 上没有环境变量（{@code System.getenv}
+     * 取不到），真机永远不会走这条分支。真机上 joinGroup 失败仍然如实报未绑定。
+     */
+    private static final boolean MULTICAST_DISABLED =
+            "1".equals(System.getenv("JUPING_SSDP_NO_MULTICAST"));
+
+    /**
      * 随机延迟用的发生器。
      *
      * <p>用 {@link Random} 而不是 {@code Math.random()}：这里要的是一个
@@ -192,6 +206,24 @@ public class SsdpResponder extends Thread {
     private MulticastSocket socket;
     private NetworkInterface boundInterface;
     private volatile int boundPort = -1;
+
+    /**
+     * 实际绑上的 UDP 端口（-1 = 未绑）。
+     *
+     * <p>与 {@link #boundPort} 的区别：{@code localPort} 只表示「端口绑上了」，
+     * **独立于**是否加入组播；{@code boundPort} 表示「已加入组播、能被搜到」。
+     * 把这两个事实拆开，是为了让协议测试能在无组播环境（CI）下只靠单播跑通 ——
+     * 测试需要的只是端口能收包。
+     */
+    private volatile int localPort = -1;
+
+    /**
+     * 是否成功加入了组播组。
+     *
+     * <p>false 在真机上就等于「手机搜不到设备」—— 与 {@link #isBound()} 同义，
+     * 但这里把它单列出来，让「端口可用」与「组播可用」两个事实互不牵连。
+     */
+    private volatile boolean multicastJoined = false;
 
     /**
      * 延迟应答用的调度器。
@@ -276,6 +308,32 @@ public class SsdpResponder extends Thread {
         return boundPort > 0 && boundInterface != null;
     }
 
+    /**
+     * UDP 端口是否已经绑上（**独立于**是否加入组播）。
+     *
+     * <p>协议测试只发单播，需要的仅仅是「端口能收包」。CI（Azure VM 不转发组播）
+     * 上 {@code joinGroup} 必失败，但端口照样能绑、单播照样能收 —— 这个方法把
+     * 「端口可用」从「能被搜到」里拆出来，正是修复协议靶机在 CI 上起不来的关键。
+     */
+    public boolean isPortBound() {
+        return localPort > 0;
+    }
+
+    /**
+     * 实际绑上的 UDP 端口；未绑时为 -1。
+     *
+     * <p>注意与 {@link #getBoundPort()} 的区别：后者只在**加入组播成功后**才报
+     * 端口（真机语义：报了就代表能被搜到）；这个只报「端口绑没绑」。
+     */
+    public int getLocalPort() {
+        return localPort;
+    }
+
+    /** 是否成功加入了组播组（真机上 false 就等于「手机搜不到设备」） */
+    public boolean isMulticastJoined() {
+        return multicastJoined;
+    }
+
     @Override
     public void run() {
         try {
@@ -304,8 +362,13 @@ public class SsdpResponder extends Thread {
             // 只应答不广播的话，在它们眼里这台设备根本不存在。
             // 而腾讯视频 / B站 会主动搜索，所以只有前者受影响，
             // 表现为「有些 App 搜得到、有些搜不到」，极易被误判成 App 的兼容性问题。
-            announceAlive();
-            startAnnouncer();
+            //
+            // 只有真的加入了组播组才广播 alive —— 没入组的话发出去没人收得到，
+            // 还会在无组播环境（CI）里刷一堆发送失败日志。单播应答不受影响。
+            if (multicastJoined) {
+                announceAlive();
+                startAnnouncer();
+            }
 
             byte[] buf = new byte[2048];
             while (running) {
@@ -418,27 +481,38 @@ public class SsdpResponder extends Thread {
             // 若仍拿 0 去 joinGroup，加入的会是 "239.255.255.250:0" 这个不存在的组。
             actualPort = s.getLocalPort();
 
-            // 依次尝试候选网卡：某一张 joinGroup 失败就换下一张。
-            // 只试第一张的话，一旦它在本平台上不可用（例如没有 IPv4 的隧道接口），
-            // SSDP 就静默死掉 —— 表现为「手机搜不到设备」，且日志里无从定位。
-            InetSocketAddress group =
-                    new InetSocketAddress(InetAddress.getByName(SSDP_ADDR), actualPort);
-            Exception lastError = null;
-            for (int i = 0; i < candidates.size(); i++) {
-                NetworkInterface nif = candidates.get(i);
-                try {
-                    s.joinGroup(group, nif);
-                    bound = nif;
-                    lastError = null;
-                    break;
-                } catch (Exception e) {
-                    lastError = e;
-                    Log.w(TAG, "网卡 " + nif.getName() + " 加入组播失败，换下一张: " + e.getMessage());
+            if (MULTICAST_DISABLED) {
+                // 测试/无组播环境：跳过 joinGroup。端口已经绑上、单播可收 ——
+                // 协议测试需要的正是这个（见 isPortBound / isMulticastJoined）。
+                Log.w(TAG, "JUPING_SSDP_NO_MULTICAST=1：跳过组播加入，仅绑定端口（测试用）");
+            } else {
+                // 依次尝试候选网卡：某一张 joinGroup 失败就换下一张。
+                // 只试第一张的话，一旦它在本平台上不可用（例如没有 IPv4 的隧道接口），
+                // SSDP 就静默死掉 —— 表现为「手机搜不到设备」，且日志里无从定位。
+                InetSocketAddress group =
+                        new InetSocketAddress(InetAddress.getByName(SSDP_ADDR), actualPort);
+                Exception lastError = null;
+                for (int i = 0; i < candidates.size(); i++) {
+                    NetworkInterface nif = candidates.get(i);
+                    try {
+                        s.joinGroup(group, nif);
+                        bound = nif;
+                        lastError = null;
+                        break;
+                    } catch (Exception e) {
+                        lastError = e;
+                        Log.w(TAG, "网卡 " + nif.getName() + " 加入组播失败，换下一张: " + e.getMessage());
+                    }
                 }
-            }
-            if (bound == null) {
-                reason = "所有候选网卡都无法加入组播组（候选 "
-                        + NetUtil.describeCandidates() + "）: " + lastError;
+                if (bound == null) {
+                    // 加入失败**不是**绑定失败：端口已经绑上、能收单播。
+                    // 「端口已绑」与「组播已加入」是两个独立事实 —— CI（Azure VM
+                    // 不转发组播）与无组播环境靠前者跑通协议测试；真机语义不放松
+                    // （isBound() 仍为 false，界面照旧如实报未绑定）。
+                    Log.w(TAG, "所有候选网卡都无法加入组播组（候选 "
+                            + NetUtil.describeCandidates() + "）: " + lastError
+                            + "；端口仍绑定，仅单播可用");
+                }
             }
         } catch (Exception e) {
             reason = e.toString();
@@ -449,30 +523,56 @@ public class SsdpResponder extends Thread {
             return reason;
         }
 
-        // 只有真正加入成功才对外报告端口。原来在 joinGroup 之前就赋值，
-        // 结果是 UI 显示"已就绪"、实际一个搜索请求都收不到 —— 谎报军情比失败更糟。
+        // socket 已就绪。注意 localPort（=「端口可用」事实）必须在 location 之后
+        // 才置位 —— 否则「isPortBound() 为 true、location 还是 null」的窗口会让
+        // 调用方（协议测试）在地址还没算好时就去读它。
         socket = s;
-        boundInterface = bound;
 
-        // LOCATION 由**实际绑上的那张网卡**算出来，不再由外部传入。
-        //
-        // 外部传进来的 IP 是按「第一张候选网卡」算的，而组播可能绑在第二张上
-        // （第一张 joinGroup 失败时）。两边一分叉，就成了「组播从 eth0 收搜索请求、
-        // 却告诉手机去 wlan0 取设备描述」—— 手机搜得到设备、点进去却拉不到描述，
-        // 表现是「搜到了却投不了屏」。由 bound 直接算，两条链路必然指向同一张网卡。
-        String ip = NetUtil.pickIpv4(bound);
-        location = "http://" + (ip == null ? "0.0.0.0" : ip) + ":" + httpPort
+        if (bound != null) {
+            // ── 真正加入组播（真机主路径）：端口与地址一并就绪 ──
+            // 只有真正加入成功才对外报告"能被搜到"的端口。原来在 joinGroup
+            // 之前就赋值，结果是 UI 显示"已就绪"、实际一个搜索请求都收不到 ——
+            // 谎报军情比失败更糟。
+            boundInterface = bound;
+            multicastJoined = true;
+
+            // LOCATION 由**实际绑上的那张网卡**算出来，不再由外部传入。
+            //
+            // 外部传进来的 IP 是按「第一张候选网卡」算的，而组播可能绑在第二张上
+            // （第一张 joinGroup 失败时）。两边一分叉，就成了「组播从 eth0 收搜索请求、
+            // 却告诉手机去 wlan0 取设备描述」—— 手机搜得到设备、点进去却拉不到描述，
+            // 表现是「搜到了却投不了屏」。由 bound 直接算，两条链路必然指向同一张网卡。
+            String ip = NetUtil.pickIpv4(bound);
+            location = "http://" + (ip == null ? "0.0.0.0" : ip) + ":" + httpPort
+                    + "/upnp/device.xml";
+
+            // boundPort 必须**最后**赋值：isBound() 判的就是它。
+            // 先赋它的话，会出现「isBound() 已经是 true、location 还是 null」的窗口 ——
+            // 而调用方（界面、协议测试）拿到 isBound() 就会立刻去读 LOCATION。
+            // 顺序定死成「绑上 ⇒ 地址已经可用」，别让调用方去处理中间态。
+            boundPort = actualPort;
+            // localPort 同理放在 location 之后：isPortBound() ⇒ 地址已可用。
+            localPort = actualPort;
+
+            Log.i(TAG, "SSDP 已加入组播组 " + SSDP_ADDR + ":" + boundPort
+                    + "，网卡=" + bound.getName()
+                    + "（候选 " + candidates.size() + " 张），LOCATION=" + location);
+            return null;
+        }
+
+        // ── 端口绑上了，但没加入组播（CI / 无组播环境）──
+        // 端口可用是独立事实：单播能收，协议测试得以运行。真机语义不放松：
+        // boundPort 不置位 ⇒ isBound() 仍为 false，界面如实报未绑定。
+        multicastJoined = false;
+        // LOCATION 仍要算出来（否则控制点/测试拿不到设备描述地址）：退回第一张
+        // 候选网卡 —— 组播没通，但「按 LOCATION 抓描述」这条链路要能走完。
+        NetworkInterface locIface = candidates.get(0);
+        String locIp = NetUtil.pickIpv4(locIface);
+        location = "http://" + (locIp == null ? "0.0.0.0" : locIp) + ":" + httpPort
                 + "/upnp/device.xml";
-
-        // boundPort 必须**最后**赋值：isBound() 判的就是它。
-        // 先赋它的话，会出现「isBound() 已经是 true、location 还是 null」的窗口 ——
-        // 而调用方（界面、协议测试）拿到 isBound() 就会立刻去读 LOCATION。
-        // 顺序定死成「绑上 ⇒ 地址已经可用」，别让调用方去处理中间态。
-        boundPort = actualPort;
-
-        Log.i(TAG, "SSDP 已加入组播组 " + SSDP_ADDR + ":" + boundPort
-                + "，网卡=" + bound.getName()
-                + "（候选 " + candidates.size() + " 张），LOCATION=" + location);
+        boundInterface = locIface;
+        // 同主路径：localPort 放最后 —— isPortBound() ⇒ location 已就绪。
+        localPort = actualPort;
         return null;
     }
 
@@ -911,6 +1011,10 @@ public class SsdpResponder extends Thread {
         boundInterface = null;
         location = null;
         socket = null;
+        // 端口与组播两个独立事实一并复位：否则线程退出后 isPortBound() 仍为 true，
+        // 协议测试会去连一个已经关掉的端口。
+        localPort = -1;
+        multicastJoined = false;
 
         // 调度器也一并收掉。不关的话它会挂着一条 daemon 线程，
         // 而里面排着的延迟应答还持有着 socket 的引用 —— 服务都销毁了，

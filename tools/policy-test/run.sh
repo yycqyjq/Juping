@@ -865,13 +865,29 @@ mk = body_of(svc_nc, 'private static String maskUri(String uri)')
 report('maskUri 方法体已找到（currentUri 打码唯一出处）', mk is not None,
        '锚点：private static String maskUri(String uri)')
 if mk:
-    report('maskUri 只抹 query（host/port/path 保留供排障）',
-           "indexOf('?')" in mk and 'substring(0' in mk,
+    report('maskUri 抹掉 query（host/port/path 保留供排障）',
+           "indexOf('?')" in mk and 'substring(0' in mk and '?***' in mk,
            '签名/token 在 ? 之后，整段换成 *** 即不可复原；'
            'host/path 要留着判断是不是 CDN、是哪个文件')
-    report('maskUri 对无 query 的 URL 原样返回（不误伤）',
-           'return uri' in mk,
-           '没有 ? 就没有签名可泄 —— 原样返回，别把排障信息也抹了')
+    report('maskUri 无 ? 时只做 userinfo 打码（不打 query 码）',
+           re.search(r"indexOf\('\?'\)[\s\S]{0,200}?return masked", mk) is not None,
+           '没有 ? 就没有签名可泄 —— 返回前只保留 userinfo 打码结果')
+    report('maskUri 调用了 maskUserInfo（userinfo 凭证也打码）',
+           'maskUserInfo(' in mk,
+           '私有 NAS 的 http://user:pass@host/path 会把 basic-auth 凭证写进 URL，'
+           '同样不能出现在无鉴权的 /status 上')
+mu = body_of(svc_nc, 'private static String maskUserInfo(String uri)')
+report('maskUserInfo 方法体已找到', mu is not None,
+       '锚点：private static String maskUserInfo(String uri)')
+if mu:
+    report('maskUserInfo 只在 authority 段内认 @（扫到 / ? # 就停，不误伤 path 的 @）',
+           '"://"' in mu and "indexOf('@'" in mu
+           and "c == '/'" in mu and "c == '#'" in mu,
+           'authority 到第一个 / ? # 为止；否则 /a@b.mp4 这种 path 里的 @ '
+           '会被误当成 userinfo，把路径也抹了')
+    report('maskUserInfo 把 user:pass 换成 ***（保留 @ 与 host）',
+           '"***"' in mu and 'substring' in mu,
+           '凭证换成 ***，@ 与 host/port/path 全部保留 —— 排障信息不丢')
 
 ct = body_of(ctrl, 'private void scheduleContentTypeProbe(final MediaPlayer mp, final String url)')
 if ct:
@@ -1826,6 +1842,35 @@ if cq:
            '界面显示"设备已就绪"，实际一个搜索请求都收不到。'
            '用户唯一能做的是重启盒子，而重启之后"看起来"又好了，'
            '于是永远定位不到')
+
+# ---- (6b) SSDP：端口绑定与组播加入是两个独立事实 ----
+# CI（GitHub runner = Azure VM）不转发组播，joinGroup 必失败。若把「加入组播」
+# 当作靶机就绪的必要条件，protocol 闸门在 CI 上永远红 —— 而本机（组播正常）
+# 复现不出来。这几条把「端口可用」与「能被搜到」钉成两个独立事实。
+_tbo2 = body_of(ssdp, 'private String tryBindOnce()')
+report('SsdpResponder 暴露 isPortBound / isMulticastJoined（端口与组播拆开）',
+       'public boolean isPortBound()' in ssdp
+       and 'public boolean isMulticastJoined()' in ssdp
+       and 'public int getLocalPort()' in ssdp,
+       'CI 上 joinGroup 必失败，但端口能绑、单播能收 —— 把「端口可用」'
+       '从「能被搜到」里拆出来，协议靶机才不会 exit 3')
+report('tryBindOnce 不再把 joinGroup 失败当作「绑定失败」',
+       _tbo2 is not None and 'bound == null' in _tbo2 and 'closeSocket(s)' in _tbo2
+       and re.search(r'reason\s*=\s*"所有候选网卡都无法加入组播组', _tbo2) is None,
+       '把加入失败赋给 reason 会进重试循环、端口永远不对外报 —— CI 上靶机就起不来。'
+       '现在只有 bind 本身失败才 return reason')
+report('有跳过组播的测试开关（JUPING_SSDP_NO_MULTICAST）',
+       'JUPING_SSDP_NO_MULTICAST' in ssdp,
+       '用来在本地模拟 CI 的无组播环境，让这个修复能被验证而不是靠推理')
+_pts = pathlib.Path('tools/protocol-test/ProtocolTestServer.java').read_text(encoding='utf-8')
+_pts = strip_comments(_pts)
+report('协议靶机 READY 只要求端口绑定（不要求加入组播）',
+       'ssdp.isPortBound()' in _pts and 'ssdp.getLocalPort()' in _pts,
+       'READY 若还要求 isBound()，CI 上（joinGroup 失败）靶机会 exit 3 ——'
+       '这正是 protocol 闸门在 CI 上一直红的根因')
+report('协议靶机把组播状态单独报告（不静默）',
+       'isMulticastJoined()' in _pts,
+       '让人一眼看出是「单播模式」还是「真机同款的组播模式」，而不是靠猜')
 
 # ---- (7) 服务侧：自检与销毁顺序 ----
 ct = body_of(svc, 'private void checkThreadsAlive()')

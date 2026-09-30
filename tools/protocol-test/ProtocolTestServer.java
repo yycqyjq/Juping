@@ -19,10 +19,14 @@ import java.util.Map;
  * TCP → HTTP 头解析 → SOAP 解析 → 指令分发 → 业务回调拿到正确参数。
  * 中间任何一环出错都会在日志里露出来。
  *
- * <p>SSDP 那半边同样跑真货：真的 bind 端口、真的 joinGroup、真的收 M-SEARCH、
- * 真的构造应答。驱动用**单播** UDP 把 M-SEARCH 发到该端口即可 ——
+ * <p>SSDP 那半边同样跑真货：真的 bind 端口、真的收 M-SEARCH、真的构造应答。
+ * 驱动用**单播** UDP 把 M-SEARCH 发到该端口即可 ——
  * 绑定在通配地址上的 socket 一样能收到单播包，于是整套逻辑都能在桌面上验证，
  * 不必依赖组播（组播在不同平台/网络环境下的行为差异很大，不适合做自动化断言）。
+ *
+ * <p>因此 READY 只要求「端口绑上了」，**不要求** joinGroup 成功：CI（Azure VM
+ * 不转发组播）上 joinGroup 必失败，但端口能绑、单播能收，测试照样跑得通。
+ * 组播是否加入作为独立事实单独报告（stderr 警告 + READY 行末尾一列）。
  *
  * <p>用法：java ProtocolTestServer &lt;http端口&gt; &lt;指令日志路径&gt; &lt;ssdp端口&gt;
  */
@@ -385,20 +389,33 @@ public class ProtocolTestServer {
                 Thread.sleep(50);
             }
         }
-        // 给 SSDP 线程一点时间完成 bind + joinGroup。
+        // 给 SSDP 线程一点时间完成 bind（以及可能的 joinGroup）。
         // 它现在带重试，正常情况下第一次就成；这里多等一会儿是为了让
         // 「第一次失败、第二次成功」这种平台差异不会把测试变成偶发红。
         long ssdpDeadline = System.currentTimeMillis() + 5000;
-        while (System.currentTimeMillis() < ssdpDeadline && !ssdp.isBound()) {
+        while (System.currentTimeMillis() < ssdpDeadline && !ssdp.isPortBound()) {
             Thread.sleep(50);
         }
 
-        // 驱动需要知道实际绑上的 SSDP 端口（传 0 时由系统分配）
-        int actualSsdpPort = ssdp.getBoundPort();
+        // 驱动只需要**端口能收单播** —— 不要求加入组播。
+        //
+        // CI（GitHub runner = Azure VM）的网络不转发组播，joinGroup 必失败；
+        // 但端口照样能绑、单播照样能收。把「端口可用」与「组播已加入」拆开，
+        // 靶机就不会再因为「组播绑不上」而 exit 3 —— 这正是 protocol 闸门
+        // 在 CI 上一直红的根因。
+        int actualSsdpPort = ssdp.getLocalPort();
         if (actualSsdpPort <= 0) {
-            System.err.println("SSDP 未绑定成功（网卡选择失败？）");
+            System.err.println("SSDP 端口未绑定成功（网卡选择失败？）");
             System.err.flush();
             System.exit(3);
+        }
+
+        // 组播是否加入**单独报告**：不影响测试能否跑，但要让人一眼看出
+        // 现在是「单播模式」还是「真机同款的组播模式」—— 而不是靠猜。
+        if (!ssdp.isMulticastJoined()) {
+            System.err.println("警告：SSDP 未加入组播组（端口已绑，仅单播可用）——"
+                    + "CI / 无组播环境下正常；本机模拟见 JUPING_SSDP_NO_MULTICAST=1");
+            System.err.flush();
         }
 
         String location = ssdp.getLocation();
@@ -408,14 +425,16 @@ public class ProtocolTestServer {
             System.exit(3);
         }
 
-        // READY <http端口> <实际ssdp端口> <location> <绑定网卡> <绑定网卡的IPv4>
+        // READY <http端口> <实际ssdp端口> <location> <绑定网卡> <绑定网卡的IPv4> <组播状态>
         //
-        // 后两列是**新增**的，加在末尾是为了不破坏 run.sh 里按 $3 取 SSDP 端口的解析。
-        // 驱动靠它们核对 LOCATION 里的 IP 真的来自**实际绑定的那张网卡** ——
-        // 而不是另一张。这正是「组播从 eth0 收、却告诉手机去 wlan0 取描述」
-        // 那个「搜到了却投不了屏」的故障点。
+        // 后三列都是**新增**的，加在末尾是为了不破坏 run.sh 里按 $3/$5/$6 的解析。
+        // 第 5/6 列让驱动核对 LOCATION 里的 IP 真的来自**实际绑定的那张网卡**
+        // （而不是另一张）—— 正是「组播从 eth0 收、却告诉手机去 wlan0 取描述」
+        // 那个「搜到了却投不了屏」的故障点。第 7 列是组播状态（multicast /
+        // no-multicast），让「单播模式」在日志里一眼可见。
         System.out.println("READY " + port + " " + actualSsdpPort + " " + location
-                + " " + ssdp.getBoundInterfaceName() + " " + ssdp.getBoundIp());
+                + " " + ssdp.getBoundInterfaceName() + " " + ssdp.getBoundIp()
+                + " " + (ssdp.isMulticastJoined() ? "multicast" : "no-multicast"));
         System.out.flush();
 
         Thread.sleep(Long.MAX_VALUE);

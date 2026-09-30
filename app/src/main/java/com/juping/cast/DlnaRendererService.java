@@ -693,20 +693,56 @@ public class DlnaRendererService extends Service
      * 是哪个文件」—— 这些不敏感且是定位问题的关键。所以只把 {@code ?} 之后的
      * query（签名/token 所在）整段替换成 {@code ?***}，host/port/path 原样保留。
      *
-     * <p>没有 {@code ?} 的 URL 原样返回（无签名可泄）；空串原样返回；
-     * {@code null} 也原样返回，交给 {@link #jsonPut} 现有的空串兜底。
+     * <p>没有 {@code ?} 的 URL 只做 userinfo 打码（见 {@link #maskUserInfo}）后返回；
+     * 空串原样返回；{@code null} 也原样返回，交给 {@link #jsonPut} 现有的空串兜底。
      */
     private static String maskUri(String uri) {
         if (uri == null || uri.length() == 0) {
             return uri;
         }
-        int q = uri.indexOf('?');
+        // ① userinfo（user:pass@）打码 —— 私有 NAS 的 basic-auth 地址会泄漏凭证。
+        String masked = maskUserInfo(uri);
+        // ② query（? 之后）整段抹掉：签名/token 参数值不可复原（不留任何前缀字符）。
+        int q = masked.indexOf('?');
         if (q < 0) {
-            // 没有 query 就没有签名可泄，原样返回不误伤排障信息。
-            return uri;
+            // 没有 query 就没有签名可泄，不打 query 码（但 userinfo 已抹）。
+            return masked;
         }
-        // query 整段抹掉：签名/token 参数值不可复原（不留任何前缀字符）。
-        return uri.substring(0, q) + "?***";
+        return masked.substring(0, q) + "?***";
+    }
+
+    /**
+     * 抹掉 URL 里的 userinfo（{@code user:pass@}）—— 私有 NAS 的 basic-auth 地址。
+     *
+     * <p><b>为什么也要打码：</b>CDN 用 query 签名（{@link #maskUri} 已覆盖），但
+     * {@code http://user:pass@192.168.1.5/video.mp4} 这种把凭据写在 userinfo 里的
+     * 地址真实存在（私有 NAS / 简单鉴权服务器）。凭证同样是「谁拿到谁能播」，
+     * 一样不能出现在无鉴权的 {@code /status} 上。
+     *
+     * <p>只在 scheme 之后的 authority 段里找 {@code @}：authority 到第一个
+     * {@code / ? #} 为止。这样不会误伤 path 里的 {@code @}（如 {@code /a@b.mp4}）。
+     * host/port/path 全部保留 —— 排障信息不丢。
+     */
+    private static String maskUserInfo(String uri) {
+        int schemeEnd = uri.indexOf("://");
+        if (schemeEnd < 0) {
+            return uri;  // 不是带 scheme 的绝对 URL，没有 userinfo 可言
+        }
+        int authorityStart = schemeEnd + 3;
+        int authorityEnd = uri.length();
+        for (int i = authorityStart; i < uri.length(); i++) {
+            char c = uri.charAt(i);
+            if (c == '/' || c == '?' || c == '#') {
+                authorityEnd = i;
+                break;
+            }
+        }
+        int at = uri.indexOf('@', authorityStart);
+        if (at < 0 || at >= authorityEnd) {
+            return uri;  // authority 里没有 @（或 @ 在 path 里），不是 userinfo
+        }
+        // user:pass 换成 ***，保留 @ 与 host/port/path。
+        return uri.substring(0, authorityStart) + "***" + uri.substring(at);
     }
 
     /**
