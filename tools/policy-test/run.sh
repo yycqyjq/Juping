@@ -1094,6 +1094,41 @@ def body_of(src, marker):
         k += 1
     return None
 
+
+def _brace_span(src, open_idx):
+    """从 open_idx（一个 '{' 的下标）起按大括号配对返回 (体, 体后下标)。"""
+    depth, k = 0, open_idx
+    while k < len(src):
+        if src[k] == '{':
+            depth += 1
+        elif src[k] == '}':
+            depth -= 1
+            if depth == 0:
+                return src[open_idx:k + 1], k + 1
+        k += 1
+    return None, None
+
+
+def positive_if_else(src, cond):
+    """切出 `if (cond) {…} else {…}` 两个分支体，条件必须是**正向**写法。
+
+    返回 (if体, else体)；条件被取反（`if (!cond)`）或没有 else 时返回 (None, None)。
+    判据要看**条件方向**，不能只看两个子串在不在 —— 反转 if/else 后子串都还在，
+    只查「存在」的写法会假阴性。
+    """
+    m = re.search(r'\bif\s*\(\s*' + re.escape(cond) + r'\s*\)\s*\{', src)
+    if m is None:
+        return None, None
+    if_body, after = _brace_span(src, src.find('{', m.start()))
+    if if_body is None:
+        return None, None
+    em = re.compile(r'\s*else\s*\{').match(src, after)
+    if em is None:
+        return None, None
+    else_body, _ = _brace_span(src, src.find('{', em.start()))
+    return if_body, else_body
+
+
 ssdp_c = strip_comments(ssdp)
 ctrl_c = strip_comments(ctrl)
 svc_c = strip_comments(svc)
@@ -1124,13 +1159,21 @@ omj = body_of(ssdp_c, 'private void onMulticastJoined()')
 report('SsdpResponder.onMulticastJoined 方法体已找到', omj is not None,
        '锚点：private void onMulticastJoined()')
 if run and omj:
+    # 判据必须看**条件方向**，不能只看「子串存在」：把 run() 里的 if/else 反转成
+    # `if (!multicastJoined) { onMulticastJoined(); } else { startJoinRetry(); }` 后，
+    # 两个子串都还在，只查「存在」的写法照样放行 —— 而那等于「广播早于 join
+    # （组播还没通，发出去没人收得到）+ 重试永不启动」= 手机永远搜不到。
+    # 所以用 positive_if_else 抠出 `if (multicastJoined)` 的分支体，要求广播确实
+    # 落在**正向**分支里。
+    _ib_join, _ = positive_if_else(run, 'multicastJoined')
     report('加入组播成功之后才广播 alive',
            re.search(r'bindUntilReady\(\)[\s\S]*?multicastJoined[\s\S]*?onMulticastJoined\(\)',
                      run) is not None
-           and 'announceAlive()' in omj,
+           and 'announceAlive()' in omj
+           and _ib_join is not None and 'onMulticastJoined()' in _ib_join,
            '必须发生在 joinGroup 成功之后 —— 早于它的话组播还没通，发出去没人收得到。'
            '触发点现在是 onMulticastJoined()，且 run() 里由 multicastJoined 这个条件'
-           '把关（未加入走后台重试，不广播）')
+           '把关（未加入走后台重试，不广播）；判据看的是**条件方向**，反转 if/else 必红')
     report('有定期重播，不是只发一轮',
            'startAnnouncer()' in omj,
            'UDP 会丢包、控制点缓存也会过期；只发一轮的话"在线却搜不到"会反复出现')
@@ -1713,6 +1756,40 @@ def body_of(src, marker):
     return None
 
 
+def _brace_span(src, open_idx):
+    """从 open_idx（一个 '{' 的下标）起按大括号配对返回 (体, 体后下标)。"""
+    depth, k = 0, open_idx
+    while k < len(src):
+        if src[k] == '{':
+            depth += 1
+        elif src[k] == '}':
+            depth -= 1
+            if depth == 0:
+                return src[open_idx:k + 1], k + 1
+        k += 1
+    return None, None
+
+
+def positive_if_else(src, cond):
+    """切出 `if (cond) {…} else {…}` 两个分支体，条件必须是**正向**写法。
+
+    返回 (if体, else体)；条件被取反（`if (!cond)`）或没有 else 时返回 (None, None)。
+    判据要看**条件方向**，不能只看两个子串在不在 —— 反转 if/else 后子串都还在，
+    只查「存在」的写法会假阴性。
+    """
+    m = re.search(r'\bif\s*\(\s*' + re.escape(cond) + r'\s*\)\s*\{', src)
+    if m is None:
+        return None, None
+    if_body, after = _brace_span(src, src.find('{', m.start()))
+    if if_body is None:
+        return None, None
+    em = re.compile(r'\s*else\s*\{').match(src, after)
+    if em is None:
+        return None, None
+    else_body, _ = _brace_span(src, src.find('{', em.start()))
+    return if_body, else_body
+
+
 # ---- (1) 设备描述：DLNA 类别标记 ----
 bd = body_of(http, 'private String buildDeviceDescription()')
 report('buildDeviceDescription 方法体已找到', bd is not None,
@@ -1893,11 +1970,22 @@ _rb = body_of(ssdp, 'public void run()')
 report('SsdpResponder.run 方法体已找到', _rb is not None,
        '锚点：public void run()')
 if _rb:
+    # 判据必须看**条件方向**，不能只看「两个子串都在」：把 run() 里的 if/else 反转成
+    # `if (!multicastJoined) { onMulticastJoined(); } else { startJoinRetry(); }` 后，
+    # startJoinRetry() / onMulticastJoined() 两个子串**都还在**，只查「存在」的写法
+    # 照样全绿（假阴性）—— 而那等于「广播早于 join（组播还没通，发出去没人收得到）
+    # + 重试永不启动」= 手机永远搜不到，正是 T4/T4b 修的病的反面。
+    # 所以抠出 `if (multicastJoined) {…} else {…}` 两个分支体，要求：
+    #   正向分支里有 onMulticastJoined()，else 分支里有 startJoinRetry()。
+    _rb_if, _rb_else = positive_if_else(_rb, 'multicastJoined')
     report('run() 未加入组播时启动后台重试（不是失败即放弃）',
-           'startJoinRetry()' in _rb and 'onMulticastJoined()' in _rb,
+           _rb_if is not None and _rb_else is not None
+           and 'onMulticastJoined()' in _rb_if
+           and 'startJoinRetry()' in _rb_else,
            'run() 有两条路径：已加入 → 立即广播 alive；未加入 → 交给后台重试。'
-           '少掉后者，joinGroup 一次失败就再没有第二次机会 —— '
-           '这正是老设备开机初期瞬时失败后「永久搜不到」的成因')
+           '判据看的是**条件方向**（if (multicastJoined) 里广播、else 里重试），'
+           '反转 if/else 必红 —— 只查子串存在会放行反转，joinGroup 一次失败就再没有'
+           '第二次机会，正是老设备开机初期瞬时失败后「永久搜不到」的成因')
 _sjr = body_of(ssdp, 'private void startJoinRetry()')
 report('SsdpResponder.startJoinRetry 方法体已找到', _sjr is not None,
        '锚点：private void startJoinRetry()')
