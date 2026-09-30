@@ -1096,12 +1096,28 @@ def body_of(src, marker):
 
 
 def _brace_span(src, open_idx):
-    """从 open_idx（一个 '{' 的下标）起按大括号配对返回 (体, 体后下标)。"""
-    depth, k = 0, open_idx
-    while k < len(src):
-        if src[k] == '{':
+    """从 open_idx（一个 '{' 的下标）起按大括号配对返回 (体, 体后下标)。
+
+    跳过字符串 / 字符字面量里的括号 —— 否则分支体里写个 "}" 就会把配对算错、
+    把分支体截断（守卫会误红；检查器喊狼来了跟不检查一样糟）。
+    """
+    depth, k, n = 0, open_idx, len(src)
+    while k < n:
+        c = src[k]
+        if c == '"' or c == "'":
+            q, k = c, k + 1
+            while k < n:
+                if src[k] == '\\':
+                    k += 2
+                    continue
+                if src[k] == q:
+                    break
+                k += 1
+            k += 1          # 跳过收尾引号
+            continue
+        if c == '{':
             depth += 1
-        elif src[k] == '}':
+        elif c == '}':
             depth -= 1
             if depth == 0:
                 return src[open_idx:k + 1], k + 1
@@ -1757,12 +1773,28 @@ def body_of(src, marker):
 
 
 def _brace_span(src, open_idx):
-    """从 open_idx（一个 '{' 的下标）起按大括号配对返回 (体, 体后下标)。"""
-    depth, k = 0, open_idx
-    while k < len(src):
-        if src[k] == '{':
+    """从 open_idx（一个 '{' 的下标）起按大括号配对返回 (体, 体后下标)。
+
+    跳过字符串 / 字符字面量里的括号 —— 否则分支体里写个 "}" 就会把配对算错、
+    把分支体截断（守卫会误红；检查器喊狼来了跟不检查一样糟）。
+    """
+    depth, k, n = 0, open_idx, len(src)
+    while k < n:
+        c = src[k]
+        if c == '"' or c == "'":
+            q, k = c, k + 1
+            while k < n:
+                if src[k] == '\\':
+                    k += 2
+                    continue
+                if src[k] == q:
+                    break
+                k += 1
+            k += 1          # 跳过收尾引号
+            continue
+        if c == '{':
             depth += 1
-        elif src[k] == '}':
+        elif c == '}':
             depth -= 1
             if depth == 0:
                 return src[open_idx:k + 1], k + 1
