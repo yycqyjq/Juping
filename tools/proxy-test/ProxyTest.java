@@ -74,6 +74,29 @@ public final class ProxyTest {
             eqBytes("⑥ 分段读 @" + off, got, src, off, expect);
         }
 
+        // ⑦ Seek 中途重连 —— 真实 MediaPlayer 的姿势：**断开旧连接、带 Range 重连**，
+        // 而不是把上一个响应读满。
+        //
+        // 上面 ①~⑥ 都是「读满 EOF」：客户端一定在重连前把窗口吃空
+        // （serve 里 winStart 会被推进到片尾、winLen 归零），于是每个新请求看到的
+        // 都是**空窗口**，走 reset 分支（winStart 与 pos 对齐）—— 这条盲区正是
+        // 「读满」姿势压不出来的。
+        //
+        // 真实播放器只读一点点就 Seek：请求 A（Range:0-）只读 64KB 就断开，A 的
+        // serve 线程在源 I/O 或缓冲推进里停下，留下一个**非空窗口**。请求 B 立刻
+        // 带 Range 重连，offset 落在 [A.winStart, A.winStart+A.winLen] 内 →
+        // B 走「复用缓冲」分支（inWindow=true、不复位）。这条分支有两个坑：
+        //   1) 窗口前缀记账 —— B 从 offset 起写，但 winStart 还在 offset 之前，
+        //      消费记账（winLen -= n; winStart = pos）会把窗口末端虚增，一路写到
+        //      超过片尾 → 字节数多出来（修复前实测 len=1114112/1097152）；
+        //   2) 线程重叠 —— A 的 serve 没退干净时 B 又起一条，两条一起推进同一份
+        //      无锁窗口状态 → 字节错乱（小窗口下 10/10 复现，两个 serve 线程并发）。
+        // 差一个字节就是花屏，而这里对的是逐字节。
+        partialRead(local, 0, 64 * 1024);
+        got = fetch(local, 1000000, -1);
+        eqBytes("⑦ Seek 中途重连（A 读 64KB 即断 → B 带 Range 重连）字节一致",
+                got, src, 1000000, src.length - 1000000);
+
         proxy.shutdown();
         origin.stop(0);
         System.out.println();
@@ -135,6 +158,39 @@ public final class ProxyTest {
         });
         server.start();
         return server;
+    }
+
+    /**
+     * 只读前 n 字节就断开 —— 模拟 MediaPlayer 起播读一点就 Seek。
+     *
+     * <p>刻意**不读到 EOF、不读完**：真实播放器就是这样（读够起播数据就断开旧连接、
+     * 带新的 Range 重连）。这正是 ①~⑥「读满」姿势覆盖不到的路径 —— 旧 serve
+     * 线程不会因为客户端读完而自然结束，会在**非空窗口**上被下一个请求撞上。
+     */
+    private static void partialRead(String local, long offset, int n) throws IOException {
+        URL u = new URL(local);
+        HttpURLConnection c = (HttpURLConnection) u.openConnection();
+        c.setConnectTimeout(5000);
+        c.setReadTimeout(10000);
+        if (offset > 0) {
+            c.setRequestProperty("Range", "bytes=" + offset + "-");
+        }
+        int code = c.getResponseCode();
+        if (code != 200 && code != 206) {
+            throw new IOException("HTTP " + code + " @offset=" + offset);
+        }
+        InputStream in = c.getInputStream();
+        byte[] b = new byte[n];
+        int total = 0;
+        while (total < n) {
+            int r = in.read(b, 0, n - total);
+            if (r < 0) {
+                break;
+            }
+            total += r;
+        }
+        // 不读完、不主动关输入流 —— 直接丢弃连接（等价于播放器 Seek 时断开旧连接）
+        c.disconnect();
     }
 
     /** GET 指定偏移（带 Range 头），读完整响应体；expectLen>=0 时校验长度 */

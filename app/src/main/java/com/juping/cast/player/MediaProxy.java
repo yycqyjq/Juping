@@ -49,6 +49,16 @@ public final class MediaProxy extends Thread {
     private volatile boolean running;
     private Thread serveThread;
 
+    /**
+     * 每次接受新连接递增 —— 用来**顶掉**上一条 serve 线程。
+     *
+     * <p>本类的窗口状态是无锁共享的，设计前提是「同一时刻只有一条 serve 线程碰它」。
+     * 光靠关旧客户端 socket 保证不了这一点（旧线程可能卡在源 I/O 上），所以：
+     * {@code run()} 先 {@code ++serveGen} 让旧线程在循环里察觉自己已作废并立刻收工，
+     * 再 {@link #supersedePrevServe()} 等它真正退出，最后才起新线程。
+     */
+    private volatile long serveGen;
+
     // ---- 会话窗口状态（仅当前 serve 线程在 epoch 匹配时读写） ----
     private final byte[] buf;      // 环形缓冲
     private long winStart;         // 窗口首字节对应的源偏移
@@ -160,16 +170,20 @@ public final class MediaProxy extends Thread {
             if (!running) {
                 break;
             }
-            // 每请求一线程；新请求会抢占旧流（closeActiveClient）。
-            // Seek 即重连，旧流通常已被播放器自己关掉，这里只是兜底。
+            // 每请求一线程；新请求**顶掉**旧请求 —— 但必须先让旧线程真正退出，
+            // 否则两条 serve 会并发碰同一份窗口状态（src / winStart / winLen /
+            // total / buf…），表现为字节错乱、投屏花屏。
+            //
+            // Seek 在播放器看来就是「断开旧连接、带 Range 重连」，所以每次新请求
+            // 都必须先顶掉上一条 —— 这正是原来漏掉的一步。
+            supersedePrevServe();
             final Socket c = client;
-            final long myEpoch = epoch;
-            preemptOldClient();
+            final long myGen = ++serveGen;
             activeClient = c;
             serveThread = new Thread(new Runnable() {
                 @Override
                 public void run() {
-                    serve(c, myEpoch);
+                    serve(c, myGen);
                 }
             }, "proxy-serve");
             serveThread.start();
@@ -184,6 +198,46 @@ public final class MediaProxy extends Thread {
             try {
                 old.close();
             } catch (IOException ignored) {
+            }
+        }
+    }
+
+    /**
+     * 顶掉上一条 serve 线程，并**等它真正退出**再返回。
+     *
+     * <p>为什么不能只关旧客户端 socket：旧线程可能正卡在**源 I/O** 上
+     * （{@link #openSource} 的 {@code getResponseCode()} 或 {@link #fillMore}
+     * 的 {@code src.read()}）—— 关客户端叫不醒它。必须连旧源流一起关，
+     * 它才会立刻抛错退出。这是本方法相对 {@link #preemptOldClient()} 的关键差别。
+     *
+     * <p>为什么要 join：窗口状态无锁共享，前提是「同一时刻只有一条 serve 线程
+     * 碰它」。旧线程没退干净就起新线程，就会两条线程一起推进窗口 → 字节错乱
+     * （CI 上真实复现过：{@code len=1114112/1097152}）。join 把「旧线程已退出」
+     * 变成新线程开工的**前置条件**，这个前提才真正成立。
+     */
+    private void supersedePrevServe() {
+        Thread prev = serveThread;
+        Socket old = activeClient;
+        activeClient = null;
+        if (old != null) {
+            try {
+                old.close();
+            } catch (IOException ignored) {
+            }
+        }
+        // 连旧源流一起关 —— 否则卡在 src.read() 的旧线程收不到任何信号。
+        // 用「保留 EOF 标志」的版本：窗口（winStart/winLen）本就是要留给下一个
+        // 请求复用的，而 srcEof 记的是「这块窗口是否已到源尾」，同样有效、同样
+        // 该留。若在这里用会复位 srcEof 的 closeSource()，下一个命中窗口的请求
+        // 会白开一次空源连接（srcEof=true 时窗口末端已在片尾，根本无需再取数）。
+        closeSourceKeepEof();
+        if (prev != null && prev != Thread.currentThread()) {
+            try {
+                // 正常会立刻返回（旧线程已被上面的关闭唤醒）。给个上限兜底：
+                // 万一源端 close 不生效，也不至于把 accept 循环永久卡死。
+                prev.join(2000L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             }
         }
     }
@@ -204,16 +258,42 @@ public final class MediaProxy extends Thread {
     }
 
     /**
+     * 关闭源流但**保留** {@link #srcEof}。
+     *
+     * <p>{@link #closeSource()} 会把 {@code srcEof} 复位成 false —— 那是给
+     * 「换源 / 换偏移、要重新取数」准备的。而 {@link #fillMore()} 读到源尾时
+     * 需要的是「关掉流、但记住已经到尾了」。原来那里写成
+     * {@code srcEof = true; closeSource();}，标志被当场抹掉，于是源到尾之后
+     * **每个 32KB 写回都重开一次源连接**（末尾那次是「客户端已拿全数据、
+     * serve 还空转重连」）—— 既浪费带宽，又拉长了旧 serve 线程的存活窗口，
+     * 是并发竞态的放大器。这里单独留一个「保留 EOF 标志」的关闭。
+     */
+    private void closeSourceKeepEof() {
+        if (src != null) {
+            try {
+                src.close();
+            } catch (IOException ignored) {
+            }
+            src = null;
+        }
+    }
+
+    /**
      * 服务一个客户端请求：解析 Range → 对位窗口 → 边填边出，直到 EOS。
      */
-    private void serve(Socket client, long myEpoch) {
+    private void serve(Socket client, long myGen) {
         try {
             client.setSoTimeout(0);
             long offset = parseRange(client);
-            Log.i(TAG, "服务请求 offset=" + offset + "（epoch=" + myEpoch + "）");
+            Log.i(TAG, "服务请求 offset=" + offset + "（gen=" + myGen + "）");
+            // 开工前先确认自己没被更新的连接顶掉 —— 作废就别碰任何窗口状态。
+            if (myGen != serveGen) {
+                client.close();
+                return;
+            }
             String url = sourceUrl;
             long mySrc = epoch;
-            if (url == null || mySrc != myEpoch) {
+            if (url == null) {
                 client.close();
                 return;
             }
@@ -226,6 +306,21 @@ public final class MediaProxy extends Thread {
                 winLen = 0;
                 total = -1;
                 closeSource();
+            } else if (offset > winStart) {
+                // **Seek 命中预取缓冲**（本代理的核心价值路径）：请求偏移落在窗口
+                // 内部、但不是窗口首字节。此时必须把 [winStart, offset) 这段前缀
+                // 从窗口里丢掉，让 winStart 与随后的 pos **对齐**。
+                //
+                // 不丢会怎样：下面的消费记账是「winLen -= n; winStart = pos」，
+                // 它隐含前提 pos == winStart。若带着前缀就开写，pos 一上来就比
+                // winStart 大 (offset - winStart)，每写一块 winStart 前移 n 而
+                // winLen 只减 n —— 窗口末端 (winStart + winLen) 被**虚增**
+                // (offset - winStart)。虚增之后写回循环里对 n 的夹取
+                // (winStart + winLen - pos) 随之失效，会一路写到超过片尾 total 的
+                // 偏移，客户端收到的字节数多于应得 → 花屏。CI 上真实复现过：
+                // len=1114112/1097152（多出一个 32KB 块）。
+                winLen -= (int) (offset - winStart);
+                winStart = offset;
             }
             if (src == null && !srcEof) {
                 openSource(url, winStart + winLen);
@@ -234,6 +329,12 @@ public final class MediaProxy extends Thread {
             OutputStream out = client.getOutputStream();
             long pos = offset;
             while (running && mySrc == epoch) {
+                // 被更新的连接顶掉 → 立刻收工，绝不再碰窗口状态。
+                // 这是「旧线程退出」的主动信号：不依赖关闭 socket 触发的异常，
+                // 让旧线程在它自己的循环里就能干净地停手。
+                if (myGen != serveGen) {
+                    break;
+                }
                 if (total > 0 && pos >= total) {
                     break;   // 片尾：EOS
                 }
@@ -288,8 +389,10 @@ public final class MediaProxy extends Thread {
             int room = Math.min(capacity - winLen, capacity - idx);
             int n = src.read(buf, idx, Math.min(room, 64 * 1024));
             if (n < 0) {
+                // 不能走会清 srcEof 的 closeSource()（它把标志复位成 false）——
+                // 那样 EOF 标志被当场抹掉，源到尾之后每个 32KB 写回都重开一次源连接。
                 srcEof = true;
-                closeSource();
+                closeSourceKeepEof();
                 return true;
             }
             winLen += n;
