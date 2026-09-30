@@ -49,6 +49,16 @@ public class MediaPlayerController {
         void onStateChanged(String state);
 
         /**
+         * 播放源已变更（播放列表自动续播）。
+         *
+         * <p>SetNextAVTransportURI 预告的下一曲在当前曲目自然播完后自动接棒时，
+         * 控制命令不走 SOAP（没有 SetAVTransportURI），服务层的 URI/元数据状态
+         * 靠这个回调对齐 —— GetMediaInfo 回读与事件推送都依赖它。
+         * 实现方应更新 URI/元数据/标题并推送 AVTransport 事件。
+         */
+        void onSourceChanged(String uri, String metadata);
+
+        /**
          * 播放出错。
          *
          * <p>{@code kind} 是 {@link PlaybackPolicy} 里的 {@code ERR_*} 分类 ——
@@ -272,6 +282,9 @@ public class MediaPlayerController {
         // 换了片源，上一次的 seek 目标立刻作废 ——
         // 不清的话，新片子的「当前位置」会先报成上一部片子拖到的进度。
         pendingSeekMs = -1L;
+        // 新片源到达，「下一曲」队列作废（新歌单会重新 SetNext）
+        nextUrl = null;
+        nextMetadata = null;
         // 兜底位置同理：不清的话，新片子起播前会先报上一部的进度
         lastKnownPosition = 0;
         startInternal();
@@ -382,6 +395,30 @@ public class MediaPlayerController {
             player.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
                 @Override
                 public void onCompletion(MediaPlayer mp) {
+                    // 播放列表续播：SetNextAVTransportURI 预告过的下一曲在这里接棒。
+                    // 必须抛到下一轮消息循环再重建播放器 —— 在播放器自己的
+                    // onCompletion 回调里 release 它自己，老平台上有崩溃先例。
+                    if (nextUrl != null && nextUrl.length() > 0 && !userPaused) {
+                        final String u = nextUrl;
+                        final String m = nextMetadata;
+                        nextUrl = null;
+                        nextMetadata = null;
+                        Log.i(TAG, "当前曲目播完，自动续播下一曲: " + u);
+                        notifyState("TRANSITIONING");
+                        handler.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                // 切源 + 重建播放器（此刻已不在 onCompletion
+                                // 回调栈里，release 旧实例是安全的）
+                                currentUrl = u;
+                                startInternal();
+                                if (listener != null) {
+                                    listener.onSourceChanged(u, m);
+                                }
+                            }
+                        });
+                        return;
+                    }
                     notifyState("STOPPED");
                 }
             });
@@ -764,10 +801,27 @@ public class MediaPlayerController {
     /** 已确认要直连的地址（代理 prepare 超时后降级，同地址不再走代理） */
     private String bypassUrl;
 
+    /**
+     * 下一曲（SetNextAVTransportURI 预告的续播源）—— 播放列表/连续播放。
+     * 当前曲目**自然播完**（onCompletion）时自动接棒；被 Stop/换片打断则作废。
+     */
+    private String nextUrl;
+    private String nextMetadata;
+
+    /** 预告下一曲（SetNextAVTransportURI 的播放器侧入口） */
+    public synchronized void setNext(String url, String metadata) {
+        nextUrl = url;
+        nextMetadata = metadata == null ? "" : metadata;
+        Log.i(TAG, "已预告下一曲: " + nextUrl);
+    }
+
     public synchronized void stop() {
         userPaused = false;
         currentUrl = null;
         stallCount = 0;
+        // Stop = 控制点明确结束：下一曲队列不跨 Stop 存活（DLNA 语义）
+        nextUrl = null;
+        nextMetadata = null;
         // Stop = 控制点明确结束：代理缓冲立刻释放（8MB 不能在空闲时占着）。
         // 断流重连路径不走这里，所以缓冲能活过重连 —— 那正是它的价值。
         if (proxy != null) {

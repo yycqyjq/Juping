@@ -76,7 +76,6 @@ public final class ProxyTest {
 
         proxy.shutdown();
         origin.stop(0);
-
         System.out.println();
         System.out.println("代理一致性：" + (names.size() - fails.size()) + " / " + names.size() + " 通过");
         if (!fails.isEmpty()) {

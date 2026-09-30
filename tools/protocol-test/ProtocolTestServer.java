@@ -182,10 +182,41 @@ public class ProtocolTestServer {
                 currentUri = uri == null ? "" : uri;
                 // 元数据同样原样记住，供 GetMediaInfo / GetPositionInfo 回读
                 currentMetadata = metadata == null ? "" : metadata;
+                // 新片源到达，「下一曲」作废（与真实服务一致）
+                nextUri = "";
+                nextUriMetadata = "";
                 // 片源带 boom → 模拟一个播放错误（真实服务里是 onError 置的）
                 lastError = (uri != null && uri.contains("boom")) ? "模拟播放错误" : "";
                 transportState = "TRANSITIONING";
                 push("AVTransport");
+            }
+
+            private String nextUri = "";
+            private String nextUriMetadata = "";
+
+            @Override
+            public void onSetNextUri(String uri, String metadata) {
+                nextUri = uri == null ? "" : uri;
+                nextUriMetadata = metadata == null ? "" : metadata;
+                rec("SetNextAVTransportURI", nextUri, nextUriMetadata);
+                transportState = "TRANSITIONING";
+                push("AVTransport");
+            }
+
+            @Override
+            public String getNextUri() {
+                return nextUri;
+            }
+
+            @Override
+            public String getNextUriMetadata() {
+                return nextUriMetadata;
+            }
+
+            @Override
+            public String buildStatusJson() {
+                return "{\"state\":\"" + transportState
+                        + "\",\"currentUri\":\"" + currentUri + "\"}";
             }
 
             @Override
@@ -220,6 +251,9 @@ public class ProtocolTestServer {
                 // 元数据一起清 —— 和真实服务保持一致：留着的话，
                 // GetMediaInfo 会在"没有媒体"的时候回一份上一部片子的元数据
                 currentMetadata = "";
+                // 下一曲队列一并作废（与真实服务一致：Stop 清歌单）
+                nextUri = "";
+                nextUriMetadata = "";
                 lastError = "";
                 transportState = "STOPPED";
                 push("AVTransport");

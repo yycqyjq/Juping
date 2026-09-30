@@ -135,6 +135,19 @@ public class DlnaRendererService extends Service
     private volatile String currentUri = "";
 
     /**
+     * 下一曲（SetNextAVTransportURI 预告的续播地址）—— 播放列表/连续播放。
+     * 新 SetAVTransportURI 到达即作废；曲目自然播完由播放器回调续播。
+     */
+    private volatile String nextUri = "";
+    private volatile String nextUriMetadata = "";
+
+    /** 本轮播放的起始时刻 —— Auto-Stop 的「本轮播放期间曾有订阅者」判据 */
+    private volatile long playStartedAtMs;
+
+    /** 进程内服务启动时刻 —— /status 的 uptimeSec 用 */
+    private volatile long startedAtMs;
+
+    /**
      * 控制点推来的原始元数据（DIDL-Lite XML）。
      *
      * <p><b>原样保存、原样回读</b>：控制点会回读 {@code GetMediaInfo} 的
@@ -217,6 +230,7 @@ public class DlnaRendererService extends Service
         public void run() {
             try {
                 checkThreadsAlive();
+                checkAutoStop();
             } catch (Throwable t) {
                 // 看门狗自己绝不能把主线程掀翻 —— 它是"最后一道保险"，
                 // 它崩了就真的没有任何东西能发现故障了。
@@ -251,6 +265,7 @@ public class DlnaRendererService extends Service
     @Override
     public void onCreate() {
         super.onCreate();
+        startedAtMs = System.currentTimeMillis();
         Log.i(TAG, "服务创建");
 
         uuid = loadOrCreateUuid();
@@ -568,6 +583,17 @@ public class DlnaRendererService extends Service
         Log.i(TAG, "收到投屏地址: " + uri);
         bringPlayerToFront();
         currentUri = uri;
+        // 新片源到达，之前预告的「下一曲」作废（新歌单会重新 SetNext）——
+        // 服务层字段和播放器侧队列要一起清
+        nextUri = "";
+        nextUriMetadata = "";
+        if (player != null) {
+            player.setNext(null, null);
+        }
+        playStartedAtMs = System.currentTimeMillis();
+        if (startedAtMs == 0) {
+            startedAtMs = System.currentTimeMillis();
+        }
         clearError();
         kindFromMetadata = kindOf(metadata);
         // 元数据原样留着（协议回读要用），另外解析一份标题给界面。
@@ -592,6 +618,63 @@ public class DlnaRendererService extends Service
         }
         // 一收到地址就报一次：控制点那边「已收到」的反馈全靠它
         notifyEvent("AVTransport");
+    }
+
+    @Override
+    public void onSetNextUri(String uri, String metadata) {
+        Log.i(TAG, "收到下一曲预告: " + uri);
+        nextUri = uri == null ? "" : uri;
+        nextUriMetadata = metadata == null ? "" : metadata;
+        // 关键：把下一曲交给播放器 —— 它才是 onCompletion 时自动续播的执行者。
+        // 只存字段不给播放器的话，续播永远不触发（真机踩过）。
+        if (player != null) {
+            player.setNext(nextUri, nextUriMetadata);
+        }
+        // 事件里带上 Next 变更，依赖事件的控制点不用轮询就能刷新队列显示
+        notifyEvent("AVTransport");
+    }
+
+    @Override
+    public String getNextUri() {
+        return nextUri;
+    }
+
+    @Override
+    public String getNextUriMetadata() {
+        return nextUriMetadata;
+    }
+
+    @Override
+    public String buildStatusJson() {
+        StringBuilder sb = new StringBuilder();
+        sb.append('{');
+        jsonPut(sb, "friendlyName", friendlyName);
+        jsonPut(sb, "state", getTransportState());
+        jsonPut(sb, "transportStatus", getTransportStatus());
+        sb.append("\"positionMs\":").append(getPositionMs()).append(',');
+        sb.append("\"durationMs\":").append(getDurationMs()).append(',');
+        jsonPut(sb, "currentUri", currentUri);
+        jsonPut(sb, "ip", getLocalIp());
+        sb.append("\"httpPort\":").append(getHttpPort()).append(',');
+        jsonPut(sb, "version", BuildConfig.VERSION_NAME);
+        if (httpServer != null) {
+            sb.append("\"subscribers\":").append(httpServer.aliveSubscriberCount()).append(',');
+            sb.append("\"msSinceLastControl\":").append(httpServer.millisSinceLastControl()).append(',');
+        }
+        sb.append("\"uptimeSec\":").append(
+                (System.currentTimeMillis() - startedAtMs) / 1000);
+        sb.append('}');
+        return sb.toString();
+    }
+
+    /** JSON 字符串值的最小转义：反斜杠与双引号（URL 与状态串的实际字符集都安全） */
+    private static void jsonPut(StringBuilder sb, String key, String val) {
+        if (val == null) {
+            val = "";
+        }
+        sb.append('"').append(key).append("\":\"")
+          .append(val.replace("\\", "\\\\").replace("\"", "\\\""))
+          .append("\",");
     }
 
     /**
@@ -694,6 +777,10 @@ public class DlnaRendererService extends Service
         // 界面会短暂显示**上一首**的名字 —— 旧标题配新地址，自相矛盾。
         currentMetadata = "";
         currentTitle = "";
+        // 下一曲队列一并作废：Stop 是控制点明确结束，歌单不跨 Stop 存活
+        // （DLNA 语义：新的 SetAVTransportURI/Stop 都会清掉 Next）。
+        nextUri = "";
+        nextUriMetadata = "";
         // 一并清掉上一次的错误：已经停止的传输不该继续挂着旧报错，
         // 否则 describeState() 会优先显示那句陈旧的「出错：…」。
         clearError();
@@ -773,6 +860,18 @@ public class DlnaRendererService extends Service
     private void clearError() {
         lastErrorKind = PlaybackPolicy.ERR_NONE;
         lastError = "";
+    }
+
+    @Override
+    public void onSourceChanged(String uri, String metadata) {
+        // 播放列表自动续播：URI/元数据状态与播放器对齐（不走 SOAP）。
+        currentUri = uri;
+        currentMetadata = metadata == null ? "" : metadata;
+        currentTitle = DidlLite.title(currentMetadata);
+        kindFromMetadata = kindOf(currentMetadata);
+        audioOnly = (kindFromMetadata == KIND_AUDIO);
+        Log.i(TAG, "自动续播已切换片源: " + currentUri);
+        notifyEvent("AVTransport");
     }
 
     @Override
@@ -1106,6 +1205,40 @@ public class DlnaRendererService extends Service
      * 绝不能重建 —— 那会把正在进行的退避循环打断，变成"每 30 秒重启一次、
      * 永远等不到网"。
      */
+    /**
+     * Auto-Stop（借鉴 gmrender-resurrect 的 --auto-stop）：控制点离开后
+     * 自动停止投屏 —— 「手机退出了，电视还在播」的行业解法。
+     *
+     * <p>判据（全部满足才停）：<br>
+     * ① 正在播放；<br>
+     * ② 存活订阅数为 0 —— 订阅由控制点周期续订，续订停止 = 控制点真的走了
+     *    （阈值授予 300s 起，所以本检查的响应下限是订阅超时，不是 30 秒）；<br>
+     * ③ 本轮播放期间曾有订阅者 —— 从未订阅过的控制点（纯投放型）不受
+     *    此机制影响，绝不误停；<br>
+     * ④ 距最后一次控制指令超过 {@link PlaybackPolicy#AUTO_STOP_AFTER_MS}。
+     */
+    private void checkAutoStop() {
+        if (player == null || httpServer == null) {
+            return;
+        }
+        if (!"PLAYING".equals(transportState)) {
+            return;
+        }
+        if (httpServer.aliveSubscriberCount() > 0) {
+            return;
+        }
+        if (httpServer.lastSubscribeAt() < playStartedAtMs) {
+            return;
+        }
+        long idleMs = httpServer.millisSinceLastControl();
+        if (idleMs < PlaybackPolicy.AUTO_STOP_AFTER_MS) {
+            return;
+        }
+        Log.w(TAG, "控制点已离开（无订阅者，最后指令 " + (idleMs / 1000)
+                + "s 前），自动停止投屏");
+        player.stop();
+    }
+
     private void checkThreadsAlive() {
         if (shuttingDown) {
             return;

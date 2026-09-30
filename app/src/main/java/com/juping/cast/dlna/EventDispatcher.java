@@ -106,6 +106,9 @@ public class EventDispatcher {
     private final Map<String, Sub> subs = new LinkedHashMap<String, Sub>();
     private int sidCounter;
 
+    /** 最近一次 SUBSCRIBE（新建或续订）的时刻 —— Auto-Stop 判据用 */
+    private volatile long lastSubscribeAtMs;
+
     /**
      * 单线程池，保证事件**按序**投递：初始事件（SEQ 0）一定先于
      * 之后的状态变化事件（SEQ 1、2…）。用多线程就会乱序，
@@ -159,6 +162,7 @@ public class EventDispatcher {
             s.callbacks.addAll(callbacks);
             s.grantedSec = clampTimeout(timeoutHeader);
             s.expireAtMs = System.currentTimeMillis() + s.grantedSec * 1000L;
+            lastSubscribeAtMs = System.currentTimeMillis();
             subs.put(sid, s);
             Log.i(TAG, "新订阅 " + service + " SID=" + sid + " 回调 " + callbacks.size()
                     + " 个，保 " + s.grantedSec + "s");
@@ -187,6 +191,25 @@ public class EventDispatcher {
         }
     }
 
+    /** 当前存活的（未过期）订阅数 —— Auto-Stop 判据用 */
+    public int aliveSubscriberCount() {
+        synchronized (this) {
+            long now = System.currentTimeMillis();
+            int n = 0;
+            for (Sub s : subs.values()) {
+                if (s.expireAtMs > now) {
+                    n++;
+                }
+            }
+            return n;
+        }
+    }
+
+    /** 最近一次 SUBSCRIBE（新建或续订）的时刻；从未订阅过返回 0 —— Auto-Stop 判据用 */
+    public long lastSubscribeAt() {
+        return lastSubscribeAtMs;
+    }
+
     /**
      * 续订。控制点会带着 SID 再来一次 SUBSCRIBE。
      *
@@ -202,6 +225,7 @@ public class EventDispatcher {
             s.grantedSec = t;
             s.expireAtMs = System.currentTimeMillis() + t * 1000L;
             s.failCount = 0;
+            lastSubscribeAtMs = System.currentTimeMillis();
             Log.d(TAG, "续订 SID=" + sid + " 再保 " + t + "s");
             return t;
         }

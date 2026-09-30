@@ -135,12 +135,15 @@ python3 "$ROOT/tools/dlna-probe.py" 127.0.0.1 \
 # 总数对不上就拦下，有意增删后同步这里的期望值。
 PROBE_LINE="$(grep '控制点自检：' "$PROBE_LOG" | tail -1 | sed 's/^ *//')"
 
+# 合法计数有两种：单播命中 = 33（组播回退分支不执行）；
+# 单播被 1900 上的自带服务截走 = 34（组播回退分支 +1）。参见 do_ssdp 的回退逻辑。
 if [ "$PROBE_RC" -ne 0 ]; then
     echo "  dlna-probe.py 未全过 —— 注意这是**脚本自身**的问题，不是被测代码的：" >&2
     grep -E '\[FAIL\]' "$PROBE_LOG" >&2 || true
     RC=1
-elif [ "$PROBE_LINE" != "控制点自检：33 / 33 通过" ]; then
-    echo "  !! probe 断言总数变了：期望「控制点自检：33 / 33 通过」，实际「${PROBE_LINE:-（没找到）}」" >&2
+elif [ "$PROBE_LINE" != "控制点自检：33 / 33 通过" ] \
+        && [ "$PROBE_LINE" != "控制点自检：34 / 34 通过" ]; then
+    echo "  !! probe 断言总数变了：期望「33 / 33」或「34 / 34」（组播回退分支），实际「${PROBE_LINE:-（没找到）}」" >&2
     echo "     总数变少几乎必然是有一条断言被静默跳过或删掉 —— 先查清楚，" >&2
     echo "     确认是有意增删后再同步这里的期望值。" >&2
     RC=1

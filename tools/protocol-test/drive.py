@@ -447,6 +447,53 @@ check('HEAD 未知路径回 404（与 GET 对齐）',
       st_head404.startswith('HTTP/1.1 404'), st_head404)
 
 
+# ══════════════════════════════════════════════ 4c. 播放列表 + /status 诊断页
+
+print('\n── 4c. 播放列表（SetNextAVTransportURI）+ /status 诊断页 ──')
+
+NEXT_URL = 'http://192.168.1.9:8080/next_track.mp4'
+st, hd, body = soap_post('SetNextAVTransportURI', SVC_AVT,
+                         '<InstanceID>0</InstanceID>'
+                         '<NextURI>' + NEXT_URL + '</NextURI>'
+                         '<NextURIMetaData></NextURIMetaData>')
+check('SetNextAVTransportURI 返回 200', st.startswith('HTTP/1.1 200'), st)
+calls = read_calls()
+new = [c for c in calls if c.startswith('SetNextAVTransportURI')]
+check('SetNext 命令到达业务层', len(new) >= 1,
+      'got=%s' % (new[0][:80] if new else '无记录'))
+
+st, hd, body = soap_post('GetMediaInfo', SVC_AVT, '<InstanceID>0</InstanceID>')
+check('GetMediaInfo 返回 200', st.startswith('HTTP/1.1 200'), st)
+m = re.search(rb'<NextURI>(.*?)</NextURI>', body, re.S)
+next_in_media = m.group(1).decode('utf-8', 'replace') if m else '(缺失)'
+check('GetMediaInfo 的 NextURI 与预告一致',
+      next_in_media == NEXT_URL, 'got=%r' % next_in_media[:80])
+
+soap_post('Stop', SVC_AVT, '<InstanceID>0</InstanceID>')
+st, hd, body = soap_post('GetMediaInfo', SVC_AVT, '<InstanceID>0</InstanceID>')
+m = re.search(rb'<NextURI>(.*?)</NextURI>', body, re.S)
+next_in_media = m.group(1).decode('utf-8', 'replace') if m else '(缺失)'
+check('Stop 清空下一曲队列', next_in_media == '', 'got=%r' % next_in_media[:60])
+
+st, hd, body = raw_request('GET', '/status')
+check('/status 返回 200', st.startswith('HTTP/1.1 200'), st)
+check('/status 是 JSON 且含 state/currentUri',
+      b'"state"' in body and b'currentUri' in body,
+      'got=%r' % body[:80])
+
+# 恢复 NextURI（后面的 probe 会按「有下一曲」多核一项，且不依赖 4c 的 Stop 残留）
+soap_post('SetNextAVTransportURI', SVC_AVT,
+          '<InstanceID>0</InstanceID>'
+          '<NextURI>' + NEXT_URL + '</NextURI>'
+          '<NextURIMetaData></NextURIMetaData>')
+
+# 恢复片源（4c 的 Stop 清了 currentUri，section 5 的 Play 需要有片源才生效）
+soap_post('SetAVTransportURI', SVC_AVT,
+          '<InstanceID>0</InstanceID>'
+          '<CurrentURI>http://192.168.1.9:8080/movie.mp4</CurrentURI>'
+          '<CurrentURIMetaData></CurrentURIMetaData>')
+
+
 # ══════════════════════════════════════════════════════════════ 5. 状态机
 
 print('\n── 5. 播放状态机 ──')

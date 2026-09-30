@@ -102,8 +102,8 @@ Juping/
 产物：
 
 ```
-dist/juping-0.1.6-release.apk   ← 装机用这个（已签名）
-dist/juping-0.1.6-debug.apk     ← 排障用（带 debuggable 标记）
+dist/juping-0.1.7-release.apk   ← 装机用这个（已签名）
+dist/juping-0.1.7-debug.apk     ← 排障用（带 debuggable 标记）
 ```
 
 `dist` 目标会在归集后**自动跑六道闸**，任何一道不过就报错退出 —— 免得把一个装不上的、点开就崩的、投不进来的、断联后恢复不了的、或者带着签名密钥的包交出去：
@@ -165,7 +165,7 @@ release 密钥在 `keystore/juping-release.jks`，密码在 `keystore.properties
 可以用这个命令确认：
 
 ```bash
-unzip -p dist/juping-0.1.6-release.apk META-INF/MANIFEST.MF | grep Digest
+unzip -p dist/juping-0.1.7-release.apk META-INF/MANIFEST.MF | grep Digest
 # 应该看到 SHA1-Digest: ...，而不是 SHA-256-Digest
 ```
 
@@ -185,7 +185,7 @@ unzip -p dist/juping-0.1.6-release.apk META-INF/MANIFEST.MF | grep Digest
 
 ```bash
 adb connect <盒子IP>:5555        # 或 USB 连接
-adb install -r dist/juping-0.1.6-release.apk
+adb install -r dist/juping-0.1.7-release.apk
 ```
 
 局域网 adb 需要盒子侧已经开着网络调试并在监听 5555 —— 零售盒子默认是关的，
@@ -193,7 +193,7 @@ adb install -r dist/juping-0.1.6-release.apk
 
 ### 路径 B：U 盘（最通用，不依赖任何调试通道）
 
-1. 把 `dist/juping-0.1.6-release.apk` 拷到 U 盘。**用 FAT32** ——
+1. 把 `dist/juping-0.1.7-release.apk` 拷到 U 盘。**用 FAT32** ——
    老盒子对 exFAT / NTFS 的支持看 ROM 心情，FAT32 是唯一稳的
 2. U 盘插上盒子，用盒子自带的「文件管理 / 本地媒体 / USB 设备」找到这个文件
 3. 点它安装
@@ -207,7 +207,7 @@ adb install -r dist/juping-0.1.6-release.apk
   和源文件比一下大小，不一致就重拷一遍：
 
   ```bash
-  ls -l dist/juping-0.1.6-release.apk   # 记下这个字节数，再和 U 盘里那个比
+  ls -l dist/juping-0.1.7-release.apk   # 记下这个字节数，再和 U 盘里那个比
   # 两个数一致就说明拷完整了。
   # 刻意不写死具体数字 —— 每次重新构建都会变，写死的那份迟早对不上，
   # 反而会让人以为文件拷坏了（这里原来就写着一个过期的字节数）。
@@ -219,7 +219,7 @@ adb install -r dist/juping-0.1.6-release.apk
 
 ```bash
 cd dist && python3 -m http.server 8000
-# 盒子浏览器打开 http://<Mac 的 IP>:8000/juping-0.1.6-release.apk
+# 盒子浏览器打开 http://<Mac 的 IP>:8000/juping-0.1.7-release.apk
 ```
 
 ### 共同前提：允许「未知来源」
@@ -865,7 +865,7 @@ com/juping/cast/player/…                   →  找不到这个前缀
 
 > **最后一条是在防「核了个陈旧产物」。** 这条闸门接在 `dist` 流程里，核的是
 > 刚编出来的包；但万一有人对着 `dist/` 里的旧包跑核验，常量这一项会立刻戳穿它。
-> 顺手把 `dist/` 清干净也是同一个道理：升过版本之后不清目录，`0.1.5` 和 `0.1.6`
+> 顺手把 `dist/` 清干净也是同一个道理：升过版本之后不清目录，`0.1.7` 和 `0.1.7`
 > 会一起躺着，装机时文件名只差一个数字，眼睛一扫就挑错。
 > 现在 `collect()` 第一件事就是 `rm -f dist/*.apk`。
 >

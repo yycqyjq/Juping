@@ -86,6 +86,16 @@ public final class PlaybackPolicy {
      */
     public static final long PREPARE_PROXY_TIMEOUT_MS = 10000L;
 
+    /**
+     * Auto-Stop 的离开判定阈值（借鉴 gmrender-resurrect 的 --auto-stop）。
+     *
+     * <p>120 秒的依据：事件订阅的授予超时最长 300s（EventDispatcher 上限），
+     * 控制点续订周期可能长达数百秒 —— 阈值必须大于订阅周期才不会误停；
+     * 同时也不能太长（否则「手机退出电视还在播」要等好几分钟才停）。
+     * 120 秒 + 30 秒检查节拍 = 最迟约 2.5 分钟停止。
+     */
+    public static final long AUTO_STOP_AFTER_MS = 120000L;
+
     /** 点播流（时长已知）的卡死判定阈值 */
     public static final long STALL_THRESHOLD_VOD_MS = 20000L;
 

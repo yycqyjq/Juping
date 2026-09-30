@@ -110,6 +110,25 @@ public class UpnpHttpServer extends Thread {
 
         /** GetMute 用。必须反映真实状态，不能恒回 false */
         boolean getMute();
+
+        /**
+         * SetNextAVTransportURI —— 播放列表/连续播放：预告「下一曲」，
+         * 当前曲目自然播完后由渲染器自动续播（BubbleUPnP 的歌单连播依赖它）。
+         */
+        void onSetNextUri(String uri, String metadata);
+
+        /** GetMediaInfo 的 NextURI 用；无下一曲时返回空串（不是 null） */
+        String getNextUri();
+
+        /** GetMediaInfo 的 NextURIMetaData 用；无下一曲时返回空串（不是 null） */
+        String getNextUriMetadata();
+
+        /**
+         * /status 诊断页用 —— 返回设备当前状态的 JSON 串。
+         * 手机浏览器可达即可排障，不需要 adb（借鉴 gmrender 生态的
+         * upnp-display 思路：渲染器的「显示屏」就是浏览器）。
+         */
+        String buildStatusJson();
     }
 
     private final int port;
@@ -132,6 +151,27 @@ public class UpnpHttpServer extends Thread {
 
     private volatile boolean running = true;
     private ServerSocket serverSocket;
+
+    /**
+     * 最近一次收到控制指令（POST）的时刻 —— Auto-Stop 的「还有没有人在控制」
+     * 判据。SUBSCRIBE 续订不算指令（那由订阅存活状态另行表达）。
+     */
+    private volatile long lastControlAt = System.currentTimeMillis();
+
+    /** 距最后一次控制指令的毫秒数（Auto-Stop 判据用） */
+    public long millisSinceLastControl() {
+        return System.currentTimeMillis() - lastControlAt;
+    }
+
+    /** 当前存活的（未过期）事件订阅数（Auto-Stop 判据用） */
+    public int aliveSubscriberCount() {
+        return events.aliveSubscriberCount();
+    }
+
+    /** 最近一次 SUBSCRIBE（新建或续订）的时刻（Auto-Stop 判据用） */
+    public long lastSubscribeAt() {
+        return events.lastSubscribeAt();
+    }
 
     /**
      * 请求体上限（字节）。
@@ -537,6 +577,16 @@ public class UpnpHttpServer extends Thread {
     }
 
     private void handleGet(String path, OutputStream out) throws IOException {
+        // /status 诊断页：手机浏览器可达的 JSON 状态（排障不需要 adb）。
+        // 放在静态路由之前 —— 它是动态资源，永远 200。
+        if (path.equals("/status")) {
+            String body = handler.buildStatusJson();
+            if (body == null || body.length() == 0) {
+                body = "{}";
+            }
+            writeSimple(out, "200 OK", "application/json; charset=\"utf-8\"", body);
+            return;
+        }
         writeStatic(out, resolveStatic(path), true);
     }
 
@@ -854,7 +904,7 @@ public class UpnpHttpServer extends Thread {
             // AVTransport —— 与 SCPD_AV_TRANSPORT 的 actionList 一一对应。
             // 两边必须同步：SCPD 里没有的 action 控制点不会发（写了也是死的），
             // 而 SCPD 里有、这张表里没有的会被回 401（明明声明支持却做不到）。
-            "SetAVTransportURI", "GetMediaInfo", "GetTransportInfo", "GetPositionInfo",
+            "SetAVTransportURI", "SetNextAVTransportURI", "GetMediaInfo", "GetTransportInfo", "GetPositionInfo",
             "GetDeviceCapabilities", "GetTransportSettings", "GetCurrentTransportActions",
             "Stop", "Play", "Pause", "Seek", "Next", "Previous", "SetPlayMode",
             // ConnectionManager
@@ -874,6 +924,7 @@ public class UpnpHttpServer extends Thread {
 
     private void handlePost(String path, String soapAction, String body, OutputStream out)
             throws IOException {
+        lastControlAt = System.currentTimeMillis();
         String service = lastSegment(path);
         String action = extractActionName(soapAction, body);
         Log.i(TAG, "控制指令: service=" + service + " action=" + action);
@@ -935,6 +986,9 @@ public class UpnpHttpServer extends Thread {
         if ("SetAVTransportURI".equals(action)) {
             // 这就是投屏的入口：手机把视频 URL 推过来
             handler.onSetUri(get(args, "CurrentURI"), get(args, "CurrentURIMetaData"));
+        } else if ("SetNextAVTransportURI".equals(action)) {
+            // 播放列表/连续播放：当前曲目播完后自动续播下一曲
+            handler.onSetNextUri(get(args, "NextURI"), get(args, "NextURIMetaData"));
         } else if ("Play".equals(action)) {
             handler.onPlay();
         } else if ("Pause".equals(action)) {
@@ -1090,7 +1144,8 @@ public class UpnpHttpServer extends Thread {
                     // 原样塞进 SOAP 响应会让**整条响应变成非法 XML** ——
                     // 控制点那边是"整条报文解析失败"，而不是"少个字段"。
                     + "<CurrentURIMetaData>" + escapeXml(meta) + "</CurrentURIMetaData>"
-                    + "<NextURI></NextURI><NextURIMetaData></NextURIMetaData>"
+                    + "<NextURI>" + escapeXml(handler.getNextUri()) + "</NextURI>"
+                    + "<NextURIMetaData>" + escapeXml(handler.getNextUriMetadata()) + "</NextURIMetaData>"
                     + "<PlayMedium>" + (hasMedia ? "NETWORK" : "NONE") + "</PlayMedium>"
                     + "<RecordMedium>NOT_IMPLEMENTED</RecordMedium>"
                     + "<WriteStatus>NOT_IMPLEMENTED</WriteStatus>";
@@ -1493,6 +1548,10 @@ public class UpnpHttpServer extends Thread {
                             "in:InstanceID:A_ARG_TYPE_InstanceID",
                             "in:CurrentURI:AVTransportURI",
                             "in:CurrentURIMetaData:AVTransportURIMetaData")
+                    + action("SetNextAVTransportURI",
+                            "in:InstanceID:A_ARG_TYPE_InstanceID",
+                            "in:NextURI:AVTransportURI",
+                            "in:NextURIMetaData:AVTransportURIMetaData")
                     + action("GetMediaInfo",
                             "in:InstanceID:A_ARG_TYPE_InstanceID",
                             "out:NrTracks:NumberOfTracks",

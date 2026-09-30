@@ -652,12 +652,13 @@ PY
 #           手机轮询 GetPositionInfo 拿到旧位置，进度条被拉回去；
 #       (c) seek 未落地时位置本来就不动，看门狗会把它判成"卡死"并触发重连 ——
 #           而重连会把播放拉回开头。
-python3 - "$CTRL" "$HTTP" "$POLICY" <<'PY' || RC=1
+python3 - "$CTRL" "$HTTP" "$POLICY" "$SVC" <<'PY' || RC=1
 import re, sys, pathlib
-ctrl_path, http_path, policy_path = sys.argv[1], sys.argv[2], sys.argv[3]
+ctrl_path, http_path, policy_path, svc_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 ctrl = pathlib.Path(ctrl_path).read_text(encoding='utf-8')
 http = pathlib.Path(http_path).read_text(encoding='utf-8')
 pol_src = pathlib.Path(policy_path).read_text(encoding='utf-8')
+svc = pathlib.Path(svc_path).read_text(encoding='utf-8')
 failed = []
 
 def report(name, ok, detail=''):
@@ -802,6 +803,32 @@ report('Stop 时清代理缓冲（空闲不占 8MB）',
 report('m3u8 不走代理',
        '.m3u8' in ctrl and 'proxyable' in ctrl,
        'HLS 的分片逻辑在播放器内部，按字节寻址的代理对它没意义')
+
+# ---- ④ 播放列表（SetNextAVTransportURI）—— BubbleUPnP 歌单连播依赖它 ----
+report('SetNextAVTransportURI 已在 KNOWN_ACTIONS（SCPD 同步）',
+       'SetNextAVTransportURI' in http,
+       'SCPD 里没有的 action 控制点不会发 —— 歌单连播整个失效')
+report('自动续播复用 Set 路径（URI/元数据/事件全部对齐）',
+       'nextUrl' in ctrl and 'listener.onSourceChanged' in ctrl,
+       '自动续播不走 SOAP，服务层的 URI/元数据状态靠 onSourceChanged 对齐 —— '
+       'GetMediaInfo 回读与事件推送都依赖它')
+report('Stop/换片清下一曲队列（DLNA 语义）',
+       'nextUrl = null' in ctrl,
+       '队列不跨 Stop 存活；新 SetAVTransportURI 也作废旧队列')
+
+# ---- ⑤ Auto-Stop：控制点离开后自动停止（借鉴 gmrender --auto-stop）----
+report('Auto-Stop 判据：播放中 + 无订阅者 + 曾有订阅者 + 指令超时',
+       'checkAutoStop' in svc and 'aliveSubscriberCount' in svc
+       and 'lastSubscribeAt' in svc and 'AUTO_STOP_AFTER_MS' in pol,
+       '手机退出了电视还在播 —— gmrender 用订阅者数做判据（比指令超时稳，'
+       '不会误杀不发轮询的控制点）')
+report('Auto-Stop 挂在服务自检看门狗里',
+       'checkAutoStop();' in svc,
+       '服务已有 30 秒自检节拍，复用它而不是另起线程')
+report('/status 诊断页（浏览器可达，排障不需要 adb）',
+       '/status' in http and 'buildStatusJson' in http and 'buildStatusJson' in svc,
+       'gmrender 生态的 upnp-display 用小屏显示状态 —— 我们的「显示屏」'
+       '就是手机浏览器')
 
 ct = body_of(ctrl, 'private void scheduleContentTypeProbe(final MediaPlayer mp, final String url)')
 if ct:
