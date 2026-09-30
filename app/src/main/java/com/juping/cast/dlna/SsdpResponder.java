@@ -59,6 +59,22 @@ import java.util.concurrent.atomic.AtomicInteger;
  * 而日志里只有一句「找不到可用于组播的网卡」，看不出是时序问题。
  * 所以绑定必须**带退避地重试**，见 {@link #bindUntilReady()}。
  *
+ * <h3>第六个坑：「网卡有 IP」不等于「组播此刻就绪」</h3>
+ * 端口绑上、网卡 up 且拿到 IPv4，都**不**代表内核/驱动的组播立即可用 ——
+ * 老 MTK 设备开机初期 {@code joinGroup} 瞬时失败是实测过的。
+ * 若把加入做成「一次失败即永久放弃」，表现就是「手机突然永远搜不到、
+ * 重启 App 才好」，而所有闸门照样全绿（最隐蔽的一类回归）。
+ *
+ * <p>因此把**两个事实拆开**：
+ * <ul>
+ *   <li>{@link #isPortBound()} —— 端口绑上了没有（可用性；CI 无组播也靠它）；</li>
+ *   <li>{@link #isMulticastJoined()} / {@link #isBound()} —— 组播加没加入
+ *       （= 真机上「能不能被搜到」）。</li>
+ * </ul>
+ * 端口绑上即视为可用；组播加入失败**不阻塞**端口，改由 {@link #startJoinRetry()}
+ * 在后台带退避地反复重试，成功那一刻才广播 alive（{@link #onMulticastJoined()}）。
+ * 真机语义不放松：{@link #isBound()} 仍要求「端口已绑 <b>且</b> 网卡已选」。
+ *
  * <h3>第四个坑：ST 必须原样回给控制点</h3>
  * 控制点是拿 ST（搜索目标）去匹配应答的。如果它搜 {@code upnp:rootdevice}，
  * 而我们回一条 {@code ST: urn:...:device:MediaRenderer:1}，这条应答会被**直接丢弃** ——
@@ -246,6 +262,13 @@ public class SsdpResponder extends Thread {
     /** 定期重播线程。持有引用是为了能在 {@link #shutdown()} 里 interrupt 掉。 */
     private volatile Thread announcer;
 
+    /**
+     * 后台「重试加入组播」线程。持有引用是为了在 {@link #shutdown()} /
+     * {@link #closeQuietly()} 里 interrupt 掉 —— 老盒子上漏一个线程就是漏一个
+     * fd / 一份内存。
+     */
+    private volatile Thread joinRetryThread;
+
     /** 生产入口：版本号随构造注入（SERVER 头产品段的来源），SSDP 端口用默认 1900。 */
     public SsdpResponder(String uuid, int httpPort, String serverName, String versionName) {
         this(uuid, httpPort, serverName, SSDP_PORT, versionName);
@@ -355,7 +378,7 @@ public class SsdpResponder extends Thread {
                 }
             });
 
-            // 加入组播成功之后**立刻主动广播一轮 ssdp:alive**。
+            // 加入组播成功之后**立刻主动广播一轮 ssdp:alive**，并启动定期重播。
             //
             // 这一步是「被动发现」类控制点（网易云音乐等）唯一的入口：
             // 它们不主动发 M-SEARCH，只监听广播来构建设备列表 ——
@@ -363,11 +386,14 @@ public class SsdpResponder extends Thread {
             // 而腾讯视频 / B站 会主动搜索，所以只有前者受影响，
             // 表现为「有些 App 搜得到、有些搜不到」，极易被误判成 App 的兼容性问题。
             //
-            // 只有真的加入了组播组才广播 alive —— 没入组的话发出去没人收得到，
-            // 还会在无组播环境（CI）里刷一堆发送失败日志。单播应答不受影响。
+            // 两条路径，都要保证「广播发生在 joinGroup 成功之后」（早于它组播还没通，
+            // 发出去没人收得到）：
+            //   · 首次绑定就加入成功 → 立刻做（onMulticastJoined）；
+            //   · 还没加入 → 交给后台重试线程，加入成功时补做（见 startJoinRetry）。
             if (multicastJoined) {
-                announceAlive();
-                startAnnouncer();
+                onMulticastJoined();
+            } else {
+                startJoinRetry();
             }
 
             byte[] buf = new byte[2048];
@@ -486,32 +512,20 @@ public class SsdpResponder extends Thread {
                 // 协议测试需要的正是这个（见 isPortBound / isMulticastJoined）。
                 Log.w(TAG, "JUPING_SSDP_NO_MULTICAST=1：跳过组播加入，仅绑定端口（测试用）");
             } else {
-                // 依次尝试候选网卡：某一张 joinGroup 失败就换下一张。
-                // 只试第一张的话，一旦它在本平台上不可用（例如没有 IPv4 的隧道接口），
-                // SSDP 就静默死掉 —— 表现为「手机搜不到设备」，且日志里无从定位。
-                InetSocketAddress group =
-                        new InetSocketAddress(InetAddress.getByName(SSDP_ADDR), actualPort);
-                Exception lastError = null;
-                for (int i = 0; i < candidates.size(); i++) {
-                    NetworkInterface nif = candidates.get(i);
-                    try {
-                        s.joinGroup(group, nif);
-                        bound = nif;
-                        lastError = null;
-                        break;
-                    } catch (Exception e) {
-                        lastError = e;
-                        Log.w(TAG, "网卡 " + nif.getName() + " 加入组播失败，换下一张: " + e.getMessage());
-                    }
-                }
+                // 首次尝试加入组播（成功与否都不影响「端口可用」这个独立事实）。
+                bound = joinMulticast(s, actualPort);
                 if (bound == null) {
                     // 加入失败**不是**绑定失败：端口已经绑上、能收单播。
                     // 「端口已绑」与「组播已加入」是两个独立事实 —— CI（Azure VM
                     // 不转发组播）与无组播环境靠前者跑通协议测试；真机语义不放松
                     // （isBound() 仍为 false，界面照旧如实报未绑定）。
-                    Log.w(TAG, "所有候选网卡都无法加入组播组（候选 "
-                            + NetUtil.describeCandidates() + "）: " + lastError
-                            + "；端口仍绑定，仅单播可用");
+                    //
+                    // 但**不能就此放弃**：网卡「up + 有 IPv4」并不等于「此刻内核/
+                    // 驱动的组播已就绪」（老 MTK 设备开机初期实测会瞬时失败）。
+                    // 加入改由 startJoinRetry() 在后台带退避地重试 —— 这是相对旧代码
+                    // 「joinGroup 全失败 → reason → 退避重试」的等价行为，见那里。
+                    Log.w(TAG, "首次加入组播失败（候选 " + NetUtil.describeCandidates()
+                            + "）；端口已绑，加入将后台重试");
                 }
             }
         } catch (Exception e) {
@@ -528,52 +542,141 @@ public class SsdpResponder extends Thread {
         // 调用方（协议测试）在地址还没算好时就去读它。
         socket = s;
 
+        // LOCATION：加入成功用**实际绑上的那张网卡**算出来，不再由外部传入 ——
+        // 外部传进来的 IP 是按「第一张候选网卡」算的，而组播可能绑在第二张上，
+        // 两边一分叉就成了「组播从 eth0 收搜索请求、却告诉手机去 wlan0 取设备描述」，
+        // 表现为「搜到了却投不了屏」。还没加入时退回第一张候选，让「按 LOCATION
+        // 抓描述」这条链路先能走完。
+        String ip = (bound != null)
+                ? NetUtil.pickIpv4(bound)
+                : NetUtil.pickIpv4(candidates.get(0));
+        location = "http://" + (ip == null ? "0.0.0.0" : ip) + ":" + httpPort
+                + "/upnp/device.xml";
+        boundInterface = (bound != null) ? bound : candidates.get(0);
+        multicastJoined = (bound != null);
+
+        // boundPort 必须**最后**赋值：isBound() 判的就是它（= 能被搜到）。
+        // 先赋它的话会出现「isBound() 已经是 true、location 还是 null」的窗口。
+        // 只有真正加入组播成功才置位 —— 未加入期间 isBound() 保持 false（界面如实报未绑定）。
         if (bound != null) {
-            // ── 真正加入组播（真机主路径）：端口与地址一并就绪 ──
-            // 只有真正加入成功才对外报告"能被搜到"的端口。原来在 joinGroup
-            // 之前就赋值，结果是 UI 显示"已就绪"、实际一个搜索请求都收不到 ——
-            // 谎报军情比失败更糟。
-            boundInterface = bound;
-            multicastJoined = true;
-
-            // LOCATION 由**实际绑上的那张网卡**算出来，不再由外部传入。
-            //
-            // 外部传进来的 IP 是按「第一张候选网卡」算的，而组播可能绑在第二张上
-            // （第一张 joinGroup 失败时）。两边一分叉，就成了「组播从 eth0 收搜索请求、
-            // 却告诉手机去 wlan0 取设备描述」—— 手机搜得到设备、点进去却拉不到描述，
-            // 表现是「搜到了却投不了屏」。由 bound 直接算，两条链路必然指向同一张网卡。
-            String ip = NetUtil.pickIpv4(bound);
-            location = "http://" + (ip == null ? "0.0.0.0" : ip) + ":" + httpPort
-                    + "/upnp/device.xml";
-
-            // boundPort 必须**最后**赋值：isBound() 判的就是它。
-            // 先赋它的话，会出现「isBound() 已经是 true、location 还是 null」的窗口 ——
-            // 而调用方（界面、协议测试）拿到 isBound() 就会立刻去读 LOCATION。
-            // 顺序定死成「绑上 ⇒ 地址已经可用」，别让调用方去处理中间态。
             boundPort = actualPort;
-            // localPort 同理放在 location 之后：isPortBound() ⇒ 地址已可用。
-            localPort = actualPort;
+        }
+        // localPort 同理放在 location 之后：isPortBound() ⇒ 地址已可用。
+        localPort = actualPort;
 
-            Log.i(TAG, "SSDP 已加入组播组 " + SSDP_ADDR + ":" + boundPort
-                    + "，网卡=" + bound.getName()
-                    + "（候选 " + candidates.size() + " 张），LOCATION=" + location);
+        Log.i(TAG, "SSDP 端口已绑定 :" + localPort + "，组播="
+                + (multicastJoined ? "已加入(" + bound.getName() + ")" : "未加入(将后台重试)")
+                + "，LOCATION=" + location);
+        return null;
+    }
+
+    /**
+     * 在给定 socket 上尝试加入组播组：依次试候选网卡，成功返回加入的网卡，失败返回 null。
+     *
+     * <p>抽成一处是因为它有两个调用点：{@link #tryBindOnce()} 的首次尝试，与
+     * {@link #startJoinRetry()} 的后台重试 —— 两处的候选遍历与日志必须一致。
+     *
+     * <p>候选网卡每次**现取**（不缓存）：网络可能在这期间才就绪，重试才有意义。
+     */
+    private NetworkInterface joinMulticast(MulticastSocket s, int actualPort) {
+        if (s == null || s.isClosed() || actualPort <= 0) {
             return null;
         }
-
-        // ── 端口绑上了，但没加入组播（CI / 无组播环境）──
-        // 端口可用是独立事实：单播能收，协议测试得以运行。真机语义不放松：
-        // boundPort 不置位 ⇒ isBound() 仍为 false，界面如实报未绑定。
-        multicastJoined = false;
-        // LOCATION 仍要算出来（否则控制点/测试拿不到设备描述地址）：退回第一张
-        // 候选网卡 —— 组播没通，但「按 LOCATION 抓描述」这条链路要能走完。
-        NetworkInterface locIface = candidates.get(0);
-        String locIp = NetUtil.pickIpv4(locIface);
-        location = "http://" + (locIp == null ? "0.0.0.0" : locIp) + ":" + httpPort
-                + "/upnp/device.xml";
-        boundInterface = locIface;
-        // 同主路径：localPort 放最后 —— isPortBound() ⇒ location 已就绪。
-        localPort = actualPort;
+        List<NetworkInterface> candidates = NetUtil.pickInterfaces();
+        if (candidates.isEmpty()) {
+            return null;
+        }
+        try {
+            InetSocketAddress group =
+                    new InetSocketAddress(InetAddress.getByName(SSDP_ADDR), actualPort);
+            for (int i = 0; i < candidates.size(); i++) {
+                NetworkInterface nif = candidates.get(i);
+                try {
+                    s.joinGroup(group, nif);
+                    return nif;
+                } catch (Exception e) {
+                    Log.w(TAG, "网卡 " + nif.getName() + " 加入组播失败，换下一张: " + e.getMessage());
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "构造组播组地址失败: " + e.getMessage());
+        }
         return null;
+    }
+
+    /**
+     * 加入组播成功后的动作：立刻广播 alive + 启动定期重播。
+     *
+     * <p>两条路径共用：首次绑定就加入成功（{@link #run()} 直接调），与后台重试
+     * 加入成功（{@link #startJoinRetry()} 调）。
+     */
+    private void onMulticastJoined() {
+        announceAlive();
+        startAnnouncer();
+    }
+
+    /**
+     * 后台重试加入组播组 —— **不阻塞端口可用性**。
+     *
+     * <p>为什么必须重试，而不是失败一次就永久放弃：网卡「up + 有 IPv4」并不等于
+     * 「此刻内核/驱动的组播已就绪」。老 MTK 设备开机初期，网卡已经拿到地址、但
+     * {@code joinGroup} 瞬时失败是合理的 —— 旧代码靠退避重试自愈；若改成一次性
+     * 放弃，就表现为「手机突然永远搜不到，重启 App 才好」，而所有闸门照样全绿。
+     *
+     * <p>退避节奏与日志节流复用绑定重试那一套（{@link #RETRY_BASE_MS} 起、
+     * {@link #RETRY_MAX_MS} 封顶、{@link #RETRY_LOG_EVERY} 节流），行为一致、便于排障。
+     *
+     * <p>{@link #MULTICAST_DISABLED} 时不启动：无组播环境下重试无意义，只会刷日志。
+     */
+    private void startJoinRetry() {
+        if (MULTICAST_DISABLED) {
+            return;
+        }
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                long wait = RETRY_BASE_MS;
+                int attempt = 0;
+                while (running && !multicastJoined) {
+                    attempt++;
+                    NetworkInterface nif = joinMulticast(socket, localPort);
+                    if (nif != null) {
+                        // 加入成功：置「能被搜到」的状态，再补做广播（被动发现类
+                        // 控制点的入口）—— 与首次绑定成功走同一条 onMulticastJoined。
+                        boundInterface = nif;
+                        boundPort = localPort;
+                        String ip = NetUtil.pickIpv4(nif);
+                        location = "http://" + (ip == null ? "0.0.0.0" : ip) + ":" + httpPort
+                                + "/upnp/device.xml";
+                        multicastJoined = true;
+                        Log.i(TAG, "SSDP 后台重试第 " + attempt + " 次加入组播成功，网卡="
+                                + nif.getName() + "，LOCATION=" + location);
+                        if (running) {
+                            onMulticastJoined();
+                        }
+                        return;
+                    }
+                    if (!running) {
+                        return;
+                    }
+                    if (wait < RETRY_MAX_MS || attempt % RETRY_LOG_EVERY == 1) {
+                        Log.w(TAG, "第 " + attempt + " 次加入组播失败；"
+                                + (wait / 1000L) + " 秒后重试");
+                    }
+                    try {
+                        Thread.sleep(wait);
+                    } catch (InterruptedException e) {
+                        // closeQuietly() / shutdown() 会 interrupt 这个 sleep
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    wait = Math.min(wait * 2, RETRY_MAX_MS);
+                }
+            }
+        }, "ssdp-join-retry");
+        t.setDaemon(true);
+        joinRetryThread = t;
+        t.start();
     }
 
     private static void closeSocket(MulticastSocket s) {
@@ -1023,6 +1126,18 @@ public class SsdpResponder extends Thread {
         replyScheduler = null;
         if (sc != null) {
             sc.shutdownNow();
+        }
+
+        // 后台「重试加入组播」线程也一并叫醒退出。
+        // 它可能正卡在最长 30 秒的退避 sleep 里 —— 不 interrupt 的话，
+        // 服务销毁后这条线程还要挂着睡满一轮才退，而它醒来后第一件事
+        // 是拿 socket 去 joinGroup，那时 socket 已经被下面关掉了。
+        // 先置 null 再 interrupt：避免 shutdown() 与 run() 的 finally 两条
+        // 路径重复 interrupt（interrupt 一个已结束的线程无害，但语义上只该有一次）。
+        Thread jrt = joinRetryThread;
+        joinRetryThread = null;
+        if (jrt != null) {
+            jrt.interrupt();
         }
 
         if (s == null) {

@@ -1117,13 +1117,24 @@ if aa:
 
 run = body_of(ssdp_c, 'public void run()')
 report('SsdpResponder.run 方法体已找到', run is not None, '锚点：public void run()')
-if run:
+# 广播的触发点已经收敛到 onMulticastJoined()：首次加入成功与「后台重试加入成功」
+# 两条路径共用同一处（announceAlive + 启动定期重播）。所以判据跟着触发点走 ——
+# 停在旧结构（run() 里直接调 announceAlive）上会变成假阴性。
+omj = body_of(ssdp_c, 'private void onMulticastJoined()')
+report('SsdpResponder.onMulticastJoined 方法体已找到', omj is not None,
+       '锚点：private void onMulticastJoined()')
+if run and omj:
     report('加入组播成功之后才广播 alive',
-           re.search(r'bindUntilReady\(\)[\s\S]*?announceAlive\(\)', run) is not None,
-           '必须发生在 joinGroup 成功之后 —— 早于它的话组播还没通，发出去没人收得到')
+           re.search(r'bindUntilReady\(\)[\s\S]*?multicastJoined[\s\S]*?onMulticastJoined\(\)',
+                     run) is not None
+           and 'announceAlive()' in omj,
+           '必须发生在 joinGroup 成功之后 —— 早于它的话组播还没通，发出去没人收得到。'
+           '触发点现在是 onMulticastJoined()，且 run() 里由 multicastJoined 这个条件'
+           '把关（未加入走后台重试，不广播）')
     report('有定期重播，不是只发一轮',
-           'startAnnouncer()' in run,
+           'startAnnouncer()' in omj,
            'UDP 会丢包、控制点缓存也会过期；只发一轮的话"在线却搜不到"会反复出现')
+if run:
     report('run 里不再自己做网卡选择与「放弃」判断',
            re.search(r'pickInterfaces\(\)|isEmpty\(\)', run) is None,
            '在 run() 里直接 return 就是"永久失效"本身：这个服务是开机自启的，'
@@ -1871,6 +1882,51 @@ report('协议靶机 READY 只要求端口绑定（不要求加入组播）',
 report('协议靶机把组播状态单独报告（不静默）',
        'isMulticastJoined()' in _pts,
        '让人一眼看出是「单播模式」还是「真机同款的组播模式」，而不是靠猜')
+
+# ---- (6c) SSDP：组播加入失败改为「后台重试」，不阻塞端口可用性 ----
+# 「网卡 up + 有 IPv4」并不等于「此刻内核/驱动的组播已就绪」。老 MTK 设备开机
+# 初期 joinGroup 瞬时失败是合理的 —— 旧代码正是靠退避重试自愈的。若把加入做成
+# 「一次失败即永久放弃」，就表现为「手机突然永远搜不到、重启 App 才好」，
+# 而所有闸门照样全绿（这正是本组守卫存在的理由）。所以加入必须带退避地在后台
+# 重试，且**不阻塞**端口可用性（端口绑上即 isPortBound()=true）。
+_rb = body_of(ssdp, 'public void run()')
+report('SsdpResponder.run 方法体已找到', _rb is not None,
+       '锚点：public void run()')
+if _rb:
+    report('run() 未加入组播时启动后台重试（不是失败即放弃）',
+           'startJoinRetry()' in _rb and 'onMulticastJoined()' in _rb,
+           'run() 有两条路径：已加入 → 立即广播 alive；未加入 → 交给后台重试。'
+           '少掉后者，joinGroup 一次失败就再没有第二次机会 —— '
+           '这正是老设备开机初期瞬时失败后「永久搜不到」的成因')
+_sjr = body_of(ssdp, 'private void startJoinRetry()')
+report('SsdpResponder.startJoinRetry 方法体已找到', _sjr is not None,
+       '锚点：private void startJoinRetry()')
+if _sjr:
+    report('后台重试带退避地反复 joinMulticast（不是只试一次）',
+           'joinMulticast(' in _sjr and 'while' in _sjr
+           and 'RETRY_BASE_MS' in _sjr and 'RETRY_MAX_MS' in _sjr,
+           '退避节奏复用绑定重试那一套（2 秒起、30 秒封顶、按 RETRY_LOG_EVERY 节流）—— '
+           '写成一个循环、每次现取候选网卡，网络就绪后自愈；只试一次就等于放弃')
+report('后台重试线程被 closeQuietly 回收（不漏线程）',
+       'joinRetryThread' in ssdp and 'joinRetryThread' in cq
+       and 'interrupt()' in cq,
+       '重试线程可能卡在最长 30 秒的退避 sleep 里。不 interrupt 的话，服务销毁后'
+       '它还挂着，醒来第一件事是拿一个已经关闭的 socket 去 joinGroup')
+
+# isBound() 的两个条件必须都保留。回退分支（未加入组播时）现在也会置
+# boundInterface（退回第一张候选网卡，好让「按 LOCATION 抓描述」这条链路先走完），
+# 所以「只查 boundInterface」会假阳性 —— 端口还没绑上就报「已就绪」。
+_ib = body_of(ssdp, 'public boolean isBound()')
+report('SsdpResponder.isBound 方法体已找到', _ib is not None,
+       '锚点：public boolean isBound()')
+if _ib:
+    report('isBound() 同时要求「端口已绑」与「网卡已选」（缺一不可）',
+           'boundPort' in _ib and 'boundInterface' in _ib
+           and re.search(r'boundPort\s*>\s*0', _ib) is not None
+           and re.search(r'boundInterface\s*!=\s*null', _ib) is not None,
+           '回退分支现在也会置 boundInterface，所以「只查 boundInterface」'
+           '会让 isBound() 在端口还没绑上时也返回 true —— 界面据此报「设备已就绪」，'
+           '而实际一个搜索请求都收不到。两个条件必须都在')
 
 # ---- (7) 服务侧：自检与销毁顺序 ----
 ct = body_of(svc, 'private void checkThreadsAlive()')
