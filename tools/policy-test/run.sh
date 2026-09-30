@@ -467,11 +467,12 @@ PY
 # 两种写法都能造成它，而两种在编译期和日志里都不报任何东西：
 #   · 把越界目标原样放行；
 #   · 把「解析失败」当成 0 下发（0 是合法时刻，语义却是"跳到开头"）。
-python3 - "$SVC" "$HTTP" <<'PY' || RC=1
+python3 - "$SVC" "$HTTP" "$ACT" <<'PY' || RC=1
 import re, sys, pathlib
-svc_path, http_path = sys.argv[1], sys.argv[2]
+svc_path, http_path, act_path = sys.argv[1], sys.argv[2], sys.argv[3]
 svc = pathlib.Path(svc_path).read_text(encoding='utf-8')
 http = pathlib.Path(http_path).read_text(encoding='utf-8')
+act_src = pathlib.Path(act_path).read_text(encoding='utf-8')
 failed = []
 
 def report(name, ok, detail=''):
@@ -598,6 +599,23 @@ if bpf:
            'FLAG_ACTIVITY_NEW_TASK' in bpf and 'catch' in bpf and 'MainActivity' in bpf,
            'Service 里 startActivity 必须 NEW_TASK；唤起失败只能降级后台播放，'
            '绝不能把投屏本身掀翻。MainActivity 是 singleTask，重复唤起不会堆实例')
+    report('唤起时置位 autoFront（对称设计的前半段）',
+           'autoFront = true' in bpf,
+           '标志位是「播完退回后台」的依据 —— 只有投屏自动唤起的界面'
+           '才在播完后退回，手动打开的不动')
+
+taf = body_of(svc, 'public boolean takeAutoFrontFlag()')
+report('autoFront 标志位对外可取（界面消费「播完退回」指令）',
+       taf is not None and 'autoFront = false' in taf,
+       '标志位必须取走即清 —— 否则界面每次刷新都重复退回后台')
+
+act = body_of(act_src, 'private void applyModeIfChanged(int mode)')
+if act:
+    report('播放结束且为自动唤起的界面 → moveTaskToBack（对称设计的后半段）',
+           'moveTaskToBack' in act and 'takeAutoFrontFlag' in act
+           and 'MODE_IDLE' in act,
+           '播放结束停在前台的话，用户对着一张黑漆漆的待机面板 —— '
+           '应该退回后台让电视回到投屏之前的样子（launcher/上一个应用）')
 
 # clearError 自己也要守住：它必须**同时**清两个字段。
 # 只清分类不清洁细节 → hasTransportError 说没错了、日志里却还留着旧报错；
@@ -790,6 +808,11 @@ sk = body_of(ctrl, 'public synchronized void seekTo(int ms)')
 report('MediaPlayerController.seekTo 方法体已找到', sk is not None,
        '锚点：public synchronized void seekTo(int ms)')
 if sk:
+    report('seekTo 把水位线对齐到目标（防回拖误外推到片尾）',
+           'hiRaw = ms' in sk,
+           '往回拖之后旧的高水位线还在 —— 外推会从旧水位线出发把进度'
+           '直接推到片尾。Seek 时必须把水位线对齐到目标')
+if sk:
     report('seekTo 在未 prepare 时暂存目标，而不是丢弃',
            'pendingSeekMs' in sk,
            '丢弃的话，手机显示已经拖过去了、电视一动不动 —— 正是"不同步"')
@@ -797,6 +820,14 @@ if sk:
 gp = body_of(ctrl, 'public int getPosition()')
 report('MediaPlayerController.getPosition 方法体已找到', gp is not None,
        '锚点：public int getPosition()')
+if gp:
+    report('位置冻结时按墙钟外推（修 MTK Seek 后媒体时钟停摆）',
+           'POSITION_FREEZE_EXTRAPOLATE_MS' in gp and 'isActivelyPlaying' in gp,
+           '海信 MTK 4.0.4 实测：Seek 后 getCurrentPosition() 永远停在 '
+           'Seek 点而画面继续播 —— 原样上报的话手机进度条冻死在 Seek 位置')
+    report('外推结果钳到时长（不越过片尾）',
+           'est > dur' in gp,
+           '外推是估出来的：越过时长的进度条会把「还剩多少」算成负数')
 if gp:
     report('getPosition 在 seek 待决期间返回目标值（乐观值）',
            re.search(r'return\s+\(int\)\s*pending', gp) is not None,

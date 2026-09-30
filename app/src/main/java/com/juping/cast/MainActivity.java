@@ -261,6 +261,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (mode == lastMode) {
             return;
         }
+        // 「播放 → 空闲」且这轮界面是投屏自动唤起的：退回后台，
+        // 电视回到投屏之前的样子（launcher / 上一个应用）。
+        // 否则用户看到的是一张黑漆漆的待机面板挂在屏幕正中央。
+        // 手动打开的界面（标志位 false）不动 —— 不能把人踢出他自己开的页面。
+        boolean wasPlaying = (lastMode == MODE_AUDIO || lastMode == MODE_VIDEO);
+        if (mode == MODE_IDLE && wasPlaying && service != null && service.takeAutoFrontFlag()) {
+            moveTaskToBack(true);
+            lastMode = mode;
+            return;
+        }
         lastMode = mode;
         applyMode(mode);
     }

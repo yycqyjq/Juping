@@ -46,6 +46,16 @@ public final class PlaybackPolicy {
     public static final long VIDEO_RECHECK_SECOND_MS = 2000L;
     public static final int VIDEO_RECHECK_MAX_ATTEMPTS = 2;
 
+    /**
+     * 位置冻结判定阈值：播放中原始位置连续这么久不变，就认为媒体时钟停摆
+     * （海信 MTK 4.0.4 实测：Seek 后 getCurrentPosition() 永远停在 Seek 点，
+     * 画面却在继续播），改用「最后位置 + 墙钟流逝」外推上报。
+     *
+     * <p>2 秒起步是留缓冲：正常播放位置每次轮询都在变，只有真停摆才会
+     * 连续 2 秒纹丝不动；太短的话一次偶发的解码停顿就会被误判成时钟死掉。
+     */
+    public static final long POSITION_FREEZE_EXTRAPOLATE_MS = 2000L;
+
     /** 点播流（时长已知）的卡死判定阈值 */
     public static final long STALL_THRESHOLD_VOD_MS = 20000L;
 

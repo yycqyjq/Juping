@@ -157,6 +157,15 @@ public class MediaPlayerController {
     private volatile long pendingSeekAtMs;
 
     /**
+     * 这次 seek 是否已观察到「位置到达目标附近」。
+     * 落地判据是一次性的：播放越过目标点之后 |raw-target| 会再次变大，
+     * 拿它当持续性判据会让「报目标位置」变成永真 —— 进度条冻死在
+     * Seek 点（真机踩过）。锁存之后对外恢复真实位置上报，
+     * pendingSeekMs 的清位仍统一在 checkStall（主线程）。
+     */
+    private volatile boolean pendingSeekLanded;
+
+    /**
      * 当前音量，0.0 ~ 1.0。
      *
      * <p>**必须自己记**：{@code MediaPlayer.getVolume()} 是 API 23 才有的方法，
@@ -582,7 +591,8 @@ public class MediaPlayerController {
         // 兼着看门狗的豁免开关 —— 那种竞态只会表现为"偶发重连"，最难查。
         long pending = pendingSeekMs;
         if (pending >= 0) {
-            if (PlaybackPolicy.isSeekExpired(System.currentTimeMillis() - pendingSeekAtMs)) {
+            if (pendingSeekLanded
+                    || PlaybackPolicy.isSeekExpired(System.currentTimeMillis() - pendingSeekAtMs)) {
                 Log.w(TAG, "seek 到 " + pending + "ms 超过 "
                         + PlaybackPolicy.SEEK_PENDING_TIMEOUT_MS + "ms 仍未落地，放弃等待");
                 pendingSeekMs = -1L;
@@ -730,6 +740,11 @@ public class MediaPlayerController {
         // 它下次轮询必须看到"已经到那了"，否则就是不同步。
         pendingSeekMs = ms;
         pendingSeekAtMs = System.currentTimeMillis();
+        pendingSeekLanded = false;
+        // 水位线对齐到目标：不改的话，往回拖之后旧的高水位线会让外推
+        // 以为位置还停在旧处，甚至把进度直接推到片尾（钳到 dur 的副作用）。
+        hiRaw = ms;
+        hiWall = System.currentTimeMillis();
 
         if (player != null && prepared) {
             try {
@@ -748,6 +763,14 @@ public class MediaPlayerController {
         }
     }
 
+    /**
+     * 位置水位线：会话内见过的最大原始位置 + 见到它的墙钟。
+     * 位置只要在前进就抬水位线；停摆超过 POSITION_FREEZE_EXTRAPOLATE_MS
+     * 才从水位线外推 —— 对 1 秒粒度的抖动免疫。
+     */
+    private int hiRaw = -1;
+    private long hiWall;
+
     public int getPosition() {
         try {
             if (player == null || !prepared) {
@@ -757,29 +780,66 @@ public class MediaPlayerController {
             }
             int raw = player.getCurrentPosition();
             lastKnownPosition = raw;
+            long now = System.currentTimeMillis();
+            // 水位线：会话内见过的最大位置 + 见到它的墙钟。
+            // 正常播放时位置每拍都在前进、水位线每拍都在抬，冻结局不会触发；
+            // 它只在「位置真的停摆」的平台上兜底（见下面的外推分支）。
+            if (raw > hiRaw) {
+                hiRaw = raw;
+                hiWall = now;
+            }
             long pending = pendingSeekMs;
-            if (pending < 0) {
-                return raw;
+            if (pending >= 0) {
+                if (PlaybackPolicy.isSeekSettled(raw, pending)) {
+                    // 落地**锁存**：位置一旦到达目标附近，这次 seek 就算完成。
+                    // 不能用「|raw-target|≤容差」当持续性判据 —— 落地之后
+                    // 播放会**越过**目标点继续走，差值只会越拉越大，
+                    // 「没落地」就成了永真，目标位置被原样报 15 秒（超时兜底），
+                    // 手机进度条冻死在 Seek 点 —— 真机踩过，就是本修的起因。
+                    pendingSeekLanded = true;
+                }
+                if (!pendingSeekLanded
+                        && !PlaybackPolicy.isSeekExpired(now - pendingSeekAtMs)) {
+                    // 还没落地也没超时：报目标位置（控制点按"用户拖到哪"算，
+                    // 两边一致）。落地/超时后走通用路径 —— 位置该多少报多少。
+                    // pendingSeekMs 的清位统一在 checkStall（主线程），
+                    // 这里只置锁存标志，避免两个线程同时改一个状态。
+                    return (int) pending;
+                }
             }
-            // seek 还没落地：位置读到的还是旧值，直接报出去会让控制点的
-            // 进度条被**拉回去**。这期间报目标位置 —— 控制点自己也是按
-            // "用户拖到哪"来算的，两边一致，用户看到的就是"同步"。
-            long elapsed = System.currentTimeMillis() - pendingSeekAtMs;
-            if (PlaybackPolicy.isSeekSettled(raw, pending)
-                    || PlaybackPolicy.isSeekExpired(elapsed)) {
-                // 落地了（真实位置追上来了）或超时了 → 交回真实位置。
-                // 超时这条是诚实兜底：万一这次 seek 永远落不了地，
-                // 不能一直报乐观值 —— 那是谎报军情。
-                //
-                // **这里刻意不清 pendingSeekMs**：清它等于同时撤销看门狗的豁免，
-                // 而这一句跑在 HTTP 连接线程上、看门狗在主线程 —— 一个字段被两个
-                // 线程读写、读的那方还顺手改状态，就是竞态的温床。
-                // 收尾统一交给 checkStall() 的超时分支。
-                return raw;
+            // 位置冻结外推：个别平台 Seek 后媒体时钟可能真的停摆
+            // （水位线不再前进）。水位线之后墙钟走了超过阈值、且确实在播，
+            // 按「水位线 + 墙钟流逝」外推（钳到时长）。正常平台上水位线
+            // 每拍都在抬，这个分支永远不会进。
+            if (raw > 0
+                    && now - hiWall > PlaybackPolicy.POSITION_FREEZE_EXTRAPOLATE_MS
+                    && isActivelyPlaying()) {
+                long est = hiRaw + (now - hiWall);
+                int dur = 0;
+                try {
+                    dur = player.getDuration();
+                } catch (Exception ignored) {
+                }
+                if (dur > 0 && est > dur) {
+                    est = dur;
+                }
+                return (int) est;
             }
-            return (int) pending;
+            return raw;
         } catch (Exception e) {
             return lastKnownPosition;
+        }
+    }
+
+    /** 是否真的在播（暂停 / 未就绪 / 释放中都不算）—— 位置外推的前提 */
+    private boolean isActivelyPlaying() {
+        if (userPaused || player == null || !prepared) {
+            return false;
+        }
+        try {
+            return player.isPlaying();
+        } catch (Exception e) {
+            return false;
         }
     }
 
@@ -870,6 +930,10 @@ public class MediaPlayerController {
 
     private void releasePlayer() {
         prepared = false;
+        // 外推锚点随实例一起作废 —— 不清的话，新片源开头的正常位置
+        // 会被当成「冻结」而误触发外推。
+        hiRaw = -1;
+        hiWall = 0;
         // 实例都没了，"准备中"和"待决的 seek"也就失去了载体。
         // 不清的话，下一次播放的「当前位置」会一直报上一次拖到的那个位置 ——
         // 控制点看到的进度条是上一部片子的。

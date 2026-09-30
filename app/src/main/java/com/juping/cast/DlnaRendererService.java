@@ -237,6 +237,14 @@ public class DlnaRendererService extends Service
      */
     private volatile boolean audioOnly = false;
 
+    /**
+     * 界面是否由「投屏到达」自动唤起且尚未消费。
+     * 置位在 {@link #bringPlayerToFront()}，消费在 MainActivity 的
+     * 「播放→空闲」变迁（退回后台）。volatile：写在前台唤起路径，
+     * 读在界面刷新线程。
+     */
+    private volatile boolean autoFront = false;
+
     /** 从 DLNA 元数据里读到的内容类型：0=未知，1=音频，2=视频。 */
     private volatile int kindFromMetadata = 0;
 
@@ -605,6 +613,7 @@ public class DlnaRendererService extends Service
      */
     private void bringPlayerToFront() {
         try {
+            autoFront = true;
             Intent intent = new Intent(this, MainActivity.class);
             // Service 里 startActivity 必须带 NEW_TASK（当前不在任何任务栈里）。
             // 这里刻意不加 FLAG_IMMUTABLE 等 —— 与 startForegroundNotification
@@ -616,6 +625,20 @@ public class DlnaRendererService extends Service
             // 用 Throwable 的话会连 OutOfMemoryError 一起吞，这里 Exception 够了。
             Log.w(TAG, "唤起界面到前台失败（继续后台播放）", e);
         }
+    }
+
+    /**
+     * 界面是不是由「投屏到达」自动唤起的（且还没被消费）。
+     *
+     * <p>对称设计的一半：投屏到达 → 唤起到前台；播放结束 → 退回后台，
+     * 电视回到投屏之前的样子。由界面在「播放→空闲」变迁时取走并执行
+     * {@code moveTaskToBack}。用户手动打开的界面（标志位为 false）不动 ——
+     * 不能把正在看面板的人踢回桌面。
+     */
+    public boolean takeAutoFrontFlag() {
+        boolean v = autoFront;
+        autoFront = false;
+        return v;
     }
 
     /**
