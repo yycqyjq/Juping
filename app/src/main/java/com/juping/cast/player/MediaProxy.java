@@ -53,9 +53,17 @@ public final class MediaProxy extends Thread {
      * 每次接受新连接递增 —— 用来**顶掉**上一条 serve 线程。
      *
      * <p>本类的窗口状态是无锁共享的，设计前提是「同一时刻只有一条 serve 线程碰它」。
-     * 光靠关旧客户端 socket 保证不了这一点（旧线程可能卡在源 I/O 上），所以：
-     * {@code run()} 先 {@code ++serveGen} 让旧线程在循环里察觉自己已作废并立刻收工，
-     * 再 {@link #supersedePrevServe()} 等它真正退出，最后才起新线程。
+     * 光靠关旧客户端 socket 保证不了这一点（旧线程可能卡在源 I/O 上），所以
+     * {@code run()} 的顺序是：**先** {@link #supersedePrevServe()}（关掉旧客户端与旧
+     * 源流、并 {@code join} 等旧线程真正退出），**再** {@code ++serveGen}，最后才起
+     * 新线程。
+     *
+     * <p>也就是说，正常路径下旧线程是靠「客户端 / 源流被关」抛错退出的 —— 卡在
+     * {@code src.read()} 里的线程根本走不到这里的 gen 检查。{@code serveGen} 自察是
+     * {@code join} 超时（旧线程迟迟不退）时的**兜底**：它一旦在循环里察觉自己已作废，
+     * 就立刻收工、不再碰任何窗口状态。承重的是 {@link #supersedePrevServe()} 的
+     * 「关源流 + join」；gen 自察既不充分（只关客户端、保留 gen 自察，旧线程卡在源
+     * I/O 上仍复现字节错乱）也不必要（有 join 时去掉 gen 自察全绿）—— QA 慢源证伪实测。
      */
     private volatile long serveGen;
 
