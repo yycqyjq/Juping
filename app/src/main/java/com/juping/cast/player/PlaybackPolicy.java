@@ -96,6 +96,20 @@ public final class PlaybackPolicy {
      */
     public static final long AUTO_STOP_AFTER_MS = 120000L;
 
+    /**
+     * prepare 卡死的重建阈值：prepareAsync 发出后这么久还没回调
+     * （onPrepared/onError 都没有），判定媒体服务卡死，重建播放器自救。
+     *
+     * <p>海信 CmpbPlayer 实测：连续切歌后媒体服务可能卡死 —— 手机 Set+Play
+     * 照发，电视端 prepare 永不完成（手机卡在加载、Stop 也没反应）。
+     * 重建播放器会拿到全新的 CmpbPlayer 实例，多数情况能自救。
+     * 30 秒 = 正常 prepare（1-2 秒）的 15 倍余量，不误伤慢网络。
+     */
+    public static final long PREPARE_STUCK_REBUILD_MS = 30000L;
+
+    /** prepare 卡死后最多重建几次；用完如实报 ERROR（提示重启电视） */
+    public static final int PREPARE_STUCK_MAX_REBUILDS = 2;
+
     /** 点播流（时长已知）的卡死判定阈值 */
     public static final long STALL_THRESHOLD_VOD_MS = 20000L;
 

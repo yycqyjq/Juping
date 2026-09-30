@@ -246,6 +246,7 @@ public class MediaPlayerController {
         public void run() {
             checkStall();
             checkProxyFallback();
+            checkPrepareStuck();
             handler.postDelayed(this, WATCHDOG_INTERVAL_MS);
         }
     };
@@ -303,6 +304,8 @@ public class MediaPlayerController {
         // 新片源到达，「下一曲」队列作废（新歌单会重新 SetNext）
         nextUrl = null;
         nextMetadata = null;
+        // 新片源 = 新的 prepare 机会，卡死重建计数清零
+        prepareStuckRebuilds = 0;
         // 兜底位置同理：不清的话，新片子起播前会先报上一部的进度
         lastKnownPosition = 0;
         startInternal();
@@ -425,18 +428,20 @@ public class MediaPlayerController {
                         nextMetadata = null;
                         Log.i(TAG, "当前曲目播完，自动续播下一曲: " + u);
                         notifyState("TRANSITIONING");
-                        handler.post(new Runnable() {
+                        // 切源 + 重建放**后台线程**：与 onSetUri 的 HTTP 线程模式
+                        // 一致，且避免厂商播放器的 setDataSource 在主线程上卡住
+                        // 时把整个应用冻住（手机端表现为永久「加载中」）。
+                        // 此刻已不在 onCompletion 回调栈里，release 旧实例安全。
+                        new Thread(new Runnable() {
                             @Override
                             public void run() {
-                                // 切源 + 重建播放器（此刻已不在 onCompletion
-                                // 回调栈里，release 旧实例是安全的）
                                 currentUrl = u;
                                 startInternal();
                                 if (listener != null) {
                                     listener.onSourceChanged(u, m);
                                 }
                             }
-                        });
+                        }, "auto-advance").start();
                         return;
                     }
                     notifyState("STOPPED");
@@ -687,6 +692,39 @@ public class MediaPlayerController {
     }
 
     /**
+     * prepare 卡死的重建检查（看门狗每拍调一次）。
+     *
+     * <p>海信 CmpbPlayer 实测：连续切歌后媒体服务可能卡死 —— prepareAsync
+     * 发出后 onPrepared/onError 都不来，手机卡在「加载」、Stop 也没反应，
+     * 只能重启电视。重建播放器会拿到全新的播放器实例，多数情况能自救；
+     * 连续重建仍卡死则如实报 ERROR 并提示重启电视（媒体服务进程级卡死，
+     * 应用层无解）。
+     */
+    private void checkPrepareStuck() {
+        if (!preparing || playerReleased) {
+            return;
+        }
+        long stuckMs = System.currentTimeMillis() - prepareStartedAt;
+        if (stuckMs < PlaybackPolicy.PREPARE_STUCK_REBUILD_MS) {
+            return;
+        }
+        if (prepareStuckRebuilds >= PlaybackPolicy.PREPARE_STUCK_MAX_REBUILDS) {
+            Log.e(TAG, "prepare 连续 " + prepareStuckRebuilds + " 次重建仍卡死"
+                    + " —— 疑似电视媒体服务异常，建议重启电视后重试");
+            preparing = false;
+            nativePlayerDead = true;
+            notifyState("ERROR");
+            return;
+        }
+        prepareStuckRebuilds++;
+        Log.w(TAG, "prepare 卡死 " + stuckMs + "ms（无任何回调），第 "
+                + prepareStuckRebuilds + " 次重建播放器自救");
+        String url = currentUrl;
+        currentUrl = null;
+        play(url);
+    }
+
+    /**
      * 看门狗：检测「没报错但也不走了」的假死状态。
      *
      * <p>老设备上这种情况比硬报错更常见 —— 画面定格、进度不动、也没有 onError。
@@ -826,6 +864,9 @@ public class MediaPlayerController {
 
     /** 已确认要直连的地址（代理 prepare 超时后降级，同地址不再走代理） */
     private String bypassUrl;
+
+    /** prepare 卡死的重建计数（新片源清零；到上限如实报 ERROR） */
+    private int prepareStuckRebuilds;
 
     /**
      * 下一曲（SetNextAVTransportURI 预告的续播源）—— 播放列表/连续播放。
