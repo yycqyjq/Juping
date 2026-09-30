@@ -1907,6 +1907,19 @@ if _sjr:
            and 'RETRY_BASE_MS' in _sjr and 'RETRY_MAX_MS' in _sjr,
            '退避节奏复用绑定重试那一套（2 秒起、30 秒封顶、按 RETRY_LOG_EVERY 节流）—— '
            '写成一个循环、每次现取候选网卡，网络就绪后自愈；只试一次就等于放弃')
+    # 赋值顺序：boundPort 必须**晚于** location —— 后台重试换上的网卡可能与
+    # tryBindOnce() fallback 用的第一张候选**不同**，先置 boundPort 会让 isBound()
+    # 提前为 true，而窗口内 location 还是 fallback 算出的**旧网卡地址**，
+    # 于是 SSDP 应答把「旧网卡的 LOCATION」发出去 —— 正是「搜到了却投不了屏」。
+    # 这个窗口纳秒级、单线程测试抓不到，只能靠读代码/守卫钉住（项目已咬过两次：
+    # T4 的 localPort 早于 location、以及本处）。
+    _m_loc = re.search(r'location\s*=', _sjr)
+    _m_bp = re.search(r'boundPort\s*=', _sjr)
+    report('startJoinRetry 里 boundPort 晚于 location 赋值（绑上⇒地址已可用）',
+           _m_loc is not None and _m_bp is not None
+           and _m_loc.start() < _m_bp.start(),
+           '顺序必须与 tryBindOnce() 一致：先算 LOCATION，boundPort 最后。'
+           '反过来就会开一个「isBound() 为 true、LOCATION 还是旧网卡」的窗口')
 report('后台重试线程被 closeQuietly 回收（不漏线程）',
        'joinRetryThread' in ssdp and 'joinRetryThread' in cq
        and 'interrupt()' in cq,

@@ -643,12 +643,22 @@ public class SsdpResponder extends Thread {
                     if (nif != null) {
                         // 加入成功：置「能被搜到」的状态，再补做广播（被动发现类
                         // 控制点的入口）—— 与首次绑定成功走同一条 onMulticastJoined。
-                        boundInterface = nif;
-                        boundPort = localPort;
+                        //
+                        // 赋值顺序必须与 tryBindOnce() **完全一致**：先算 LOCATION，
+                        // 再置网卡 / 组播标志，boundPort **最后**（isBound() 判的就是它）。
+                        // 这里尤其不能把 boundPort 提前：后台重试换上的网卡（nif）
+                        // 可能与 tryBindOnce() fallback 用的第一张候选网卡**不同**，
+                        // 而那时 location 还是 fallback 算出的**旧网卡地址** ——
+                        // 先置 boundPort 就会开一个窗口，窗口内的 SSDP 应答把
+                        // 「旧网卡的 LOCATION」发出去，正是「搜到了却投不了屏」
+                        // （组播从 A 网卡收、却告诉手机去 B 网卡取描述）。
                         String ip = NetUtil.pickIpv4(nif);
                         location = "http://" + (ip == null ? "0.0.0.0" : ip) + ":" + httpPort
                                 + "/upnp/device.xml";
+                        boundInterface = nif;
                         multicastJoined = true;
+                        // boundPort 必须**最后**赋值：「绑上 ⇒ 地址已可用」。
+                        boundPort = localPort;
                         Log.i(TAG, "SSDP 后台重试第 " + attempt + " 次加入组播成功，网卡="
                                 + nif.getName() + "，LOCATION=" + location);
                         if (running) {
