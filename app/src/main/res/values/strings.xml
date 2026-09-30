@@ -10,7 +10,7 @@
     <string name="label_source">片源</string>
 
     <string name="guide_title">在手机上开始投屏</string>
-    <string name="guide_body">打开腾讯视频 / 哔哩哔哩 / 爱奇艺 / QQ音乐，\n点右上角「投屏」图标，选择下面这个名字</string>
+    <string name="guide_body">打开手机 App 的投屏功能（腾讯视频 / 网易云音乐等已实测可用），\n选择下面这个名字</string>
 
     <string name="btn_restart">重启服务</string>
 
