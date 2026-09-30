@@ -1,11 +1,12 @@
 # 桌面闸门 —— 不需要真机、也不需要 Android SDK 的那几道。
 #
-# 五道闸里有三道只依赖 JDK / python3：
-#   protocol —— 把真实的 DLNA 协议层编译到桌面 JVM，用原始 socket 跑 214 项一致性检查
+# 六道闸里有四道只依赖 JDK / python3，全部进 CI：
+#   protocol —— 把真实的 DLNA 协议层编译到桌面 JVM，用原始 socket 跑 237 项一致性检查
 #   policy   —— 播放重连策略的 57 项断言 + 全部源码级不变量守卫
+#   proxy    —— 本地预取代理的字节一致性（全量 / Range / 回拖 / EOS 边界，10 项）
 #   secrets  —— 签名密钥没有混进被跟踪的文件（这仓库是公开的，这道不能省）
 #
-# 另外 两道（API 引用核对、dex 入口点）必须先编 APK，要装整套 Android SDK，
+# 另外两道（API 引用核对、dex 入口点）必须先编 APK，要装整套 Android SDK，
 # 在 CI 上要 10 分钟以上 —— 收益撑不起耗时（这两道依赖"产物与源码的对应关系"，
 # 本地出包时反正会跑），所以刻意不进 CI。本地 ./tools/build.sh dist 一条命令全跑。
 #
@@ -19,30 +20,85 @@ on:
     branches: [main]
   pull_request:
 
+# 同一分支连推多次时，取消排队中的旧运行 —— 旧结果对新提交没有意义
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   protocol:
     name: DLNA 协议一致性
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      # setup-java v4 已被上游标记弃用（会收到 "migrate to @v5" 的告警），
+      # 升 v5。checkout 留在 v4：它没有弃用告警，只是被迫跑在 Node 24 上。
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
       - name: 跑协议测试
-        run: ./tools/build.sh protocol
+        run: |
+          set +e
+          ./tools/build.sh protocol > /tmp/gate.log 2>&1
+          rc=$?
+          tail -20 /tmp/gate.log
+          if [ "$rc" -ne 0 ]; then
+            # 失败行做成 annotation —— 否则排查得先有 GitHub token：
+            # 日志端点对未认证请求返回 403，check-runs 只给一句 "exit code 1"。
+            # 这个包装就是为了让**下次**红的时候，原因能直接从 API 读到。
+            grep -E '\[FAIL\]|^  · |!!|未绑定|启动即退出|Exception|error' /tmp/gate.log \
+              | head -8 | while IFS= read -r line; do
+                  echo "::error::${line//'%'/'%25'}"
+                done
+            exit 1
+          fi
 
   policy:
     name: 播放策略断言
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
       - name: 跑策略测试
-        run: ./tools/build.sh policy
+        run: |
+          set +e
+          ./tools/build.sh policy > /tmp/gate.log 2>&1
+          rc=$?
+          tail -20 /tmp/gate.log
+          if [ "$rc" -ne 0 ]; then
+            grep -E '\[FAIL\]|^  · |!!|Exception|error' /tmp/gate.log \
+              | head -8 | while IFS= read -r line; do
+                  echo "::error::${line//'%'/'%25'}"
+                done
+            exit 1
+          fi
+
+  proxy:
+    name: 预取代理字节一致性
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: 跑代理测试
+        run: |
+          set +e
+          ./tools/build.sh proxy > /tmp/gate.log 2>&1
+          rc=$?
+          tail -20 /tmp/gate.log
+          if [ "$rc" -ne 0 ]; then
+            grep -E '\[FAIL\]|^  · |!!|Exception|error' /tmp/gate.log \
+              | head -8 | while IFS= read -r line; do
+                  echo "::error::${line//'%'/'%25'}"
+                done
+            exit 1
+          fi
 
   secrets:
     name: 密钥核查
