@@ -261,19 +261,50 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (mode == lastMode) {
             return;
         }
-        // 「播放 → 空闲」且这轮界面是投屏自动唤起的：退回后台，
+        // 「播放 → 空闲」且这轮界面是投屏自动唤起的：**延迟**退回后台，
         // 电视回到投屏之前的样子（launcher / 上一个应用）。
-        // 否则用户看到的是一张黑漆漆的待机面板挂在屏幕正中央。
+        //
+        // 为什么必须延迟 —— MTK 平台的蓝屏怪癖：视频层刚被销毁时，
+        // 显示管线需要一拍才能切回 UI 图层，**同一帧内**把任务切到后台的话，
+        // 蓝色视频帧会粘在 launcher 上（真机 Hisense Vision-TV 实测）。
+        // 先停 2.5 秒让 SurfaceView 销毁、视频层干净移除（此时显示的是
+        // 待机面板），再退后台就看不到蓝屏了。
+        //
+        // 期间重新投屏（mode 离开 IDLE）会自动取消退避；
         // 手动打开的界面（标志位 false）不动 —— 不能把人踢出他自己开的页面。
         boolean wasPlaying = (lastMode == MODE_AUDIO || lastMode == MODE_VIDEO);
-        if (mode == MODE_IDLE && wasPlaying && service != null && service.takeAutoFrontFlag()) {
-            moveTaskToBack(true);
-            lastMode = mode;
-            return;
+        if (mode == MODE_IDLE && wasPlaying && service != null) {
+            if (service.hasAutoFrontFlag()) {
+                handler.removeCallbacks(autoBackTask);
+                handler.postDelayed(autoBackTask, AUTO_BACK_DELAY_MS);
+            }
+        } else if (mode != MODE_IDLE) {
+            handler.removeCallbacks(autoBackTask);
         }
         lastMode = mode;
         applyMode(mode);
     }
+
+    /**
+     * 延迟退回后台的阈值。2.5 秒 = SurfaceView 销毁 + 视频层从硬件
+     * 显示管线移除的余量；期间重新投屏会自动取消。
+     */
+    private static final long AUTO_BACK_DELAY_MS = 2500L;
+
+    private final Runnable autoBackTask = new Runnable() {
+        @Override
+        public void run() {
+            // 双重确认：到点时仍是空闲态、界面仍是自动唤起的，才退回后台。
+            // 期间用户重新投屏（mode 离开 IDLE）或手动打开界面（标志被消费）
+            // 都会取消或放弃。
+            if (service == null || currentMode() != MODE_IDLE) {
+                return;
+            }
+            if (service.takeAutoFrontFlag()) {
+                moveTaskToBack(true);
+            }
+        }
+    };
 
     /** 切换三种形态 */
     private void applyMode(int mode) {

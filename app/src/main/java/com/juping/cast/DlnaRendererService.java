@@ -724,6 +724,11 @@ public class DlnaRendererService extends Service
         return v;
     }
 
+    /** 只看不消费 —— 界面的延迟退回任务用来决定「到点后要不要退」 */
+    public boolean hasAutoFrontFlag() {
+        return autoFront;
+    }
+
     /**
      * 从 DLNA 元数据里判内容类型。
      *

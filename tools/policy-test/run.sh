@@ -612,11 +612,16 @@ report('autoFront 标志位对外可取（界面消费「播完退回」指令�
 
 act = body_of(act_src, 'private void applyModeIfChanged(int mode)')
 if act:
-    report('播放结束且为自动唤起的界面 → moveTaskToBack（对称设计的后半段）',
-           'moveTaskToBack' in act and 'takeAutoFrontFlag' in act
-           and 'MODE_IDLE' in act,
-           '播放结束停在前台的话，用户对着一张黑漆漆的待机面板 —— '
-           '应该退回后台让电视回到投屏之前的样子（launcher/上一个应用）')
+    report('播放结束且为自动唤起的界面 → 延迟退回后台（对称设计的后半段）',
+           'hasAutoFrontFlag' in act and 'autoBackTask' in act
+           and 'AUTO_BACK_DELAY_MS' in act,
+           '播放结束停在前台会看到待机面板；直接退后台又会撞上 MTK 蓝屏窗口 —— '
+           '延迟 2.5 秒等 SurfaceView 销毁、视频层干净移除后再退，两害相权取其轻')
+if 'moveTaskToBack' in act_src and 'AUTO_BACK_DELAY_MS' in act_src:
+    pass
+else:
+    report('退后台任务存在（moveTaskToBack + 延迟取消逻辑）', False,
+           'applyModeIfChanged 的延迟退回任务丢了')
 
 # clearError 自己也要守住：它必须**同时**清两个字段。
 # 只清分类不清洁细节 → hasTransportError 说没错了、日志里却还留着旧报错；
