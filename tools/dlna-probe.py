@@ -56,6 +56,9 @@ def ssdp_msearch(host, port, st, timeout=3.0):
     单播而不是组播：盒子上的 SSDP socket 绑在通配地址上，单播包一样能收到。
     组播在不同网络/系统上行为差异大（防火墙、AP 隔离、多网卡），
     做自检时单播的结果更可靠、也更好排查。
+
+    单播 0 应答时**不要**急着判死 —— 见 {@link ssdp_msearch_multicast}：
+    海信等自带投屏服务的电视会把单播截走，要用组播回退。
     """
     msg = ('M-SEARCH * HTTP/1.1\r\n'
            'HOST: 239.255.255.250:1900\r\n'
@@ -86,12 +89,115 @@ def ssdp_msearch(host, port, st, timeout=3.0):
     return out
 
 
+def ssdp_msearch_multicast(host, timeout=4.0):
+    """组播发 M-SEARCH（ST: ssdp:all），只收**来自目标 IP** 的应答。
+
+    为什么必须有这条路：单播 M-SEARCH 是内核投给 1900 端口上**某一个**
+    socket 的 —— 海信等自带投屏服务的电视上，那个 socket 是厂商自己的
+    服务，聚屏收不到（实测：组播 32 条应答正常、单播 0 条）。
+    真实手机控制点走的就是组播，所以组播结果才是「手机视角」的事实。
+
+    应答按源 IP == 目标过滤（局域网里别的设备也会应答）；
+    同一台电视上厂商服务和聚屏会同时应答，用 friendlyName 认出聚屏
+    （见 pick_device_replies）。
+    """
+    msg = ('M-SEARCH * HTTP/1.1\r\n'
+           'HOST: 239.255.255.250:1900\r\n'
+           'MAN: "ssdp:discover"\r\n'
+           'MX: 2\r\n'
+           'ST: ssdp:all\r\n\r\n').encode('utf-8')
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    out = []
+    try:
+        s.settimeout(timeout)
+        s.sendto(msg, ('239.255.255.250', 1900))
+        while True:
+            try:
+                data, addr = s.recvfrom(8192)
+            except socket.timeout:
+                break
+            if addr[0] != host:
+                continue
+            head, _, _ = data.decode('utf-8', 'replace').partition('\r\n\r\n')
+            lines = head.split('\r\n')
+            hdrs = {}
+            for hl in lines[1:]:
+                if ':' in hl:
+                    k, _, v = hl.partition(':')
+                    hdrs[k.strip().lower()] = v.strip()
+            out.append((lines[0] if lines else '', hdrs))
+            s.settimeout(0.6)
+    finally:
+        s.close()
+    return out
+
+
+def pick_device_replies(replies, host):
+    """同一台电视上厂商自带服务和聚屏会同时应答 —— 用 friendlyName 认出聚屏。
+
+    逐个拉 LOCATION 的 device.xml 看 friendlyName 前缀；认不出（比如
+    厂商服务恰好也叫别的、或拉取失败）就全部保留 —— 至少还能往下查。
+    """
+    locations = []
+    for _, h in replies:
+        loc = h.get('location', '')
+        if loc and loc not in locations:
+            locations.append(loc)
+    for loc in locations:
+        try:
+            _, body = http_get(loc, timeout=4)
+            fname = xml_text(body, 'friendlyName') or ''
+        except Exception:
+            continue
+        if fname.startswith('聚屏'):
+            return [(s, h) for (s, h) in replies if h.get('location', '') == loc]
+    return replies
+
+
 def do_ssdp(host, port):
     print('\n── ① SSDP 发现（手机能不能搜到这台设备）──')
     resp = ssdp_msearch(host, port, 'ssdp:all')
-    sts = [h.get('st', '') for _, h in resp]
-    check('ssdp:all 有应答', len(resp) > 0,
-          '收到 %d 条；ST = %s' % (len(resp), ', '.join(sorted(set(sts))) or '(无)'))
+    mode = 'unicast'
+
+    if not resp:
+        # 单播 0 应答 ≠ 设备死了。先组播回退（真实手机走的路），
+        # 再直连降级（SSDP 全挂时至少把 HTTP 层查清楚）。
+        hint('单播 M-SEARCH 0 应答。常见原因：电视自带的投屏服务也占着 1900，')
+        hint('单播被内核投给了它 —— 海信/乐视这类自带 DLNA 的电视上很常见。')
+        hint('改用组播探测（真实手机控制点走的就是组播）……')
+        mresp = ssdp_msearch_multicast(host)
+        check('组播回退收到来自目标的应答', len(mresp) > 0,
+              '收到 %d 条' % len(mresp))
+        if mresp:
+            resp = pick_device_replies(mresp, host)
+            mode = 'multicast'
+            hint('组播发现成功 —— 印证「单播被 1900 上的自带服务抢占」，'
+                 '真实手机不受影响。')
+
+    if not resp:
+        hint('组播也没有 → 路由器挡了组播，或设备没入组。降级为直连检查：')
+        direct_loc = 'http://%s:%d/upnp/device.xml' % (host, port)
+        try:
+            st, body = http_get(direct_loc, timeout=5)
+            fname = xml_text(body, 'friendlyName') or ''
+            if st == 200 and fname:
+                check('直连降级：HTTP 层可达（SSDP 发现异常）', True,
+                      'friendlyName=%s' % fname)
+                # 构造一条伪应答，让下游 ②③④⑤ 继续查 ——
+                # SSDP 相关的检查仍会如实标红。
+                resp = [('HTTP/1.1 200 OK (direct)',
+                         {'location': direct_loc, 'usn': '', 'server': ''})]
+                mode = 'direct'
+            else:
+                check('直连降级：HTTP 层可达（SSDP 发现异常）', False,
+                      'HTTP %s' % st)
+        except Exception as e:
+            check('直连降级：HTTP 层可达（SSDP 发现异常）', False, str(e))
+
+    check('ssdp:all 有应答', len(resp) > 0 and mode != 'direct',
+          '收到 %d 条（%s）；ST = %s'
+          % (len(resp), mode,
+             ', '.join(sorted(set(h.get('st', '') for _, h in resp))) or '(无)'))
     if not resp:
         hint('盒子没回应。按这个顺序查：')
         hint('  1. 电视界面上「网络」那一栏是不是显示「(未绑定) 候选: …」')
@@ -106,11 +212,31 @@ def do_ssdp(host, port):
         check('应答含 %s' % k.upper(), k in first, first.get(k, '(缺失)'))
 
     # 逐个搜索目标核 ST 是否原样回 —— 这是「有的 App 搜得到、有的搜不到」的根因
+    if mode == 'direct':
+        for st in ('upnp:rootdevice',
+                   'urn:schemas-upnp-org:device:MediaRenderer:1',
+                   'urn:schemas-upnp-org:service:AVTransport:1'):
+            check('搜 %s → ST 原样回' % st.split(':')[-2], False,
+                  'SSDP 不可用（单播/组播均无应答，已走直连降级）')
+        return resp
+
+    if mode == 'multicast':
+        picked_loc = first.get('location', '')
+
+        def search(st):
+            # 组播模式下逐 ST 重新组播，只保留认出的那台设备的应答
+            r = ssdp_msearch_multicast(host)
+            return [(s, h) for (s, h) in r
+                    if h.get('location', '') == picked_loc]
+    else:
+        def search(st):
+            return ssdp_msearch(host, port, st)
+
     print()
     for st in ('upnp:rootdevice',
                'urn:schemas-upnp-org:device:MediaRenderer:1',
                'urn:schemas-upnp-org:service:AVTransport:1'):
-        r = ssdp_msearch(host, port, st)
+        r = search(st)
         got = [h.get('st', '') for _, h in r]
         check('搜 %s → ST 原样回' % st.split(':')[-2] if ':' in st else st,
               st in got, '收到 ST = %s' % (', '.join(got) or '(无应答)'))
