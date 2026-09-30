@@ -558,6 +558,7 @@ public class DlnaRendererService extends Service
     @Override
     public void onSetUri(String uri, String metadata) {
         Log.i(TAG, "收到投屏地址: " + uri);
+        bringPlayerToFront();
         currentUri = uri;
         clearError();
         kindFromMetadata = kindOf(metadata);
@@ -583,6 +584,38 @@ public class DlnaRendererService extends Service
         }
         // 一收到地址就报一次：控制点那边「已收到」的反馈全靠它
         notifyEvent("AVTransport");
+    }
+
+    /**
+     * 投屏到达时把界面带到前台。
+     *
+     * <p>为什么必须做：服务是开机自启的，电视重启后**只有服务在跑、
+     * 界面从未打开** —— 这时手机一投，播放器没有可渲染的 SurfaceView，
+     * 结果是「电视屏幕停在桌面/上一个应用，只有声音」——
+     * 用户看到的就是「后台投屏」「投了没反应」。
+     * （真机 Hisense Vision-TV 实测确认过的现象。）
+     *
+     * <p>Android 4.x 允许 Service 启动 Activity（后台启动的限制是
+     * Android 10 才引入的，本机 targetSdk 19 不受影响）。
+     * MainActivity 是 singleTask：已在前台时只是无操作，在后台/没开时
+     * 把任务带回来并复用实例 —— 不会堆积多个界面。
+     *
+     * <p>每次 SetAVTransportURI 都调（不只第一次）：控制点换片时界面可能
+     * 又被用户按 Home 退到后台了，换片就应该再次把画面带回来。
+     */
+    private void bringPlayerToFront() {
+        try {
+            Intent intent = new Intent(this, MainActivity.class);
+            // Service 里 startActivity 必须带 NEW_TASK（当前不在任何任务栈里）。
+            // 这里刻意不加 FLAG_IMMUTABLE 等 —— 与 startForegroundNotification
+            // 同一条注释：那些常量是 API 23 才有的，本机 API 15 会 NoSuchFieldError。
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(intent);
+        } catch (Exception e) {
+            // 唤起失败绝不能打断投屏 —— 大不了继续后台播（声音还在）。
+            // 用 Throwable 的话会连 OutOfMemoryError 一起吞，这里 Exception 够了。
+            Log.w(TAG, "唤起界面到前台失败（继续后台播放）", e);
+        }
     }
 
     /**

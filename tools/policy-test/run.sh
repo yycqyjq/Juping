@@ -584,6 +584,21 @@ if op:
            'clearError()' in op,
            '不清的话，自愈之后顶部条会一直挂着那条已经过期的报错')
 
+su = body_of(svc, 'public void onSetUri(String uri, String metadata)')
+if su:
+    report('收到投屏即唤起界面到前台（杜绝后台投屏）',
+           'bringPlayerToFront()' in su,
+           '服务开机自启后界面可能从未打开 —— 这时投屏只有声音没有画面，'
+           '电视屏幕停在桌面（Hisense 真机实测）。每次 SetAVTransportURI 都唤起，'
+           '换片时界面若已被退到后台也能被带回来')
+
+bpf = body_of(svc, 'private void bringPlayerToFront()')
+if bpf:
+    report('前台唤起带 NEW_TASK 且兜住异常（不打断投屏）',
+           'FLAG_ACTIVITY_NEW_TASK' in bpf and 'catch' in bpf and 'MainActivity' in bpf,
+           'Service 里 startActivity 必须 NEW_TASK；唤起失败只能降级后台播放，'
+           '绝不能把投屏本身掀翻。MainActivity 是 singleTask，重复唤起不会堆实例')
+
 # clearError 自己也要守住：它必须**同时**清两个字段。
 # 只清分类不清洁细节 → hasTransportError 说没错了、日志里却还留着旧报错；
 # 只清细节不清分类 → 顶部条还挂着报错。漏掉任何一个都是自相矛盾的状态。
