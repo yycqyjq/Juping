@@ -211,6 +211,27 @@ public class UpnpHttpServer extends Thread {
      */
     private volatile boolean bound;
 
+    /**
+     * 实际监听的端口。
+     *
+     * <p>正常等于构造时给的首选端口；首选端口被别人占了就自动上移
+     * （见 {@link #bindWithFallback()}），此时这里是**真正在听**的那一个。
+     * LOCATION、界面显示、{@code /status} 都必须以它为准 —— 谁要是拿首选端口
+     * 去拼地址，一旦触发回退就会把控制点指到一个没人监听的端口上，
+     * 正是「搜得到却投不了」。
+     */
+    private volatile int actualPort = -1;
+
+    /**
+     * 首选端口被占时，向上试探的次数。
+     *
+     * <p>49152 是 UPnP 惯例端口，而老电视上厂家自带的 DLNA 栈很可能也占它
+     * （已实测海信 {@code com.hisense.an} 抢 1900）。绑不上就只有 HTTP 层死掉、
+     * SSDP 照活 —— 表现是「手机搜得到设备，但一点投屏就失败」，重启 App 也救不回。
+     * 向上试若干个足够避开这种抢占，又不会去占无关的端口。
+     */
+    private static final int PORT_BIND_TRIES = 20;
+
     public UpnpHttpServer(int port, String uuid, String friendlyName, String versionName,
                           CommandHandler handler, EventDispatcher.EventSource eventSource) {
         super("upnp-http");
@@ -262,28 +283,90 @@ public class UpnpHttpServer extends Thread {
         return bound && serverSocket != null && !serverSocket.isClosed();
     }
 
+    /**
+     * 实际监听的端口（首选端口被占时是回退后的那个）。
+     *
+     * <p>{@code start()} 里同步完成绑定，所以调用它之前先 {@code start()} 一次，
+     * 拿到的就是确定值。还没绑上时退回首选端口 —— 那只是为了日志/界面有个可打印的数，
+     * 不代表这个端口可用（可用性要看 {@link #isBound()}）。
+     */
+    public int getPort() {
+        int p = actualPort;
+        return p > 0 ? p : port;
+    }
+
+    /**
+     * 启动。**绑定在这一步同步完成**（含端口回退），accept 循环才丢给线程。
+     *
+     * <p>为什么必须同步绑：LOCATION 里的端口要和 HTTP 真正在听的端口**是同一个**。
+     * 原来绑定发生在子线程里，调用方在构造 SSDP 时只能提前写一个固定端口 ——
+     * 一旦这里触发回退，手机拿到的地址就指向一个没人监听的端口，
+     * 表现正是「搜得到设备但一点投屏就失败」。同步绑定之后，
+     * {@link #getPort()} 在 start() 返回时就已经是确定值。
+     */
     @Override
-    public void run() {
-        try {
-            serverSocket = new ServerSocket(port);
-            // bind 成功之后必须**立刻**复查 running。
+    public synchronized void start() {
+        if (!bindWithFallback()) {
+            // 候选端口全被占：不起 accept 线程。此时 isAlive() 与 isBound() 都是 false，
+            // 服务层的看门狗会按既有路径重建 —— 等于带退避的重试，不必在这里自旋。
+            return;
+        }
+        super.start();
+    }
+
+    /**
+     * 绑定监听端口，首选端口被占就往上试。
+     *
+     * @return 是否绑上；false 表示候选端口全被占，HTTP 层不可用
+     */
+    private boolean bindWithFallback() {
+        for (int i = 0; i < PORT_BIND_TRIES; i++) {
+            int candidate = port + i;
+            final ServerSocket s;
+            try {
+                s = new ServerSocket(candidate);
+            } catch (IOException e) {
+                Log.w(TAG, "端口 " + candidate + " 绑定失败: " + e.getMessage());
+                continue;
+            }
+            serverSocket = s;
+            // 绑上之后必须**立刻**复查 running。
             //
             // 竞态：shutdown() 可能正好落在「构造 ServerSocket」与「这一句」之间。
             // 那一刻 serverSocket 字段还是 null，shutdown 里那句 close 被跳过，
-            // 而这个线程紧接着就把 49152 绑上了 —— 端口被永久占住。
-            // 下次服务启动时 bind 直接 EADDRINUSE，HTTP 层彻底死掉，
+            // 而这个线程紧接着就把端口绑上了 —— 端口被永久占住。
+            // 下次服务启动时 bind 直接失败，HTTP 层彻底死掉，
             // 而 SSDP 还活着 —— 表现就是「手机搜得到设备，但一点投屏就失败」，
             // 且重启 App 也救不回来（端口一直占着）。
             if (!running) {
-                try {
-                    serverSocket.close();
-                } catch (IOException ignored) {
-                }
-                Log.i(TAG, "启动途中已被要求关闭，端口 " + port + " 已释放");
-                return;
+                closeQuietly(s);
+                serverSocket = null;
+                Log.i(TAG, "启动途中已被要求关闭，端口 " + candidate + " 已释放");
+                return false;
             }
+            actualPort = candidate;
             bound = true;
-            Log.i(TAG, "UPnP HTTP 服务已启动，端口 " + port);
+            if (i > 0) {
+                Log.w(TAG, "首选端口 " + port + " 被占，已回退到 " + candidate);
+            }
+            Log.i(TAG, "UPnP HTTP 服务已启动，端口 " + candidate);
+            return true;
+        }
+        Log.e(TAG, "端口 " + port + "~" + (port + PORT_BIND_TRIES - 1)
+                + " 全部绑定失败，HTTP 层不可用（SSDP 仍在，控制点会「搜得到但投不了」）");
+        return false;
+    }
+
+    private static void closeQuietly(ServerSocket s) {
+        try {
+            s.close();
+        } catch (IOException ignored) {
+        }
+    }
+
+    @Override
+    public void run() {
+        try {
             while (running) {
                 final Socket socket;
                 try {
@@ -1591,9 +1674,11 @@ public class UpnpHttpServer extends Thread {
                             "in:InstanceID:A_ARG_TYPE_InstanceID",
                             "out:Actions:CurrentTransportActions")
                     + action("Stop", "in:InstanceID:A_ARG_TYPE_InstanceID")
-                    + action("Play",
-                            "in:InstanceID:A_ARG_TYPE_InstanceID",
-                            "in:Speed:TransportPlaySpeed")
+                    // Play 的 in:Speed **刻意不声明**：老平台没有变速播放能力，
+                    // 声明了又不照做（Speed=2 也按 1x 播）就是"声明做不到的事"。
+                    // 控制点据此就不会发 Speed；即便发了也被忽略（仍按 1x 播，
+                    // CurrentSpeed 如实回 1）。
+                    + action("Play", "in:InstanceID:A_ARG_TYPE_InstanceID")
                     + action("Pause", "in:InstanceID:A_ARG_TYPE_InstanceID")
                     + action("Seek",
                             "in:InstanceID:A_ARG_TYPE_InstanceID",

@@ -967,19 +967,22 @@ for label, marker in [('stop()', 'public synchronized void stop()'),
            '不清的话，下一次播放会拿着上一次的 seek 目标当"当前位置"报给控制点')
 
 # ---- ③ 重投：HTTP 服务 bind 竞态不得泄漏端口 ----
-run = body_of(http, 'public void run()')
-report('UpnpHttpServer.run 方法体已找到', run is not None, '锚点：public void run()')
-if run:
-    # 判据必须落在「bind 之后真的关过一次 socket」上。
+# 绑定已从 run() 移进 bindWithFallback()（为的是同步绑定 + 端口被占时回退），
+# 判据的锚点跟着移 —— 守的还是同一件事：绑上之后真关过一次 socket。
+bb = body_of(http, 'private boolean bindWithFallback()')
+report('UpnpHttpServer.bindWithFallback 方法体已找到', bb is not None,
+       '锚点：private boolean bindWithFallback()')
+if bb:
+    # 判据必须落在「绑上之后真的复查 running 并关过一次 socket」上。
     #
     # 只查 if (!running) 是不够的 —— accept 的 catch 里本来就有一句
     # if (!running) break;，那句会让断言**恒真**，永远发现不了这里的回归。
     # （这条是证伪时发现的：把兜底整段删掉，断言居然还是绿的。）
     report('bind 之后有兜底：复查 running 并释放端口',
-           re.search(r'new ServerSocket\(port\)[\s\S]*?serverSocket\.close\(\)',
-                     run) is not None,
+           re.search(r'new ServerSocket\([\s\S]*?if\s*\(!running\)[\s\S]*?closeQuietly\(',
+                     bb) is not None,
            'shutdown() 可能正好落在 bind 与赋值之间：那一刻 serverSocket 还是 null，'
-           'close 被跳过，线程却把 49152 绑上了 —— 端口被永久占住，'
+           'close 被跳过，线程却把端口绑上了 —— 端口被永久占住，'
            '下次启动 bind 直接失败，表现为「搜得到设备但投不上去」')
 
 ib = body_of(http, 'public boolean isBound()')
@@ -1569,6 +1572,30 @@ if gli:
            '或是隧道接口）时，界面显示的 IP 和 SSDP 告诉手机的 LOCATION 就不是同一个。'
            '判据是**顺序**：先 getBoundIp()，兜底才 return localIp ——'
            '反过来的话（先 return localIp）这段代码就永远走不到后面那句')
+
+# 端口同一个道理：HTTP 首选端口被占会自动回退，界面 / 状态页显示的端口
+# 必须来自「实际在听」的那个，而不是首选常量 —— 否则照着界面地址 curl，
+# 怎么都复现不了用户的问题，看着还像"盒子没问题"。
+ghp = body_of(svc_c, 'public int getHttpPort()')
+report('DlnaRendererService.getHttpPort 方法体已找到', ghp is not None,
+       '锚点：public int getHttpPort()')
+if ghp:
+    report('界面取端口走 currentHttpPort（实际端口），不直接回常量',
+           'currentHttpPort()' in ghp and 'HTTP_PORT' not in ghp,
+           '直接 return HTTP_PORT 的话，49152 被占、回退到相邻端口之后，'
+           '界面和 /status 还在报 49152 —— 那是没人监听的地址（与上面 getLocalIp 同理）')
+
+# 网络变化时 applyNetworkChange 是「先 SSDP 后 HTTP」（守卫钉着这个顺序），
+# 所以重建 HTTP 若是换了端口，必须回头让 SSDP 重算 LOCATION，否则手机拿到的
+# 地址指向旧端口 —— 正是「搜得到但投不了」。
+rhb = body_of(svc_c, 'private void restartHttp(')
+report('DlnaRendererService.restartHttp 方法体已找到', rhb is not None,
+       '锚点：private void restartHttp(')
+if rhb:
+    report('restartHttp 端口变化时重同步 SSDP 的 LOCATION',
+           re.search(r'getPort\(\)[\s\S]*?restartSsdp\(', rhb) is not None,
+           '端口因占用变了却不同步的话，SSDP 广播的 LOCATION 还指着旧端口；'
+           '重启的是 HTTP、手机却去了一个没人听的地址')
 
 sys.exit(1 if failed else 0)
 PY

@@ -51,4 +51,9 @@ __pycache__/
 *.pyc
 
 # 西瓜的本地待办/工作上下文，不进公开仓库
-.agent/
+.agent/*
+# 例外：协作手册 AGENTS.md 要进版本库。
+# 它是「断言/守卫计数」的单一事实来源之一 —— 计数守卫
+# （tools/check_policy_counts.py）要拿它核对，CI 与 clone 者也得看得到。
+# （QA 在 T9 点过：AGENTS.md 不进 commit，正是「计数单一事实来源不存在」的根因。）
+!.agent/AGENTS.md

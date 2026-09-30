@@ -237,6 +237,15 @@ verify_policy() {
     out="$(mktemp)"
     if tools/policy-test/run.sh >"$out" 2>&1; then
         echo "  策略: $(grep -oE '播放策略：.*' "$out" | head -1)"
+        # 计数守卫 —— 防「文档里写的断言/守卫数」与「实际跑出来的」悄悄对不上。
+        # 这些数字散落在 README.md 与 .agent/AGENTS.md 里手写同步（5 处），
+        # 靠人肉同步必然漂：本轮之前就有过 proxy 用例 10→11、两处文档漏改，
+        # 是 QA 跑测试才发现的。对齐不上就红，逼着改文档或改期望值。
+        if [ -f tools/check_policy_counts.py ]; then
+            if ! python3 tools/check_policy_counts.py "$out"; then
+                rm -f "$out"; return 1
+            fi
+        fi
         rm -f "$out"; return 0
     fi
     echo "  !! 播放策略核验未通过 —— 断联后可能不会恢复，或无限重连：" >&2

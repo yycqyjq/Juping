@@ -1,0 +1,207 @@
+# AGENTS.md — 聚屏（Juping）Agent 协作手册
+
+> 面向 AI Agent 的项目速查手册。用户文档看 `README.md`，当前任务与状态看
+> `.agent/todo.md`，历史方案看 `.agent/optimization-report.md` /
+> `modification-plan.md`。**改代码前必读本文的第 4、6 节。**
+
+## 1. 项目速览
+
+Android DLNA 投屏接收端（DMR），目标设备是 **2012 年的老电视/盒子**
+（实测主力机：海信 Vision-TV，MTK 芯片，Android 4.0.4，API 15，0.6GB 内存）。
+零第三方依赖，minSdk 14，语言全中文注释。
+
+**资源稀缺排序（实测结论）**：固件媒体栈质量 > 硬件性能 > 带宽（充裕）。
+优化方向是绕固件坑，不是网络。
+
+## 2. 常用命令
+
+```bash
+cd /Users/yjq/Desktop/Juping   # 所有命令都从这里出发
+
+# ── 构建（六道闸门全跑，绿了才算完）──
+./tools/build.sh dist          # debug+release 双包 + 全部核验 → dist/
+
+# ── 单独闸门 ──
+./tools/build.sh proxy         # 本地预取代理字节一致性（11 项）
+./tools/build.sh lint          # lint
+./tools/build.sh clean         # 清理
+
+# ── 真机（adb over Wi-Fi）──
+ADB=~/$.android-build/sdk/platform-tools/adb ./tools/verify-on-device.sh 192.168.1.8
+# 或手工：adb connect 192.168.1.8:5555 → install -r dist/*.apk → am startservice
+
+# ── 控制点视角自检（不需要真机）──
+python3 tools/dlna-probe.py 192.168.1.8     # 真机；桌面跑见 protocol-test
+
+# ── 运行中诊断 ──
+curl http://<电视IP>:49152/status           # JSON 状态页（0.1.7+）
+adb shell setprop log.tag.UpnpHttpServer DEBUG && adb logcat | grep UpnpHttpServer
+adb shell am broadcast -a com.juping.cast.APPLY_RENAME --es name "新名字"   # 改名
+```
+
+**git 注意**：`.git/index.lock` 会被外部进程反复重建，提交必须
+`rm -f .git/index.lock && git add -A && git commit` 同一条命令链。
+
+## 3. 代码组件地图
+
+```
+app/src/main/java/com/juping/cast/
+├── DlnaRendererService.java   前台服务心脏：装配全部组件、Auto-Stop、
+│                              改名广播处理、/status 数据源、30s 自检看门狗
+├── UpnpHttpServer.java        HTTP+SOAP+SSCPD+GENA 订阅：HTTP 端口首选 49152、
+│                              被占自动上移（getPort() 是端口唯一出处），
+│                              /status 诊断页，lastControlAt（Auto-Stop 判据）
+├── SsdpResponder.java         SSDP 组播应答；单播时灵时不灵（海信自带服务
+│                              抢 1900），probe 已做组播回退；端口可用与
+│                              组播就绪解耦（joinGroup 失败后台带退避重试）
+├── EventDispatcher.java       GENA 订阅表+NOTIFY 投递；订阅数=Auto-Stop 判据
+├── NetUtil.java               网卡选择唯一出处
+├── DidlLite.java              DIDL-Lite 元数据解析
+├── MainActivity.java          界面：前台唤醒/播完延迟退后台（MTK 蓝屏规避）
+├── RenameReceiver.java        adb 改名广播入口（唯一 exported 指令面）
+├── BootReceiver.java          开机自启
+└── player/
+    ├── MediaPlayerController.java  播放+看门狗+重连+位置外推+prepare 卡死
+    │                               重建+nativePlayerDead 守卫（见 §6）
+    ├── MediaProxy.java             本地预取缓冲代理（PROXY_ENABLED 默认关：
+    │                               海信 CmpbPlayer 黑盒，详见 todo.md）
+    └── PlaybackPolicy.java         纯逻辑策略/阈值常量（桌面可测）
+tools/
+├── build.sh              一键构建+六道闸门（apk/api/dex/protocol/policy/proxy/secrets）
+├── verify-on-device.sh   真机一条命令验收
+├── probe-tv.sh           电视硬件信息探测（只读）
+├── dlna-probe.py         控制点视角自检（单播→组播回退→直连降级，33/34 项）
+├── check_api_compat.py   平台 API 引用逐个核对（260+ 命中）
+├── check_dex_entrypoints.py  R8 后 dex 入口点核查
+├── check_sources.py      无 JDK 环境的源码结构检查
+├── check_no_secrets.py   密钥泄漏核查
+├── check_policy_counts.py  断言/守卫计数 ↔ README/AGENTS 文档 一致性
+├── apk_info.py           APK 包名/minSdk 解析
+├── make_icon.py          位图资源生成（纯标准库）
+├── protocol-test/        DLNA 协议一致性 237 项（桌面 JVM + 真实协议栈桩）
+├── policy-test/          播放策略 57 断言 + 265 源码级守卫
+└── proxy-test/           MediaProxy 字节一致性 11 项
+```
+
+## 4. 测试与闸门矩阵
+
+`./tools/build.sh dist` 依次跑，**任何一门红都不能提交**：
+
+| 闸门 | 内容 | 断言数 |
+|------|------|--------|
+| verify_apk | 签名/minSdk | 每包 |
+| verify_api | 平台 API 引用逐个核对（目标 API 15/33） | 260+/272+ |
+| verify_dex | R8 后框架回调/Thread 子类/协议常量存活 | 全量 |
+| verify_protocol | DLNA 协议一致性（drive.py，期望 237/237） | 237 |
+| ↳ 内含 probe | 控制点自检（**33 或 34 双态**：组播回退分支） | 33/34 |
+| verify_policy | 播放策略 57 断言 + 265 源码级守卫 | 57+ |
+| ↳ 内含计数 | 文档里的断言/守卫数 ↔ 实际跑出来的（`check_policy_counts.py`） | 一致性 |
+| verify_proxy | MediaProxy 字节一致性（全量/Range/回拖/EOS/中途重连） | 11 |
+| verify_secrets | 密钥泄漏 | 零命中 |
+
+**总数守卫是特性**：协议 237、probe 33/34 双态（组播回退分支）、策略 57。
+有意增删断言后必须同步 build.sh / run.sh 里的期望值。
+
+**计数单一事实来源**：策略的断言/守卫数写在 `README.md` 与 `.agent/AGENTS.md`
+里（措辞「N 项断言」/「N 条源码级守卫」或省量词的写法都算）。`verify_policy`
+末尾用 `tools/check_policy_counts.py` 拿这两个文档和实际 `[PASS]` 数核对，
+对不上就红 —— 再不用靠人肉同步多处手写数字（那必然漂，T9 就是被 QA 抓到的）。
+`AGENTS.md` 因此**必须进版本库**（见根目录 `.gitignore` 里那条例外）。
+
+## 5. 真机调试手册（Hisense Vision-TV 实测坑）
+
+**排障流程**：`adb connect 192.168.1.8:5555` → 清日志 → 复现 → **3 秒内**
+读日志（主缓冲极小，hwcomposer 秒级刷掉）→ `/status` 交叉验证。
+
+| 坑 | 事实 | 对策 |
+|----|------|------|
+| 单播 SSDP 时灵时不灵 | 内核把单播在聚屏与自带服务间二选一 | probe 组播回退；别写依赖单播的工具 |
+| NIC up+IPv4 ≠ 组播就绪 | 开机初期内核/驱动的 `joinGroup` 可瞬时失败 | 加入失败后台带退避重试、不放弃；端口绑上即可用（`isPortBound`） |
+| 跨网段组播全灭 | 路由器挡组播 | 控制端与电视同一 Wi-Fi |
+| 出站端口策略 | 8123 拒 / 8080 放行 | 测试服务用常见端口 |
+| /proc/net 被过滤 | udp/tcp 表缺 App 条目 | 用 dumpsys SurfaceFlinger 判视频层 |
+| logcat 缓冲秒级刷掉 | hwcomposer 刷屏 | 清空→复现→立即读 |
+| CmpbPlayer 黑盒 | 连 localhost 代理即断；prepare 可卡死无回调 | PROXY_ENABLED 默认关；prepare 卡死看门狗自救 |
+| Seek 后位置冻结/抖动 | getCurrentPosition 停在 Seek 点 | 水位线+墙钟外推（已实现） |
+| 时长解析错 | 个别 MP4 报短 | 无解，观察项 |
+| screencap 截不到视频层 | 只截应用 UI | 配合 GetPositionInfo 判真实播放 |
+| 蓝屏（视频层无内容） | MTK 硬件输出蓝色 | 空闲时藏 SurfaceView；退后台延迟 2.5s |
+| macOS zsh 无 setsid | 后台服务起不来 | 用受管后台任务（run_in_background） |
+| Mac 全局代理 | 局域网 curl 被 58199 拦 | curl 加 --noproxy '*' |
+
+### 实时调试会话（临时任务配方，非项目文件）
+
+用户实测投屏时的标准抓日志姿势（本次会话反复使用）。两个任务都是
+**内联命令、会话级托管**，磁盘上无脚本文件；本节就是它们的完整用法。
+
+#### 任务 A：测试源 HTTP 服务（端口 8080）
+
+**用途**：给合成投屏提供媒体源——验证播放/Seek/续播等功能时，
+不依赖真实 CDN（CDN URL 带签名会过期，且不方便控制时长）。
+
+```bash
+# 启动（必须用受管后台任务，前台命令会被会话回收；macOS zsh 无 setsid）
+cd /tmp/cast-test && python3 -m http.server 8080 --bind 0.0.0.0
+```
+
+| 事项 | 说明 |
+|------|------|
+| 服务内容 | `/tmp/cast-test/` 目录下所有文件（test.mp4=11s、bbb.mp4=10s） |
+| 投屏地址 | `http://<Mac 的 IP>:8080/<文件名>` —— Mac IP 用 `ifconfig en0` 查，**换网络会变** |
+| 加测试视频 | `curl -sL --noproxy '*' -o /tmp/cast-test/xxx.mp4 <下载地址>`（--noproxy 必加，见上表代理坑） |
+| 何时需要 | Agent 做合成投屏测试时；**用户用手机真投 CDN 流时不需要** |
+| 用完即停 | `pkill -f "http.server 8080"`（挂一整天会占着后台面板） |
+
+#### 任务 B：实时日志捕获（/tmp/tv_session.log）
+
+**用途**：全量录制电视 logcat——电视本地缓冲秒级被刷掉，文件捕获
+是唯一保得住完整时间线的方式。用户实测时必须先开这个再让用户操作。
+
+```bash
+# 清空 + 开始录制（受管后台任务持续写文件）
+adb -s 192.168.1.8:5555 shell "logcat -c"
+adb -s 192.168.1.8:5555 logcat -v time > /tmp/tv_session.log 2>&1
+```
+
+| 事项 | 说明 |
+|------|------|
+| 分析 | `grep -E "控制指令\|播放状态\|收到投屏\|NOTIFY 失败\|播放错误\|重连" /tmp/tv_session.log \| tail -50` |
+| 过滤刷屏 | 先滤掉 hwcomposer/wpa_supplicant/HiMarket/dalvikvm（占 90%+） |
+| 文件增长 | ~10 万行/小时（刷屏为主），grep 分析不受影响，不必重启 |
+| 电视重启后 | adb 断开 → 任务随之结束，需重连后重开捕获 |
+| 时长/位置/URI 交叉验证 | 配合 `curl http://<电视IP>:49152/status`（见 §2） |
+
+#### 标准排障时序
+
+1. 起任务 B（清空 + 录制）→ 2. 用户操作投屏 → 3. 用户报现象（带时间点）
+→ 4. 立即 grep 分析时间线 → 5. 需要画面证据时 `adb shell screencap`
+（注意：screencap 截不到视频层，只能看到应用 UI）。
+
+注意：这两个任务是**会话级**的（WorkBuddy 后台任务面板可见），
+调试会话结束即可停掉；测试源文件在 `/tmp/cast-test/`，均不属于项目。
+分析时要先过滤 hwcomposer/wpa_supplicant/HiMarket 刷屏行。
+
+## 6. 修改纪律（铁律，违反会返工）
+
+1. **六道闸门全绿才能提交**；断言总数变了必须同步期望值（probe 是 33/34 双态）。
+2. **源码级守卫是资产**：修 bug 时同步加守卫（policy-test 里 report()），
+   防回归；改代码结构时同步改守卫锚点。
+3. **破坏性证伪**：修复前先复现红灯，修后确认绿灯；还原文件用反向
+   replace，不用 `git checkout --`。
+4. **错误态/已释放的 MediaPlayer 碰不得**：任何方法调用都触发 -38 回调
+   （走事件不走异常，try/catch 挡不住）→ ERROR 刷屏死循环。必须用
+   `nativePlayerDead`/`playerReleased` 标志挡调用本身（全套守卫已布）。
+5. **乐观值必须有会终结的落地判据**：「未落地报目标位置」的持续性判据
+   会成永真（进度条冻死在 Seek 点，已修）。
+6. **协议面向真实控制点**：新字段/新 action 先查控制点会不会发
+   （BubbleUPnP/腾讯视频/B站/网易云实测），SCPD 与 KNOWN_ACTIONS 同步。
+7. **真机验证 = 电视屏幕实际观察**：screencap 截不到视频层，位置数据
+   用 GetPositionInfo 交叉验证；需要人眼看画面时明确请用户确认。
+8. **文档三处同步**：README（用户）、.agent/todo.md（状态）、本文件（Agent）。
+
+## 7. 当前状态指针
+
+- 版本 0.1.7（versionCode 8），全部推送 GitHub（main）。
+- 未完成/观察项清单：`.agent/todo.md` §五（真机发现）、§六（生态调研 P1/P2）。
+- 代理（MediaProxy）默认关：CmpbPlayer 黑盒两症状未定根因，开
+  `PlaybackPolicy.PROXY_ENABLED=true` 可继续迭代。

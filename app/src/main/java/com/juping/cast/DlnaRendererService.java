@@ -54,7 +54,14 @@ public class DlnaRendererService extends Service
     static final String PREFS = "juping";
     private static final String KEY_UUID = "device_uuid";
 
-    /** DLNA 服务端口。用固定端口方便排查，冲突概率很低。 */
+    /**
+     * DLNA 服务的**首选**端口。
+     *
+     * <p>49152 是 UPnP 惯例端口，用固定端口方便排查。但它不再是"写死"的：
+     * 被别的进程占了（老电视上厂家自带的 DLNA 栈很可能也占它）会由
+     * {@link UpnpHttpServer#getPort()} 回退到相邻端口，LOCATION、界面、
+     * {@code /status} 一律显示**实际**端口。这个常量只是绑定的起点。
+     */
     private static final int HTTP_PORT = 49152;
 
     /**
@@ -287,14 +294,19 @@ public class DlnaRendererService extends Service
         // 图标要在 start() 之前给 —— 设备描述是随请求现生成的，
         // 但早点给上可以让"第一台来搜的控制点"就看到图标。
         provideDeviceIcon();
+        // start() 里同步完成绑定（含端口回退），返回时端口就是确定值。
         httpServer.start();
 
-        // 只把 HTTP 端口交给 SSDP，不传拼好的 LOCATION ——
+        // 只把 **HTTP 实际监听的端口** 交给 SSDP，不传拼好的 LOCATION ——
         // 设备描述地址里的 IP 必须等组播真的绑上某张网卡之后才知道。
         // 提前在外面拼一个，就等于把「组播绑哪张网卡」和「告诉手机去哪取描述」
         // 拆成两次独立选择：第一张候选网卡 joinGroup 失败时，组播会绑到第二张上，
         // 而 LOCATION 还指着第一张 —— 手机搜得到设备、点进去却拉不到描述。
-        ssdp = new SsdpResponder(uuid, HTTP_PORT, serverName, BuildConfig.VERSION_NAME);
+        //
+        // 端口同理必须用 getPort() 而不是首选常量：49152 被占时 HTTP 会回退到
+        // 别的端口，这里要是还报首选端口，手机就会去一个没人听的地址取描述 ——
+        // 又是「搜得到但投不了」。
+        ssdp = new SsdpResponder(uuid, httpServer.getPort(), serverName, BuildConfig.VERSION_NAME);
         ssdp.start();
 
         // 网络变化监听。放在两条链路都起来之后注册 —— 注册本身不做事，
@@ -305,7 +317,7 @@ public class DlnaRendererService extends Service
         // 这种情况能早点进日志。
         watchdog.postDelayed(watchdogTask, WATCHDOG_INTERVAL_MS);
 
-        Log.i(TAG, "接收端已就绪：名称=" + friendlyName + " HTTP 端口=" + HTTP_PORT
+        Log.i(TAG, "接收端已就绪：名称=" + friendlyName + " HTTP 端口=" + httpServer.getPort()
                 + "（设备描述地址等 SSDP 绑上网卡后确定）");
     }
 
@@ -533,9 +545,12 @@ public class DlnaRendererService extends Service
             // 不关就重建等于漏一个 socket + 一个调度器。
             s.shutdown();
         }
-        ssdp = new SsdpResponder(uuid, HTTP_PORT, serverName, BuildConfig.VERSION_NAME);
+        // 用 HTTP **实际在听**的端口，而不是首选常量 —— 回退过一次之后
+        // 首选常量就再也对不上了（见 currentHttpPort）。
+        int httpPort = currentHttpPort();
+        ssdp = new SsdpResponder(uuid, httpPort, serverName, BuildConfig.VERSION_NAME);
         ssdp.start();
-        Log.i(TAG, "已重建 SSDP（" + reason + "）");
+        Log.i(TAG, "已重建 SSDP（" + reason + "，LOCATION 端口 " + httpPort + "）");
     }
 
     /**
@@ -547,13 +562,22 @@ public class DlnaRendererService extends Service
      */
     private void restartHttp(String reason) {
         UpnpHttpServer h = httpServer;
+        int before = h != null ? h.getPort() : -1;
         if (h != null) {
             h.shutdown();
         }
         httpServer = new UpnpHttpServer(HTTP_PORT, uuid, friendlyName, BuildConfig.VERSION_NAME, this, this);
         provideDeviceIcon();
         httpServer.start();
-        Log.i(TAG, "已重建 HTTP 服务（" + reason + "）");
+        int after = httpServer.getPort();
+        Log.i(TAG, "已重建 HTTP 服务（" + reason + "，端口 " + after + "）");
+        // 端口若变了，SSDP 正在广播的 LOCATION 就指向旧端口 —— 必须让它重算 LOCATION。
+        // applyNetworkChange 的顺序是「先 SSDP 后 HTTP」（守卫钉着这个顺序），
+        // 所以这里重建 HTTP 时 SSDP 已经拿着旧端口起来了，这是唯一能补上的一步：
+        // 少了它，回退过端口的设备在网络变化之后就变成「搜得到但投不了」。
+        if (httpServer.isBound() && after != before) {
+            restartSsdp(reason + "：HTTP 端口变为 " + after);
+        }
     }
 
     private void startForegroundNotification() {
@@ -1173,9 +1197,24 @@ public class DlnaRendererService extends Service
         return localIp;
     }
 
-    /** HTTP 端口。暴露出来是为了让界面显示地址时不必再硬编码一遍端口号。 */
+    /**
+     * HTTP **实际监听**的端口。暴露出来是为了让界面/`/status` 显示地址时
+     * 不必再硬编码一遍端口号，也不会在端口回退后显示一个错的。
+     */
     public int getHttpPort() {
-        return HTTP_PORT;
+        return currentHttpPort();
+    }
+
+    /**
+     * 取当前 HTTP 服务的实际端口，还没建起来时退回首选常量。
+     *
+     * <p>单一出口：LOCATION、界面、{@code /status} 都从这里拿端口，
+     * 免得有哪一处还在用 {@link #HTTP_PORT} 这个首选值 —— 一旦发生回退，
+     * 那一处就会给出一个没人监听的地址。
+     */
+    private int currentHttpPort() {
+        UpnpHttpServer h = httpServer;
+        return h != null ? h.getPort() : HTTP_PORT;
     }
 
     /**

@@ -373,17 +373,19 @@ public class ProtocolTestServer {
 
         server.start();
 
-        // 只把 HTTP 端口交给 SSDP —— LOCATION 由响应器在**绑上组播之后**
-        // 用实际绑定的那张网卡的 IPv4 拼出来（和真实服务完全一致）。
+        // 只把 HTTP **实际监听**的端口交给 SSDP —— LOCATION 由响应器在
+        // **绑上组播之后**用实际绑定的那张网卡的 IPv4 拼出来（和真实服务完全一致）。
+        // 端口取 getPort() 而不是构造时那个入参：绑定时被占会回退，
+        // 入参就不一定是真正在听的那个了（与生产代码 DlnaRendererService 一致）。
         // 驱动会顺着它去抓 device.xml，这一步正是「搜到了却投不了屏」的典型断点。
-        SsdpResponder ssdp = new SsdpResponder(UUID, port, "Android/4.0.4", ssdpPort,
+        SsdpResponder ssdp = new SsdpResponder(UUID, server.getPort(), "Android/4.0.4", ssdpPort,
                 TEST_VERSION);
         ssdp.start();
 
         // 等两个服务真的起来，再告诉驱动可以开始了
         long deadline = System.currentTimeMillis() + 5000;
         while (System.currentTimeMillis() < deadline) {
-            try (java.net.Socket s = new java.net.Socket("127.0.0.1", port)) {
+            try (java.net.Socket s = new java.net.Socket("127.0.0.1", server.getPort())) {
                 break;
             } catch (IOException e) {
                 Thread.sleep(50);
@@ -432,7 +434,7 @@ public class ProtocolTestServer {
         // （而不是另一张）—— 正是「组播从 eth0 收、却告诉手机去 wlan0 取描述」
         // 那个「搜到了却投不了屏」的故障点。第 7 列是组播状态（multicast /
         // no-multicast），让「单播模式」在日志里一眼可见。
-        System.out.println("READY " + port + " " + actualSsdpPort + " " + location
+        System.out.println("READY " + server.getPort() + " " + actualSsdpPort + " " + location
                 + " " + ssdp.getBoundInterfaceName() + " " + ssdp.getBoundIp()
                 + " " + (ssdp.isMulticastJoined() ? "multicast" : "no-multicast"));
         System.out.flush();
