@@ -33,21 +33,54 @@ cd "$ROOT"
 
 # --- 工具链路径 ---
 TOOLCHAIN="${ANDROID_BUILD_HOME:-$HOME/.android-build}"
-export JAVA_HOME="$TOOLCHAIN/jdk/Contents/Home"
+# JAVA_HOME 的选择顺序（与 tools/*-test/run.sh 保持一致，改一处要同步另一处）：
+#   ① 环境里已有可用的 javac → 尊重它。CI 上 setup-java 会设；本地也可能
+#      指向系统 JDK。**不能无条件覆盖** —— 那样在没有本地工具链的机器上
+#      （CI runner）会直接报「工具链不完整」退出，而这几道桌面闸门本来
+#      只需要一个 JDK。
+#   ② 否则回退到自包含工具链；macOS 解出来的 Contents/Home 与 Linux 的
+#      平铺布局都要认。
+if [ -z "${JAVA_HOME:-}" ] || [ ! -x "$JAVA_HOME/bin/javac" ]; then
+    if [ -x "$TOOLCHAIN/jdk/Contents/Home/bin/javac" ]; then
+        export JAVA_HOME="$TOOLCHAIN/jdk/Contents/Home"
+    elif [ -x "$TOOLCHAIN/jdk/bin/javac" ]; then
+        export JAVA_HOME="$TOOLCHAIN/jdk"
+    else
+        # 都没有：保留原路径，让下面的前置检查给出可读的报错
+        export JAVA_HOME="$TOOLCHAIN/jdk/Contents/Home"
+    fi
+fi
 export ANDROID_HOME="$TOOLCHAIN/sdk"
 export ANDROID_SDK_ROOT="$TOOLCHAIN/sdk"
 export GRADLE_USER_HOME="$TOOLCHAIN/gradle-home"
 GRADLE_BIN="$TOOLCHAIN/gradle/bin/gradle"
 BT="$ANDROID_HOME/build-tools/33.0.0"
 
-# --- 前置检查：工具链是否齐 ---
+# --- 前置检查：按子命令区分需要什么 ---
+# protocol / policy / proxy 是纯桌面闸门，只需要一个 JDK（CI 上跑的就是它们）；
+# secrets 连 JDK 都不需要（纯 python3）。**不能一律要求完整工具链** ——
+# 那会让这几道闸门在 CI 上永远跑不起来（实测：workflow 连续 4 次全红，
+# 根因就是这里无条件检查 gradle / android.jar）。
+case "${1:-debug}" in
+    protocol|policy|proxy) NEED_JAVA=1; NEED_TOOLCHAIN=0 ;;
+    secrets)               NEED_JAVA=0; NEED_TOOLCHAIN=0 ;;
+    *)                     NEED_JAVA=1; NEED_TOOLCHAIN=1 ;;
+esac
+
 missing=0
-for p in "$JAVA_HOME/bin/java" "$GRADLE_BIN" "$ANDROID_HOME/platforms/android-33/android.jar"; do
-    if [ ! -e "$p" ]; then
-        echo "缺少工具链组件: $p" >&2
+check_tool() {
+    if [ ! -e "$1" ]; then
+        echo "缺少工具链组件: $1" >&2
         missing=1
     fi
-done
+}
+if [ "$NEED_JAVA" -eq 1 ]; then
+    check_tool "$JAVA_HOME/bin/java"
+fi
+if [ "$NEED_TOOLCHAIN" -eq 1 ]; then
+    check_tool "$GRADLE_BIN"
+    check_tool "$ANDROID_HOME/platforms/android-33/android.jar"
+fi
 if [ "$missing" -ne 0 ]; then
     cat >&2 <<'EOF'
 
