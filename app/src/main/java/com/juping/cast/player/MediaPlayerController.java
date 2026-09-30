@@ -217,6 +217,7 @@ public class MediaPlayerController {
         @Override
         public void run() {
             checkStall();
+            checkProxyFallback();
             handler.postDelayed(this, WATCHDOG_INTERVAL_MS);
         }
     };
@@ -299,7 +300,30 @@ public class MediaPlayerController {
             if (surface != null) {
                 player.setSurface(surface);
             }
-            player.setDataSource(currentUrl);
+            // 本地预取代理：http(s) 渐进流经 127.0.0.1 缓冲后喂给播放器，
+            // 把富余带宽兑换成「数据已在本地」。m3u8（HLS）自带分片逻辑，
+            // 按字节寻址的代理没意义，bypass 直连。曾经代理超时的地址
+            // （bypassUrl）也直连 —— 厂商自研播放器栈的行为不会自己变好。
+            // 开关见 PlaybackPolicy.PROXY_ENABLED（当前默认关，原因见彼处注释）。
+            String playUrl = currentUrl;
+            boolean proxyable = PlaybackPolicy.PROXY_ENABLED
+                    && currentUrl != null
+                    && (currentUrl.startsWith("http://") || currentUrl.startsWith("https://"))
+                    && !currentUrl.contains(".m3u8")
+                    && !currentUrl.equals(bypassUrl);
+            proxiedCurrent = false;
+            // MediaProxy **无条件创建**：开关关闭时它只是个空壳对象（缓冲在
+            // localize 之后才分配）。放在条件内的话，R8 会把 PROXY_ENABLED=false
+            // 折叠成死代码把整个类从 dex 里删掉 —— dex 入口点守卫数对不上就红了。
+            if (proxy == null) {
+                proxy = new MediaProxy(PlaybackPolicy.PROXY_BUFFER_BYTES);
+            }
+            if (proxyable) {
+                playUrl = proxy.localize(currentUrl);
+                proxiedCurrent = !playUrl.equals(currentUrl);
+            }
+            prepareStartedAt = System.currentTimeMillis();
+            player.setDataSource(playUrl);
             player.setScreenOnWhilePlaying(true);
 
             player.setOnPreparedListener(new MediaPlayer.OnPreparedListener() {
@@ -384,6 +408,10 @@ public class MediaPlayerController {
             // 本来就只在"prepare 快慢"这个边界上出问题，赌不起。
             preparing = true;
             player.prepareAsync();
+            // 看门狗必须在 **prepare 阶段就跑起来**：原来只在 onPrepared 里
+            // 启动，等于「prepare 卡死」的整个窗口内没有任何探测 ——
+            // 代理路径的超时降级正是要在这个窗口里生效的。
+            startWatchdog();
             notifyState("PREPARING");
         } catch (Exception e) {
             Log.e(TAG, "启动播放失败", e);
@@ -571,6 +599,31 @@ public class MediaPlayerController {
     }
 
     /**
+     * 代理路径 prepare 超时的降级检查（看门狗每拍调一次）。
+     *
+     * <p>厂商自研播放器栈对 127.0.0.1 代理的行为不可控（海信 CmpbPlayer
+     * 实测：连接后立即断开，prepare 永远不完成）—— 不能让投屏永远卡在
+     * TRANSITIONING。超时就把这个地址记入 bypass，直连重建。
+     * prepare 成功的代理路径不受影响（preparing 会翻转为 prepared）。
+     */
+    private void checkProxyFallback() {
+        if (!preparing || !proxiedCurrent) {
+            return;
+        }
+        if (System.currentTimeMillis() - prepareStartedAt
+                < PlaybackPolicy.PREPARE_PROXY_TIMEOUT_MS) {
+            return;
+        }
+        Log.w(TAG, "代理路径 prepare 超时，降级直连重试");
+        String url = currentUrl;
+        bypassUrl = url;
+        proxiedCurrent = false;
+        // 打破幂等判定强制重建：currentUrl 置空后 play() 会当成新片源
+        currentUrl = null;
+        play(url);
+    }
+
+    /**
      * 看门狗：检测「没报错但也不走了」的假死状态。
      *
      * <p>老设备上这种情况比硬报错更常见 —— 画面定格、进度不动、也没有 onError。
@@ -699,10 +752,27 @@ public class MediaPlayerController {
         }
     }
 
+    /** 本地预取缓冲代理（懒创建；Stop 时清缓冲，断流重连特意保留） */
+    private MediaProxy proxy;
+
+    /** 当前这次播放是否走的代理路径 */
+    private boolean proxiedCurrent;
+
+    /** 本次 prepare 的起始时刻 —— 代理超时降级的计时基准 */
+    private long prepareStartedAt;
+
+    /** 已确认要直连的地址（代理 prepare 超时后降级，同地址不再走代理） */
+    private String bypassUrl;
+
     public synchronized void stop() {
         userPaused = false;
         currentUrl = null;
         stallCount = 0;
+        // Stop = 控制点明确结束：代理缓冲立刻释放（8MB 不能在空闲时占着）。
+        // 断流重连路径不走这里，所以缓冲能活过重连 —— 那正是它的价值。
+        if (proxy != null) {
+            proxy.reset();
+        }
         cancelPendingRetry();
         handler.removeCallbacks(watchdog);
         // 停了就没有"待决的 seek"可言。不清的话，下一次播放的当前位置

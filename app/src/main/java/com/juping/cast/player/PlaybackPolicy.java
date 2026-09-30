@@ -56,6 +56,36 @@ public final class PlaybackPolicy {
      */
     public static final long POSITION_FREEZE_EXTRAPOLATE_MS = 2000L;
 
+    /**
+     * 本地预取代理的环形缓冲容量。
+     *
+     * <p>8MB 的依据：0.6GB 的盒子 + largeHeap，8MB 是安全线；
+     * 对 2Mbps 的常见投屏码率相当于 32 秒的内容余量 —— Seek 落在这个
+     * 窗口内立即出画面，落在窗口外才需要重新对源取数。
+     */
+    public static final int PROXY_BUFFER_BYTES = 8 * 1024 * 1024;
+
+    /**
+     * 本地预取代理开关（当前默认关）。
+     *
+     * <p>桌面字节一致性测试 10/10 通过，但在海信 CmpbPlayer（自研播放器栈）
+     * 真机上：代理连接后立即被对方断开（EPIPE），prepare 卡死；超时降级直连
+     * 后 CmpbPlayer 的直连也出现异常挂起 —— 厂商栈是黑盒，两个症状都还没
+     * 定位到根因。在根因清楚之前默认关：**先保住已验证可靠的直连路径**，
+     * 机制和测试全部保留，打开开关即可继续真机迭代。
+     */
+    public static final boolean PROXY_ENABLED = false;
+
+    /**
+     * 代理路径 prepare 的超时降级阈值。
+     *
+     * <p>厂商自研播放器栈对 127.0.0.1 代理的行为不可控（海信 CmpbPlayer
+     * 实测：连接后立即断开，prepare 永远不完成）。代理是为标准 MediaPlayer
+     * 准备的增强，不能让不兼容的厂商栈把投屏永远卡在 TRANSITIONING ——
+     * 超时就记下这个地址降级直连。
+     */
+    public static final long PREPARE_PROXY_TIMEOUT_MS = 10000L;
+
     /** 点播流（时长已知）的卡死判定阈值 */
     public static final long STALL_THRESHOLD_VOD_MS = 20000L;
 

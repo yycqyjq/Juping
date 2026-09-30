@@ -67,12 +67,13 @@ echo "  通过（证明 PlaybackPolicy 确实不依赖 Android 运行时）"
 # 这里用 android.jar 做一次快速语法/类型检查，几秒钟就能挡住这类问题。
 echo "── 编译 MediaPlayerController（对着 android.jar 快速语法检查）──"
 ANDROID_JAR="${ANDROID_HOME:-$TOOLCHAIN/sdk}/platforms/android-33/android.jar"
+MPROXY="app/src/main/java/com/juping/cast/player/MediaProxy.java"
 if [ ! -f "$ANDROID_JAR" ]; then
     echo "  跳过（找不到 ${ANDROID_JAR}）"
 else
     mkdir -p "$OUT/ctrl"
     if "$JAVAC" -nowarn -encoding UTF-8 -cp "$ANDROID_JAR" -d "$OUT/ctrl" \
-            "$POLICY" "$CTRL" 2>"$OUT/ctrl.err"; then
+            "$POLICY" "$CTRL" "$MPROXY" 2>"$OUT/ctrl.err"; then
         echo "  通过（MediaPlayerController 语法与类型检查无误）"
     else
         echo "编译失败：" >&2
@@ -651,11 +652,12 @@ PY
 #           手机轮询 GetPositionInfo 拿到旧位置，进度条被拉回去；
 #       (c) seek 未落地时位置本来就不动，看门狗会把它判成"卡死"并触发重连 ——
 #           而重连会把播放拉回开头。
-python3 - "$CTRL" "$HTTP" <<'PY' || RC=1
+python3 - "$CTRL" "$HTTP" "$POLICY" <<'PY' || RC=1
 import re, sys, pathlib
-ctrl_path, http_path = sys.argv[1], sys.argv[2]
+ctrl_path, http_path, policy_path = sys.argv[1], sys.argv[2], sys.argv[3]
 ctrl = pathlib.Path(ctrl_path).read_text(encoding='utf-8')
 http = pathlib.Path(http_path).read_text(encoding='utf-8')
+pol_src = pathlib.Path(policy_path).read_text(encoding='utf-8')
 failed = []
 
 def report(name, ok, detail=''):
@@ -776,6 +778,30 @@ if vr:
     report('视频复查次数有上限（到顶认命，纯音频判成音乐卡片本来就是对的）',
            'VIDEO_RECHECK_MAX_ATTEMPTS' in vr,
            '无上限的话，一条真的没有视频的音频流会让复查永远空转')
+
+# ---- ③ 本地预取代理：把富余带宽兑换成「数据已在本地」 ----
+pol = strip_comments(pol_src)
+report('代理开关默认关（厂商栈黑盒，根因清楚前保直连）',
+       'PROXY_ENABLED = false' in pol,
+       '海信 CmpbPlayer 真机实测：代理连接即被断开 + 降级直连也挂起，'
+       '两个症状未定根因前默认关，机制与测试保留，开开关即可继续迭代')
+report('http 流经本地预取代理（m3u8 直连）',
+       'proxy.localize' in ctrl,
+       '海信真机实测：起播/Seek 后的卡顿是老播放器自己取数保守，网络是闲的。'
+       '经 127.0.0.1 预取代理，解码器永远读本地；m3u8 有自己的分片逻辑必须 bypass')
+report('代理路径 prepare 有超时降级（不兼容厂商栈不死等）',
+       'checkProxyFallback' in ctrl and 'PREPARE_PROXY_TIMEOUT_MS' in pol,
+       'CmpbPlayer 实测：连接后立即断开，prepare 永远不完成 —— '
+       '超时降级直连，不让投屏永远卡在 TRANSITIONING')
+report('代理缓冲容量来自策略常量（0.6GB 盒子的内存纪律）',
+       'PROXY_BUFFER_BYTES' in ctrl,
+       '环形缓冲绝不落盘、绝不超限 —— 容量来自纯逻辑层的常量，方便标定')
+report('Stop 时清代理缓冲（空闲不占 8MB）',
+       'proxy.reset()' in ctrl,
+       '断流重连特意保留缓冲，但 Stop 是控制点明确结束 —— 空闲时不能占着')
+report('m3u8 不走代理',
+       '.m3u8' in ctrl and 'proxyable' in ctrl,
+       'HLS 的分片逻辑在播放器内部，按字节寻址的代理对它没意义')
 
 ct = body_of(ctrl, 'private void scheduleContentTypeProbe(final MediaPlayer mp, final String url)')
 if ct:

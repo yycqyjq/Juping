@@ -35,8 +35,8 @@ android {
         // versionCode 随每次「要拿去装机」的包递增。
         // 覆盖安装本身不看它，但「设置 → 应用信息」里能靠它一眼分辨
         // 装的是哪一版 —— 真机排障时很有用（分不清新旧会白试一轮）。
-        versionCode 6
-        versionName "0.1.5"
+        versionCode 7
+        versionName "0.1.6"
     }
 
     if (hasSigningConfig) {

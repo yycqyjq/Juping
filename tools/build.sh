@@ -14,6 +14,7 @@
 #   ./tools/build.sh dex          # 核验 dex 里框架回调/Thread 子类/协议常量是否完好
 #   ./tools/build.sh protocol     # 跑 DLNA 协议层一致性测试（桌面 JVM，不需要真机）
 #   ./tools/build.sh policy       # 跑播放重连策略测试（纯逻辑 + 源码不变量守卫）
+#   ./tools/build.sh proxy        # 跑本地预取代理测试（字节一致性）
 #   ./tools/build.sh clean        # 清理构建产物
 #
 # 产物：
@@ -215,6 +216,19 @@ verify_policy() {
     rm -f "$out"; return 1
 }
 
+verify_proxy() {
+    if [ ! -f tools/proxy-test/run.sh ]; then
+        echo "  代理: 跳过（没有 tools/proxy-test/run.sh）"
+        return 0
+    fi
+    if ! tools/proxy-test/run.sh; then
+        echo "  !! 本地预取代理核验未通过 —— 投屏可能花屏或数据错乱：" >&2
+        echo "     代理吐出的字节必须与源逐字节一致，差一个就是花屏。" >&2
+        return 1
+    fi
+    echo "  代理: 字节一致性通过（全量/Range/回拖/EOS 边界）"
+}
+
 # 密钥核查：这个仓库是要公开的，而 release 签名密钥一旦泄漏，
 # 任何人都能伪造出「能覆盖升级到已装设备上」的 APK —— 比源码泄漏严重得多。
 # 所以把「密钥有没有混进被跟踪的文件」做成闸门，而不是靠人记得去翻。
@@ -315,6 +329,10 @@ PY
         verify_dex app/build/outputs/apk/release/app-release.apk
         ;;
 
+    proxy)
+        verify_proxy
+        ;;
+
     dist)
         if [ ! -f keystore.properties ]; then
             echo "!! 缺少 keystore.properties，跳过 release 构建。" >&2
@@ -337,6 +355,9 @@ PY
         echo
         echo "=== 播放策略（同上，纯逻辑，不需要真机）==="
         verify_policy
+        echo
+        echo "=== 本地预取代理（同上，纯 Java，不需要真机）==="
+        verify_proxy
         echo
         echo "=== 密钥核查（这个仓库要公开）==="
         verify_secrets
