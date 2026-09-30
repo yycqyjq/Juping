@@ -23,6 +23,11 @@
 #                       盒子上应用固定用 1900，一般不用动；它存在的意义是
 #                       让这个脚本自己也能被自测（见 verify-device-selftest.sh）。
 #
+# 环境变量：
+#   ADB=<路径>          指定 adb 可执行文件（默认用 PATH 里的 adb）
+#   APK=<路径>          直接指定要装的包（默认扫 dist/juping-*.apk）。
+#                       自测会喂一个随仓库提交的 fixture，从而不依赖 dist/。
+#
 # 前置：盒子已开 USB 调试（Android 4.0 路径：设置 → 开发者选项 → USB 调试）
 #
 # 退出码：0 = 全过；1 = 有失败项；2 = 环境问题（没 adb / 没设备 / 装不上）
@@ -104,12 +109,21 @@ echo "  设备      : ${DEV_MODEL:-未知}"
 echo "  Android   : ${DEV_REL:-未知}（API ${DEV_SDK:-未知}）"
 
 # ─────────────────────────────────────────── 1. 选包 + minSdk 比对
-APK=""
-for cand in dist/juping-*-release.apk dist/juping-*-debug.apk; do
-    [ -f "$cand" ] && APK="$cand" && break
-done
+# APK 可由外部指定（与 ADB 对称）—— 自测会喂一个随仓库提交的 fixture，
+# 这样这条管道就不再依赖 dist/ 里的发布产物（CI 干净检出里没有 dist/）。
+# 未指定时才去 dist/ 里找发布包。
+APK="${APK:-}"
+if [ -z "$APK" ]; then
+    for cand in dist/juping-*-release.apk dist/juping-*-debug.apk; do
+        [ -f "$cand" ] && APK="$cand" && break
+    done
+fi
 if [ -z "$APK" ]; then
     echo "  产物      : 没有找到 —— 先跑 ./tools/build.sh dist" >&2
+    exit 2
+fi
+if [ ! -f "$APK" ]; then
+    echo "  产物      : 指定的安装包不存在：$APK" >&2
     exit 2
 fi
 echo "  安装包    : $APK"

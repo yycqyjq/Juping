@@ -10,7 +10,9 @@
 #
 # 做法：
 #   造一个"假 adb"，按真实 adb 的输出格式回放那几条命令；
-#   靶机用 protocol-test 起的那个**真服务**（真 UpnpHttpServer + 真 SsdpResponder）。
+#   靶机用 protocol-test 起的那个**真服务**（真 UpnpHttpServer + 真 SsdpResponder）；
+#   安装包用 fixtures/ 下随仓库提交的**极小 fixture APK** —— 不是 dist/ 里的发布产物，
+#   否则 CI 干净检出里没有 dist/，verify-on-device.sh 的选包闸门会直接 exit 2。
 #   于是整条管道——解析参数 → 比 minSdk → 装包 → 起服务 → 从 logcat 抠地址
 #   → 调 dlna-probe.py → 判结论——都被真跑了一遍。
 #
@@ -30,6 +32,17 @@ SSDP_PORT="${2:?用法: verify-device-selftest.sh <HTTP端口> <SSDP端口>}"
 
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
+
+# 夹具：一个能被 apk_info.py 解析出 minSdk=14 的最小 APK（随仓库提交）。
+# 于是这个自测**不依赖 dist/** —— CI 的干净检出里没有构建产物，
+# 而 verify-on-device.sh 的选包闸门只认 dist/juping-*.apk，缺了就会 exit 2，
+# 把下面 6 条断言全部带红（这正是协议闸门「macOS 能过、CI 全红」的根因）。
+FIXTURE="$HERE/fixtures/selftest-min-sdk-14.apk"
+if [ ! -f "$FIXTURE" ]; then
+    echo "  [FAIL] 找不到夹具：$FIXTURE" >&2
+    echo "         生成：python3 \"$HERE/fixtures/make_fixture.py\"" >&2
+    exit 1
+fi
 
 FAIL=0
 ok()  { echo "  [PASS] $1"; }
@@ -83,6 +96,7 @@ echo "── 真机验收脚本自测（假 adb + 真靶机）──"
 LOG="$OUT/verify.log"
 FAKE_LOGCAT="$OUT/logcat.txt" \
 ADB="$OUT/adb" \
+APK="$FIXTURE" \
     "$ROOT/tools/verify-on-device.sh" --ssdp-port "$SSDP_PORT" \
     >"$LOG" 2>&1
 RC=$?
@@ -114,7 +128,7 @@ grep -q "真机验收通过" "$LOG" \
 
 # ⑥ 反面对照：设备 API 只有 13（低于 minSdk 14），闸门必须拦住
 #    —— 不做这一条，就等于不知道 ③ 那条闸门到底有没有在工作
-FAKE_LOGCAT="$OUT/logcat.txt" FAKE_SDK=13 ADB="$OUT/adb" \
+FAKE_LOGCAT="$OUT/logcat.txt" FAKE_SDK=13 ADB="$OUT/adb" APK="$FIXTURE" \
     "$ROOT/tools/verify-on-device.sh" --ssdp-port "$SSDP_PORT" \
     >"$OUT/neg.log" 2>&1
 NEG=$?
