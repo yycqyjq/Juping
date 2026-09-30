@@ -877,6 +877,10 @@ public class DlnaRendererService extends Service
 
     @Override
     public void onPrepared(int durationMs, boolean hasVideo) {
+        // 注意：这个方法可能对同一次播放被调用两次 —— 老芯片（MTK 5880 实测）
+        // onPrepared 时视频尺寸未就绪，播放器先按纯音频回调，延迟复查确认
+        // 有视频后再以 hasVideo=true 重调。本方法幂等：audioOnly 由
+        // 元数据 / hasVideo 重新定夺，界面轮询刷新自然跟上。
         // 播放已经真的就绪了 —— 把之前那条错误清掉。
         //
         // 不清的话会出一个很别扭的现象：一次**已经自愈**的断流（onError → 重连 →

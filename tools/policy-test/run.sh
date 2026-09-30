@@ -725,6 +725,42 @@ if prep:
     report('onPrepared 补发 prepare 期间暂存的 seek',
            'pendingSeekMs' in prep,
            '不补发的话，投屏刚起来时拖的进度条会被永久丢弃 —— 电视一动不动')
+    report('视频判定为纯音频时安排延迟复查（老芯片尺寸晚就绪）',
+           'scheduleVideoRecheck' in prep,
+           'MTK 5880 实测：onPrepared 时 getVideoWidth() 仍返回 0 —— '
+           '只判一次的话视频流被误判成纯音频，电视上对着视频弹「音乐投屏」卡片')
+
+vr = body_of(ctrl, 'private void scheduleVideoRecheck(final MediaPlayer mp, final int attempt)')
+if vr:
+    report('视频复查校验播放器实例与就绪状态（防过期复查串台）',
+           'player != mp' in vr and 'prepared' in vr and 'hasVideo' in vr,
+           '复查排队期间可能已重连/换片/停止 —— 不校验的话，过期复查会把'
+           '上一个片源的判定套到新片源上')
+    report('视频复查翻案后重新回调 onPrepared（而不是只改字段）',
+           'listener.onPrepared' in vr,
+           '只改字段的话界面（轮询刷新）要等下一拍才知道，'
+           '重新回调让"纯音频→视频"的形态切换立刻发生')
+    report('视频复查次数有上限（到顶认命，纯音频判成音乐卡片本来就是对的）',
+           'VIDEO_RECHECK_MAX_ATTEMPTS' in vr,
+           '无上限的话，一条真的没有视频的音频流会让复查永远空转')
+
+ct = body_of(ctrl, 'private void scheduleContentTypeProbe(final MediaPlayer mp, final String url)')
+if ct:
+    report('Content-Type 探测只有 video/* 才翻案成视频',
+           ct.find('startsWith("video/")') >= 0
+           and 'video/' in ct and 'return' in ct,
+           'audio/* 必须维持音乐卡片 —— 把音频误判成视频，用户对着黑屏'
+           '以为投屏坏了，比卡片盖住视频更糟（宁漏勿错）')
+    report('Content-Type 探测回调前校验实例与状态',
+           'player != mp' in ct and 'prepared' in ct and 'hasVideo' in ct,
+           '探测走独立线程，排队期间可能已重连/换片/停止 —— '
+           '不校验的话过期回调会把上一个片源的判定套到新片源上')
+pc = body_of(ctrl, 'private static String probeContentType(String url)')
+if pc:
+    report('Content-Type 探测有超时（不无限等）',
+           'setConnectTimeout(3000)' in pc and 'setReadTimeout(3000)' in pc,
+           '探测线程是拿片源连通性的试金石：服务器不回就该放弃，'
+           '挂着等只会白养一个线程')
 
 err = body_of(ctrl, 'new MediaPlayer.OnErrorListener()')
 report('OnErrorListener 匿名类体已找到', err is not None,

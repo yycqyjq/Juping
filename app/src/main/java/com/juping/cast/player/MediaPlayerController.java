@@ -66,6 +66,11 @@ public class MediaPlayerController {
          * <p>{@code hasVideo == false} 表示这是**纯音频流**（音乐投屏）。
          * 界面必须据此切到音乐形态 —— 否则 SurfaceView 上什么都没有，
          * 电视就是一片黑，用户会以为投屏坏了（声音其实正常在放）。
+         *
+         * <p><b>可能对同一次播放回调多次</b>：老芯片在 onPrepared 时
+         * 视频尺寸未就绪（getVideoWidth()==0），先按纯音频回调；
+         * 延迟复查确认有视频后，会以 {@code hasVideo == true} 再回调一次。
+         * 实现方必须幂等 —— 服务层与界面（轮询刷新）都已按此设计。
          */
         void onPrepared(int durationMs, boolean hasVideo);
     }
@@ -191,6 +196,14 @@ public class MediaPlayerController {
      */
     private Runnable pendingRetry;
 
+    /**
+     * 已排期但还没执行的「视频尺寸延迟复查」。
+     *
+     * <p>持引用才能取消（换片 / 停止 / 重连时），否则一次过期的复查会把
+     * 上一个片源的视频判定套到新片源上。与 {@link #pendingRetry} 同一条纪律。
+     */
+    private Runnable videoRecheck;
+
     private final Runnable watchdog = new Runnable() {
         @Override
         public void run() {
@@ -295,6 +308,21 @@ public class MediaPlayerController {
                     lastPosition = -1L;
                     lastProgressAt = System.currentTimeMillis();
                     hasVideo = detectVideo(mp);
+
+                    // 视频尺寸延迟复查：部分老芯片（MTK 5880 实测）在 onPrepared
+                    // 时 getVideoWidth() 仍返回 0 —— 视频要等首帧解码才有尺寸。
+                    // 只在这里判一次的话，视频流会被误判成纯音频，
+                    // 电视上对着一个视频弹「音乐投屏」卡片（真机踩到）。
+                    // 复查翻案后用 onPrepared 再通知一次 —— 服务层幂等，
+                    // 界面是轮询刷新，重复通知天然安全。
+                    if (!hasVideo) {
+                        scheduleVideoRecheck(mp, 1);
+                        // getVideoWidth 在部分平台（海信 MTK 4.0.4 实测）**永远**
+                        // 返回 0 —— 视频在渲染、API 却不报。这时改问媒体服务器：
+                        // Content-Type 是服务端自述的事实（video/ 开头的翻案成视频；
+                        // audio/ 开头的维持音乐卡片，绝不把音频误判成黑屏视频）。
+                        scheduleContentTypeProbe(mp, currentUrl);
+                    }
 
                     // prepare 期间攒下的 seek 到这里补发。
                     // 不补的话，投屏刚起来（画面还没出来）时拖的进度条会被
@@ -401,6 +429,130 @@ public class MediaPlayerController {
         if (pendingRetry != null) {
             handler.removeCallbacks(pendingRetry);
             pendingRetry = null;
+        }
+    }
+
+    /**
+     * 视频尺寸延迟复查：第 {@code attempt} 次（1 起步）。
+     *
+     * <p>节奏先快后慢（见 {@link PlaybackPolicy} 的 VIDEO_RECHECK_* 常量）：
+     * 首帧解码通常几十到几百毫秒就绪，所以第一次只等 500ms；
+     * 仍没有说明这台芯片更慢，等 2 秒再试最后一次。
+     * 到上限还没有，就认命 —— 那多半真是纯音频流，音乐卡片本来就是对的。
+     *
+     * <p>回调里必须校验「播放器实例还是发起时的那个」：复查排队期间可能
+     * 已经重连（实例重建）、换片或停止，与发起时不符就放弃 ——
+     * 该来的新 onPrepared 会安排新的复查。不校验的话，过期复查会把
+     * 上一个片源的判定套到新片源上。
+     */
+    private void scheduleVideoRecheck(final MediaPlayer mp, final int attempt) {
+        cancelVideoRecheck();
+        long delay = (attempt <= 1) ? PlaybackPolicy.VIDEO_RECHECK_FIRST_MS
+                                    : PlaybackPolicy.VIDEO_RECHECK_SECOND_MS;
+        Runnable task = new Runnable() {
+            @Override
+            public void run() {
+                videoRecheck = null;
+                if (player != mp || !prepared || hasVideo) {
+                    return;
+                }
+                if (detectVideo(mp)) {
+                    hasVideo = true;
+                    Log.i(TAG, "视频尺寸延迟就绪（第 " + attempt
+                            + " 次复查），从音乐形态切回视频形态");
+                    if (listener != null) {
+                        listener.onPrepared(mp.getDuration(), true);
+                    }
+                    return;
+                }
+                if (attempt < PlaybackPolicy.VIDEO_RECHECK_MAX_ATTEMPTS) {
+                    scheduleVideoRecheck(mp, attempt + 1);
+                }
+            }
+        };
+        videoRecheck = task;
+        handler.postDelayed(task, delay);
+    }
+
+    /** 取消已排期但还没执行的视频尺寸复查 */
+    private void cancelVideoRecheck() {
+        if (videoRecheck != null) {
+            handler.removeCallbacks(videoRecheck);
+            videoRecheck = null;
+        }
+    }
+
+    /**
+     * Content-Type 探测：问媒体服务器「你给我的是什么」。
+     *
+     * <p>为什么需要第二个信号：视频尺寸复查依赖 {@code getVideoWidth()}，
+     * 而它在部分平台（海信 MTK 4.0.4 实测）**永远返回 0** —— 视频明明在
+     * SurfaceView 上渲染（SurfaceFlinger 图层可见），API 却不报。
+     * Content-Type 是媒体服务器自述的事实，与芯片实现无关。
+     *
+     * <p>纪律：**只有 video/ 开头的类型才翻案**。audio/ 开头的维持音乐卡片 —— 把音频
+     * 误判成视频，用户对着黑屏以为投屏坏了，比卡片盖住视频更糟；
+     * 其它（octet-stream、探测失败）维持现状，宁漏勿错。
+     *
+     * <p>网络跑在独立守护线程上（3 秒超时，失败即放弃）；
+     * 回调切回主线程前必须校验实例与状态，与复查同一条纪律。
+     */
+    private void scheduleContentTypeProbe(final MediaPlayer mp, final String url) {
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                String type = probeContentType(url);
+                if (type == null || !type.startsWith("video/")) {
+                    return;
+                }
+                handler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        // 排队期间世界可能已变：重连换实例、换片、停止。
+                        if (player != mp || !prepared || hasVideo) {
+                            return;
+                        }
+                        hasVideo = true;
+                        Log.i(TAG, "Content-Type 为 " + type
+                                + "（getVideoWidth 恒 0 的平台），从音乐形态切回视频形态");
+                        if (listener != null) {
+                            listener.onPrepared(mp.getDuration(), true);
+                        }
+                    }
+                });
+            }
+        }, "ct-probe");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** HEAD 拿 Content-Type，失败退回 Range GET。超时 3 秒，失败返回 null */
+    private static String probeContentType(String url) {
+        try {
+            java.net.HttpURLConnection c =
+                    (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+            c.setRequestMethod("HEAD");
+            c.setConnectTimeout(3000);
+            c.setReadTimeout(3000);
+            String type = c.getContentType();
+            c.disconnect();
+            if (type != null) {
+                return type;
+            }
+        } catch (Exception ignored) {
+        }
+        try {
+            java.net.HttpURLConnection c =
+                    (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+            c.setRequestProperty("Range", "bytes=0-0");
+            c.setConnectTimeout(3000);
+            c.setReadTimeout(3000);
+            String type = c.getContentType();
+            c.disconnect();
+            return type;
+        } catch (Exception e) {
+            Log.w(TAG, "Content-Type 探测失败（放弃翻案）: " + e.getMessage());
+            return null;
         }
     }
 
@@ -723,6 +875,9 @@ public class MediaPlayerController {
         // 控制点看到的进度条是上一部片子的。
         preparing = false;
         pendingSeekMs = -1L;
+        // 视频尺寸复查同理：载体（MediaPlayer 实例）没了就必须摘掉，
+        // 否则过期复查会对着已释放的实例跑 —— 判定套到新片源上。
+        cancelVideoRecheck();
         if (player != null) {
             try {
                 player.reset();

@@ -29,6 +29,23 @@ public final class PlaybackPolicy {
     /** 看门狗轮询间隔 */
     public static final long WATCHDOG_INTERVAL_MS = 5000L;
 
+    /**
+     * 视频尺寸的延迟复查间隔。
+     *
+     * <p>为什么需要：部分老芯片（如 MTK 5880）在 {@code onPrepared} 回调时
+     * {@code getVideoWidth()} 仍返回 0 —— 视频尺寸要等首帧解码才就绪。
+     * 只在 onPrepared 判一次的话，视频流会被误判成纯音频，
+     * 电视上对着视频弹「音乐投屏」卡片。
+     *
+     * <p>节奏：先快后慢 —— 第一次 {@link #VIDEO_RECHECK_FIRST_MS}（首帧通常
+     * 几十到几百毫秒内就绪），仍没有则等 {@link #VIDEO_RECHECK_SECOND_MS}
+     * 再试一次，到 {@link #VIDEO_RECHECK_MAX_ATTEMPTS} 次就认命
+     * （那多半真是纯音频流，判成音乐卡片本来就是对的）。
+     */
+    public static final long VIDEO_RECHECK_FIRST_MS = 500L;
+    public static final long VIDEO_RECHECK_SECOND_MS = 2000L;
+    public static final int VIDEO_RECHECK_MAX_ATTEMPTS = 2;
+
     /** 点播流（时长已知）的卡死判定阈值 */
     public static final long STALL_THRESHOLD_VOD_MS = 20000L;
 
