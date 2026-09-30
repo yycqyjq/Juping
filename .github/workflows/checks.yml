@@ -44,13 +44,33 @@ jobs:
           rc=$?
           tail -20 /tmp/gate.log
           if [ "$rc" -ne 0 ]; then
-            # 失败行做成 annotation —— 否则排查得先有 GitHub token：
-            # 日志端点对未认证请求返回 403，check-runs 只给一句 "exit code 1"。
-            # 这个包装就是为了让**下次**红的时候，原因能直接从 API 读到。
-            grep -E '\[FAIL\]|^  · |!!|未绑定|启动即退出|Exception|error' /tmp/gate.log \
-              | head -8 | while IFS= read -r line; do
+            # 主注解：优先抓「最前面的失败」。第一条 [FAIL] 通常就是根因，
+            # 其后的多是级联；旧写法在一堆模式（含 error 噪声）上 head -8，
+            # 会把真正那条挤出注解之外。日志自上而下写，head -1 即最早。
+            first_fail="$(grep -E '\[FAIL\]' /tmp/gate.log | head -1)"
+            if [ -n "$first_fail" ]; then
+              echo "::error::${first_fail//'%'/'%25'}"
+            else
+              # 没有 [FAIL]（崩溃 / 异常）时，退回第一条像样的错误行
+              fallback="$(grep -E '!!|未绑定|启动即退出|Exception|error|\[×\]' /tmp/gate.log | head -1)"
+              echo "::error::${fallback:-构建失败（退出码 $rc），完整日志见 job summary}"
+            fi
+            # 紧随其后的细节行，帮助定位（最多 6 条）
+            grep -E '^  · |!!|未绑定|启动即退出|Exception|\[×\]' /tmp/gate.log \
+              | head -6 | while IFS= read -r line; do
                   echo "::error::${line//'%'/'%25'}"
                 done
+            # 完整日志写进 job summary：annotation 有长度上限、会被截断，
+            # 完整证据留在 summary，排查不必再要 token。
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              {
+                echo "### ❌ \`build.sh protocol\` 失败（退出码 ${rc}）"
+                echo
+                echo '```'
+                cat /tmp/gate.log
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
             exit 1
           fi
 
@@ -70,10 +90,33 @@ jobs:
           rc=$?
           tail -20 /tmp/gate.log
           if [ "$rc" -ne 0 ]; then
-            grep -E '\[FAIL\]|^  · |!!|Exception|error' /tmp/gate.log \
-              | head -8 | while IFS= read -r line; do
+            # 主注解：优先抓「最前面的失败」。第一条 [FAIL] 通常就是根因，
+            # 其后的多是级联；旧写法在一堆模式（含 error 噪声）上 head -8，
+            # 会把真正那条挤出注解之外。日志自上而下写，head -1 即最早。
+            first_fail="$(grep -E '\[FAIL\]' /tmp/gate.log | head -1)"
+            if [ -n "$first_fail" ]; then
+              echo "::error::${first_fail//'%'/'%25'}"
+            else
+              # 没有 [FAIL]（崩溃 / 异常）时，退回第一条像样的错误行
+              fallback="$(grep -E '!!|未绑定|启动即退出|Exception|error|\[×\]' /tmp/gate.log | head -1)"
+              echo "::error::${fallback:-构建失败（退出码 $rc），完整日志见 job summary}"
+            fi
+            # 紧随其后的细节行，帮助定位（最多 6 条）
+            grep -E '^  · |!!|未绑定|启动即退出|Exception|\[×\]' /tmp/gate.log \
+              | head -6 | while IFS= read -r line; do
                   echo "::error::${line//'%'/'%25'}"
                 done
+            # 完整日志写进 job summary：annotation 有长度上限、会被截断，
+            # 完整证据留在 summary，排查不必再要 token。
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              {
+                echo "### ❌ \`build.sh policy\` 失败（退出码 ${rc}）"
+                echo
+                echo '```'
+                cat /tmp/gate.log
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
             exit 1
           fi
 
@@ -93,10 +136,33 @@ jobs:
           rc=$?
           tail -20 /tmp/gate.log
           if [ "$rc" -ne 0 ]; then
-            grep -E '\[FAIL\]|^  · |!!|Exception|error' /tmp/gate.log \
-              | head -8 | while IFS= read -r line; do
+            # 主注解：优先抓「最前面的失败」。第一条 [FAIL] 通常就是根因，
+            # 其后的多是级联；旧写法在一堆模式（含 error 噪声）上 head -8，
+            # 会把真正那条挤出注解之外。日志自上而下写，head -1 即最早。
+            first_fail="$(grep -E '\[FAIL\]' /tmp/gate.log | head -1)"
+            if [ -n "$first_fail" ]; then
+              echo "::error::${first_fail//'%'/'%25'}"
+            else
+              # 没有 [FAIL]（崩溃 / 异常）时，退回第一条像样的错误行
+              fallback="$(grep -E '!!|未绑定|启动即退出|Exception|error|\[×\]' /tmp/gate.log | head -1)"
+              echo "::error::${fallback:-构建失败（退出码 $rc），完整日志见 job summary}"
+            fi
+            # 紧随其后的细节行，帮助定位（最多 6 条）
+            grep -E '^  · |!!|未绑定|启动即退出|Exception|\[×\]' /tmp/gate.log \
+              | head -6 | while IFS= read -r line; do
                   echo "::error::${line//'%'/'%25'}"
                 done
+            # 完整日志写进 job summary：annotation 有长度上限、会被截断，
+            # 完整证据留在 summary，排查不必再要 token。
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              {
+                echo "### ❌ \`build.sh proxy\` 失败（退出码 ${rc}）"
+                echo
+                echo '```'
+                cat /tmp/gate.log
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
             exit 1
           fi
 
