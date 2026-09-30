@@ -63,6 +63,7 @@ Juping/
 │   └── res/                         布局、配色、字符串、图标、banner
 └── tools/
     ├── build.sh              一键构建 + 出包前核验
+    ├── lib.sh                各脚本共用的 JDK 定位（build.sh 与三个 run.sh 都 source 它）
     ├── check_api_compat.py   逐个核验平台 API 引用是否在目标版本里存在
     ├── make_icon.py          生成全部位图资源（纯标准库）
     ├── probe-tv.sh           adb 探测盒子真实硬件信息（只读）
@@ -70,6 +71,7 @@ Juping/
     ├── dlna-probe.py         控制点视角自检（站在手机那一侧走完整链路）
     ├── apk_info.py           解析 APK 的包名 / minSdk
     ├── check_no_secrets.py   发布前核查：密钥真实值有没有混进被跟踪的文件
+    ├── check_gate_counts.py  四道闸门用例总数 ↔ README / AGENTS 文档 一致性
     ├── check_sources.py      无 JDK 环境下的源码结构检查
     ├── check_dex_entrypoints.py  反汇编 dex，核 R8 有没有把框架回调名改坏
     ├── protocol-test/        DLNA 协议层端到端测试（桌面 JVM，不需要真机）
@@ -424,7 +426,7 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 ```
 
 ```
-协议一致性：219 / 219 通过
+协议一致性：237 / 237 通过
 ```
 
 覆盖两大故障场景 —— **「手机搜不到设备」和「投屏没反应」**：
@@ -1310,7 +1312,7 @@ bash 在 **UTF-8 locale** 下会把多字节字符的字节一起吞进变量名
   桌面核验现在是十五项全绿：编译 / lint `NewApi` 零命中 /
   API 引用 287 项（release 297 项）全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
   DLNA 协议 237 项通过 / 播放策略 57 项断言 + 265 条源码级守卫通过 /
-  断言/守卫计数与 README、AGENTS 文档一致（`check_policy_counts.py`）/
+  断言/守卫计数与 README、AGENTS 文档一致（`check_gate_counts.py`，覆盖协议/代理/probe/策略四道）/
   本地预取代理字节一致性 11 项通过 / R8 dex 入口点 33 项通过 /
   控制点自检脚本 33 或 34 项通过（组播回退分支所致，均为合法值）/
   真机验收脚本管道自测 6 项通过 / 密钥核查干净 /
@@ -1473,3 +1475,9 @@ adb shell am broadcast -a com.juping.cast.APPLY_RENAME --es name ""   # 恢复�
 改名不影响 UUID，手机端对这台设备的记忆不会断。名字会被剔除控制字符、
 限长 32 字符——这是全项目唯一的 exported 指令面，入口处就该把明显非法
 的输入拒掉。
+
+---
+
+## 许可证
+
+[MIT](LICENSE) —— 改、打包、再分发、商用都行，保留版权声明与许可声明即可。

@@ -3,15 +3,22 @@
 # 六道闸里有四道只依赖 JDK / python3，全部进 CI：
 #   protocol —— 把真实的 DLNA 协议层编译到桌面 JVM，用原始 socket 跑 237 项一致性检查
 #   policy   —— 播放重连策略的 57 项断言 + 全部源码级不变量守卫
-#   proxy    —— 本地预取代理的字节一致性（全量 / Range / 回拖 / EOS 边界，10 项）
+#   proxy    —— 本地预取代理的字节一致性（全量 / Range / 回拖 / EOS 边界，11 项）
 #   secrets  —— 签名密钥没有混进被跟踪的文件（这仓库是公开的，这道不能省）
 #
-# 另外两道（API 引用核对、dex 入口点）必须先编 APK，要装整套 Android SDK，
-# 在 CI 上要 10 分钟以上 —— 收益撑不起耗时（这两道依赖"产物与源码的对应关系"，
-# 本地出包时反正会跑），所以刻意不进 CI。本地 ./tools/build.sh dist 一条命令全跑。
+# 其余三道（签名/minSdk、API 引用核对、dex 入口点）必须先编 APK、装整套
+# Android SDK，在 CI 上要 10 分钟以上 —— 收益撑不起耗时（它们依赖「产物与源码
+# 的对应关系」，本地出包时反正会跑），所以刻意不进 CI。本地 ./tools/build.sh dist
+# 一条命令全跑。
 #
 # 这份 workflow 本身不碰任何机密：它只读仓库、只跑测试，没有 deploy key、
 # 没有签名密钥 —— 所以 secrets 那道闸对它自己也是适用的。
+#
+# protocol / policy / proxy 三个 job 只差「跑哪道闸门」这一个参数，故合成一个
+# matrix job：失败诊断那段 shell 原先逐字复制了三份，改一处要改三处（历史上就
+# 因此漂过 —— 注释里还留着「旧写法 head -8 会把真正的失败挤出注解」的教训）。
+# 注意 fail-fast: false —— 原先三个 job 彼此独立，一道挂了另外两道照样跑；
+# matrix 默认 fail-fast: true 会在第一道失败时取消其余，那是行为变更。
 
 name: checks
 
@@ -26,9 +33,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  protocol:
-    name: DLNA 协议一致性
+  gate:
+    # 沿用原先的名字：分支保护里的 required status checks 认的是这个显示名
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gate: protocol
+            name: DLNA 协议一致性
+          - gate: policy
+            name: 播放策略断言
+          - gate: proxy
+            name: 预取代理字节一致性
     steps:
       - uses: actions/checkout@v4
       # setup-java v4 已被上游标记弃用（会收到 "migrate to @v5" 的告警），
@@ -37,10 +55,10 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - name: 跑协议测试
+      - name: 跑 ${{ matrix.name }}
         run: |
           set +e
-          ./tools/build.sh protocol > /tmp/gate.log 2>&1
+          ./tools/build.sh ${{ matrix.gate }} > /tmp/gate.log 2>&1
           rc=$?
           tail -20 /tmp/gate.log
           if [ "$rc" -ne 0 ]; then
@@ -64,99 +82,7 @@ jobs:
             # 完整证据留在 summary，排查不必再要 token。
             if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
               {
-                echo "### ❌ \`build.sh protocol\` 失败（退出码 ${rc}）"
-                echo
-                echo '```'
-                cat /tmp/gate.log
-                echo '```'
-              } >> "$GITHUB_STEP_SUMMARY"
-            fi
-            exit 1
-          fi
-
-  policy:
-    name: 播放策略断言
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '17'
-      - name: 跑策略测试
-        run: |
-          set +e
-          ./tools/build.sh policy > /tmp/gate.log 2>&1
-          rc=$?
-          tail -20 /tmp/gate.log
-          if [ "$rc" -ne 0 ]; then
-            # 主注解：优先抓「最前面的失败」。第一条 [FAIL] 通常就是根因，
-            # 其后的多是级联；旧写法在一堆模式（含 error 噪声）上 head -8，
-            # 会把真正那条挤出注解之外。日志自上而下写，head -1 即最早。
-            first_fail="$(grep -E '\[FAIL\]' /tmp/gate.log | head -1)"
-            if [ -n "$first_fail" ]; then
-              echo "::error::${first_fail//'%'/'%25'}"
-            else
-              # 没有 [FAIL]（崩溃 / 异常）时，退回第一条像样的错误行
-              fallback="$(grep -E '!!|未绑定|启动即退出|Exception|error|\[×\]' /tmp/gate.log | head -1)"
-              echo "::error::${fallback:-构建失败（退出码 $rc），完整日志见 job summary}"
-            fi
-            # 紧随其后的细节行，帮助定位（最多 6 条）
-            grep -E '^  · |!!|未绑定|启动即退出|Exception|\[×\]' /tmp/gate.log \
-              | head -6 | while IFS= read -r line; do
-                  echo "::error::${line//'%'/'%25'}"
-                done
-            # 完整日志写进 job summary：annotation 有长度上限、会被截断，
-            # 完整证据留在 summary，排查不必再要 token。
-            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-              {
-                echo "### ❌ \`build.sh policy\` 失败（退出码 ${rc}）"
-                echo
-                echo '```'
-                cat /tmp/gate.log
-                echo '```'
-              } >> "$GITHUB_STEP_SUMMARY"
-            fi
-            exit 1
-          fi
-
-  proxy:
-    name: 预取代理字节一致性
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '17'
-      - name: 跑代理测试
-        run: |
-          set +e
-          ./tools/build.sh proxy > /tmp/gate.log 2>&1
-          rc=$?
-          tail -20 /tmp/gate.log
-          if [ "$rc" -ne 0 ]; then
-            # 主注解：优先抓「最前面的失败」。第一条 [FAIL] 通常就是根因，
-            # 其后的多是级联；旧写法在一堆模式（含 error 噪声）上 head -8，
-            # 会把真正那条挤出注解之外。日志自上而下写，head -1 即最早。
-            first_fail="$(grep -E '\[FAIL\]' /tmp/gate.log | head -1)"
-            if [ -n "$first_fail" ]; then
-              echo "::error::${first_fail//'%'/'%25'}"
-            else
-              # 没有 [FAIL]（崩溃 / 异常）时，退回第一条像样的错误行
-              fallback="$(grep -E '!!|未绑定|启动即退出|Exception|error|\[×\]' /tmp/gate.log | head -1)"
-              echo "::error::${fallback:-构建失败（退出码 $rc），完整日志见 job summary}"
-            fi
-            # 紧随其后的细节行，帮助定位（最多 6 条）
-            grep -E '^  · |!!|未绑定|启动即退出|Exception|\[×\]' /tmp/gate.log \
-              | head -6 | while IFS= read -r line; do
-                  echo "::error::${line//'%'/'%25'}"
-                done
-            # 完整日志写进 job summary：annotation 有长度上限、会被截断，
-            # 完整证据留在 summary，排查不必再要 token。
-            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-              {
-                echo "### ❌ \`build.sh proxy\` 失败（退出码 ${rc}）"
+                echo "### ❌ \`build.sh ${{ matrix.gate }}\` 失败（退出码 ${rc}）"
                 echo
                 echo '```'
                 cat /tmp/gate.log

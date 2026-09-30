@@ -33,23 +33,10 @@ cd "$ROOT"
 
 # --- 工具链路径 ---
 TOOLCHAIN="${ANDROID_BUILD_HOME:-$HOME/.android-build}"
-# JAVA_HOME 的选择顺序（与 tools/*-test/run.sh 保持一致，改一处要同步另一处）：
-#   ① 环境里已有可用的 javac → 尊重它。CI 上 setup-java 会设；本地也可能
-#      指向系统 JDK。**不能无条件覆盖** —— 那样在没有本地工具链的机器上
-#      （CI runner）会直接报「工具链不完整」退出，而这几道桌面闸门本来
-#      只需要一个 JDK。
-#   ② 否则回退到自包含工具链；macOS 解出来的 Contents/Home 与 Linux 的
-#      平铺布局都要认。
-if [ -z "${JAVA_HOME:-}" ] || [ ! -x "$JAVA_HOME/bin/javac" ]; then
-    if [ -x "$TOOLCHAIN/jdk/Contents/Home/bin/javac" ]; then
-        export JAVA_HOME="$TOOLCHAIN/jdk/Contents/Home"
-    elif [ -x "$TOOLCHAIN/jdk/bin/javac" ]; then
-        export JAVA_HOME="$TOOLCHAIN/jdk"
-    else
-        # 都没有：保留原路径，让下面的前置检查给出可读的报错
-        export JAVA_HOME="$TOOLCHAIN/jdk/Contents/Home"
-    fi
-fi
+# JDK 的定位逻辑已收敛到 tools/lib.sh（原先在本文件 + 三个 run.sh 里各有一份，
+# 注释里自己写着「改一处要同步另一处」）。选择顺序与理由见该文件。
+. "$ROOT/tools/lib.sh"
+resolve_java_home
 export ANDROID_HOME="$TOOLCHAIN/sdk"
 export ANDROID_SDK_ROOT="$TOOLCHAIN/sdk"
 export GRADLE_USER_HOME="$TOOLCHAIN/gradle-home"
@@ -237,12 +224,14 @@ verify_policy() {
     out="$(mktemp)"
     if tools/policy-test/run.sh >"$out" 2>&1; then
         echo "  策略: $(grep -oE '播放策略：.*' "$out" | head -1)"
-        # 计数守卫 —— 防「文档里写的断言/守卫数」与「实际跑出来的」悄悄对不上。
-        # 这些数字散落在 README.md 与 .agent/AGENTS.md 里手写同步（5 处），
-        # 靠人肉同步必然漂：本轮之前就有过 proxy 用例 10→11、两处文档漏改，
-        # 是 QA 跑测试才发现的。对齐不上就红，逼着改文档或改期望值。
-        if [ -f tools/check_policy_counts.py ]; then
-            if ! python3 tools/check_policy_counts.py "$out"; then
+        # 计数守卫 —— 防「文档里写的用例总数」与「闸门期望值/实际跑出来的」悄悄对不上。
+        # 存在的数字散落在 README.md 与 .agent/AGENTS.md 里手写同步，靠人肉必然漂：
+        # 之前有过 proxy 用例 10→11、两处文档漏改（QA 跑测试才发现），README 里还
+        # 长期留着一句 `协议一致性：219 / 219`（实际早是 237）。现在四道闸门的总数
+        # 都由 tools/check_gate_counts.py 核对：规范值是这里/run.sh 里的期望字符串，
+        # 文档跟不上就红。对齐不上就红，逼着改文档或改期望值。
+        if [ -f tools/check_gate_counts.py ]; then
+            if ! python3 tools/check_gate_counts.py "$out"; then
                 rm -f "$out"; return 1
             fi
         fi

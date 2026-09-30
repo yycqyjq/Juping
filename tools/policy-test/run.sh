@@ -17,19 +17,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 cd "$ROOT"
 
-# JAVA_HOME 的选择顺序：与 protocol-test/run.sh 相同 ——
-# 已有可用的就尊重（CI 上的 setup-java 会设），没有才回退到自包含工具链；
-# 工具链的两种目录布局（macOS 的 Contents/Home 与 Linux 的平铺）都要认。
-# 这段是照着那边改的，两处必须保持一致 —— 一处改了另一处忘了，
-# 症状是「协议闸门绿、策略闸门红」，看起来像断言挂了，其实是环境问题。
-if [ -z "${JAVA_HOME:-}" ] || [ ! -x "$JAVA_HOME/bin/javac" ]; then
-    TOOLCHAIN="${ANDROID_BUILD_HOME:-$HOME/.android-build}"
-    if [ -x "$TOOLCHAIN/jdk/Contents/Home/bin/javac" ]; then
-        export JAVA_HOME="$TOOLCHAIN/jdk/Contents/Home"
-    elif [ -x "$TOOLCHAIN/jdk/bin/javac" ]; then
-        export JAVA_HOME="$TOOLCHAIN/jdk"
-    fi
-fi
+# JDK 的定位收敛到 tools/lib.sh（原先在 build.sh + 三个 run.sh 里各有一份，
+# 那段注释自己都写着「两处必须保持一致」—— 收敛掉这个隐患）。顺序见该文件。
+. "$HERE/../lib.sh"
+resolve_java_home
 JAVAC="$JAVA_HOME/bin/javac"
 JAVA="$JAVA_HOME/bin/java"
 

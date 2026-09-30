@@ -1,0 +1,33 @@
+# 换行符与文件性质的统一声明。
+#
+# 为什么需要它：这个仓库有必须跨平台执行的脚本 —— .sh / gradlew 要在
+# ubuntu CI 与 macOS 上跑，一旦被 CRLF 污染，`/bin/sh^M: bad interpreter`
+# 会直接起不来；而 gradlew.bat 是 Windows 批处理，必须保持 CRLF。
+# 与其指望「没人从 Windows 提交」，不如把规则写死在这里。
+#
+# 现状核对（补这个文件时实测）：全部被跟踪文件本来就是 LF，唯一的 CRLF
+# 是 gradlew.bat。它已被下面的 `-text` 排除，所以本文件是**零 churn** 的
+# 纯保险 —— 不会引发一次性的换行符批量重写，也无需跑 git add --renormalize。
+
+# 默认：文本按 LF 存、按 LF 检出
+* text=auto eol=lf
+
+# 必须可执行的脚本，显式钉死 LF（无扩展名的 gradlew 一并覆盖）
+*.sh    text eol=lf
+gradlew text eol=lf
+
+# Windows 批处理保持原样：用 -text 而不是 eol=crlf —— 后者会把仓库里的
+# 存储形态改成 LF，进而让 gradlew.bat 显示为已修改（一次性 churn）。
+*.bat   -text
+
+# 二进制：不让 git 尝试按文本处理（git 本可自动识别，显式写出是为了
+# 明确「这些不该被当文本」，也免得将来有人误加 text 规则）
+*.png     binary
+*.apk     binary
+*.jar     binary
+*.jks     binary
+*.keystore binary
+*.pyc     binary
+
+# GitHub 语言统计：协议测试的夹具 APK 由 make_fixture.py 生成，不算源码
+tools/protocol-test/fixtures/* linguist-generated

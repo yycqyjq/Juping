@@ -19,21 +19,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 cd "$ROOT"
 
-# JAVA_HOME 的选择顺序：
-# ① 环境里已有可用的 javac → 尊重它。CI 上 setup-java 会设；
-#    本地也可能指向系统 JDK。**不能无条件覆盖** —— 那样在
-#    没有本地工具链的机器上（CI runner）会直接 exit 2。
-# ② 否则用自包含工具链。注意布局差异：当初绕开 sdkmanager 下载的
-#    macOS 包解压出来是 Contents/Home 结构，Linux 的 tar.gz 没有 ——
-#    两种都要认，否则这套脚本换个平台就跑不了。
-if [ -z "${JAVA_HOME:-}" ] || [ ! -x "$JAVA_HOME/bin/javac" ]; then
-    TOOLCHAIN="${ANDROID_BUILD_HOME:-$HOME/.android-build}"
-    if [ -x "$TOOLCHAIN/jdk/Contents/Home/bin/javac" ]; then
-        export JAVA_HOME="$TOOLCHAIN/jdk/Contents/Home"
-    elif [ -x "$TOOLCHAIN/jdk/bin/javac" ]; then
-        export JAVA_HOME="$TOOLCHAIN/jdk"
-    fi
-fi
+# JDK 的定位收敛到 tools/lib.sh（原先在 build.sh + 三个 run.sh 里各有一份，
+# 「改一处要同步另一处」）。选择顺序与理由见该文件。
+. "$HERE/../lib.sh"
+resolve_java_home
 JAVAC="$JAVA_HOME/bin/javac"
 JAVA="$JAVA_HOME/bin/java"
 

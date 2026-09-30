@@ -68,6 +68,7 @@ app/src/main/java/com/juping/cast/
     └── PlaybackPolicy.java         纯逻辑策略/阈值常量（桌面可测）
 tools/
 ├── build.sh              一键构建+六道闸门（apk/api/dex/protocol/policy/proxy/secrets）
+├── lib.sh                各脚本共用的 JDK 定位（build.sh 与三个 run.sh 都 source 它）
 ├── verify-on-device.sh   真机一条命令验收
 ├── probe-tv.sh           电视硬件信息探测（只读）
 ├── dlna-probe.py         控制点视角自检（单播→组播回退→直连降级，33/34 项）
@@ -75,7 +76,7 @@ tools/
 ├── check_dex_entrypoints.py  R8 后 dex 入口点核查
 ├── check_sources.py      无 JDK 环境的源码结构检查
 ├── check_no_secrets.py   密钥泄漏核查
-├── check_policy_counts.py  断言/守卫计数 ↔ README/AGENTS 文档 一致性
+├── check_gate_counts.py  四道闸门用例总数 ↔ README/AGENTS 文档 一致性
 ├── apk_info.py           APK 包名/minSdk 解析
 ├── make_icon.py          位图资源生成（纯标准库）
 ├── protocol-test/        DLNA 协议一致性 237 项（桌面 JVM + 真实协议栈桩）
@@ -95,17 +96,20 @@ tools/
 | verify_protocol | DLNA 协议一致性（drive.py，期望 237/237） | 237 |
 | ↳ 内含 probe | 控制点自检（**33 或 34 双态**：组播回退分支） | 33/34 |
 | verify_policy | 播放策略 57 断言 + 265 源码级守卫 | 57+ |
-| ↳ 内含计数 | 文档里的断言/守卫数 ↔ 实际跑出来的（`check_policy_counts.py`） | 一致性 |
+| ↳ 内含计数 | 文档里的用例总数 ↔ 闸门期望值（`check_gate_counts.py`，覆盖协议/代理/probe/策略） | 一致性 |
 | verify_proxy | MediaProxy 字节一致性（全量/Range/回拖/EOS/中途重连） | 11 |
 | verify_secrets | 密钥泄漏 | 零命中 |
 
 **总数守卫是特性**：协议 237、probe 33/34 双态（组播回退分支）、策略 57。
 有意增删断言后必须同步 build.sh / run.sh 里的期望值。
 
-**计数单一事实来源**：策略的断言/守卫数写在 `README.md` 与 `.agent/AGENTS.md`
-里（措辞「N 项断言」/「N 条源码级守卫」或省量词的写法都算）。`verify_policy`
-末尾用 `tools/check_policy_counts.py` 拿这两个文档和实际 `[PASS]` 数核对，
-对不上就红 —— 再不用靠人肉同步多处手写数字（那必然漂，T9 就是被 QA 抓到的）。
+**计数单一事实来源**：策略的断言/守卫数，以及协议/proxy/probe 的用例总数，
+手写在 `README.md` 与 `.agent/AGENTS.md` 里（措辞「N 项断言」/「N 条源码级守卫」/
+「N 项一致性」等，量词可有可无）。`verify_policy` 末尾用
+`tools/check_gate_counts.py` 拿这两个文档和闸门里的期望值核对，对不上就红 ——
+规范值的唯一出处仍是 `build.sh` / `protocol-test/run.sh` 里那句比较字符串，
+文档跟不上就报出来。再不用靠人肉同步多处手写数字（那必然漂，T9 就是被 QA
+抓到的；README 里那句样本输出写的 `协议一致性：219 / 219` 也是这么留下的）。
 `AGENTS.md` 因此**必须进版本库**（见根目录 `.gitignore` 里那条例外）。
 
 ## 5. 真机调试手册（Hisense Vision-TV 实测坑）

@@ -16,14 +16,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 cd "$ROOT"
 
-if [ -z "${JAVA_HOME:-}" ] || [ ! -x "$JAVA_HOME/bin/javac" ]; then
-    TOOLCHAIN="${ANDROID_BUILD_HOME:-$HOME/.android-build}"
-    if [ -x "$TOOLCHAIN/jdk/Contents/Home/bin/javac" ]; then
-        export JAVA_HOME="$TOOLCHAIN/jdk/Contents/Home"
-    elif [ -x "$TOOLCHAIN/jdk/bin/javac" ]; then
-        export JAVA_HOME="$TOOLCHAIN/jdk"
-    fi
-fi
+# JDK 的定位收敛到 tools/lib.sh（原先在 build.sh + 三个 run.sh 里各有一份，
+# 与 protocol-test 同样的选择顺序）。理由见该文件。
+. "$HERE/../lib.sh"
+resolve_java_home
 if [ -z "${JAVA_HOME:-}" ] || [ ! -x "$JAVA_HOME/bin/javac" ]; then
     echo "找不到 javac（需要 JDK 17）" >&2
     exit 2
