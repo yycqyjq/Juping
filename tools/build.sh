@@ -254,12 +254,33 @@ verify_proxy() {
         echo "  代理: 跳过（没有 tools/proxy-test/run.sh）"
         return 0
     fi
-    if ! tools/proxy-test/run.sh; then
-        echo "  !! 本地预取代理核验未通过 —— 投屏可能花屏或数据错乱：" >&2
-        echo "     代理吐出的字节必须与源逐字节一致，差一个就是花屏。" >&2
-        return 1
+    local out
+    out="$(mktemp)"
+    if tools/proxy-test/run.sh >"$out" 2>&1; then
+        # 断言总数守卫 —— 同 verify_protocol：防的是「断言被静默删掉」。
+        # 代理的 oracle 是逐字节一致，漏测一条 = 一条字节路径没人守，
+        # 而闸门照样全绿 —— 「全部通过」和「该测的都测了」是两回事。
+        # 断言只会越写越多；有意增删后同步更新这里的期望值即可。
+        local summary
+        summary="$(grep -oE '代理一致性：[0-9]+ / [0-9]+' "$out" | head -1)"
+        if [ "$summary" != "代理一致性：11 / 11" ]; then
+            echo "  !! 代理断言总数变了：期望「代理一致性：11 / 11」，实际「${summary:-（没找到）}」" >&2
+            echo "     总数变少几乎必然是有一条断言被静默删掉或跳过 —— 先查清楚，" >&2
+            echo "     确认是有意增删后再同步这里的期望值。" >&2
+            rm -f "$out"; return 1
+        fi
+        echo "  代理: 字节一致性通过（11 / 11，全量/Range/回拖/EOS/中途重连）"
+        rm -f "$out"; return 0
     fi
-    echo "  代理: 字节一致性通过（全量/Range/回拖/EOS 边界）"
+    echo "  !! 本地预取代理核验未通过 —— 投屏可能花屏或数据错乱：" >&2
+    echo "     代理吐出的字节必须与源逐字节一致，差一个就是花屏。" >&2
+    # 同 verify_protocol / verify_policy：失败清单必须完整打出来，不能只 tail ——
+    # FAIL 行散布在各个断言里，tail 一截「是哪几条」就丢了，只剩一句「没通过」。
+    grep '\[FAIL\]' "$out" >&2 || true
+    grep -E '^  · ' "$out" >&2 || true
+    grep '!!' "$out" >&2 || true
+    tail -15 "$out" >&2
+    rm -f "$out"; return 1
 }
 
 # 密钥核查：这个仓库是要公开的，而 release 签名密钥一旦泄漏，
