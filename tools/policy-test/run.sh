@@ -982,7 +982,9 @@ if tbo:
            '拆成两次独立选择 —— 第一张网卡 joinGroup 失败时两者会分叉，'
            '表现为「搜得到设备却投不了屏」')
     report('构造函数收的是 HTTP 端口，不是拼好的 LOCATION 字符串',
-           'public SsdpResponder(String uuid, int httpPort, String serverName)' in ssdp_c,
+           'public SsdpResponder(String uuid, int httpPort, String serverName, '
+           'String versionName)' in ssdp_c.replace('\n', ' ')
+           and 'LOCATION' not in ssdp_c[:ssdp_c.find('public SsdpResponder')],
            'LOCATION 里的 IP 必须等组播真的绑上某张网卡之后才知道。'
            '从外面传进来，就等于让「绑哪张网卡」和「告诉手机去哪取描述」各自算一次')
 

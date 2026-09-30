@@ -184,12 +184,13 @@ public class UpnpHttpServer extends Thread {
     }
 
     /**
-     * Server / SERVER 头里的产品段。
+     * Server 头里的产品段。
      *
-     * <p>之前 "Juping/1.0" 以字符串字面量散落在四处（两个响应头方法 +
-     * 两处 SSDP 相关拼装）—— 升版本时漏改任何一处，同一个设备在不同
-     * 协议路径上就报两个版本号。收口成一个方法，与 {@link #versionName}
-     * 单一来源。
+     * <p>之前 "Juping/1.0" 以字符串字面量散落在四处（writeSimple /
+     * SUBSCRIBE 响应 / UNSUBSCRIBE 响应 / writeStatic）—— 升版本时漏改
+     * 任何一处，同一个设备在不同协议路径上就报两个版本号。收口成一个
+     * 方法，与 {@link #versionName} 单一来源。SSDP 侧的 SERVER 头在
+     * {@link SsdpResponder}，那边同样收构造注入的版本号。
      */
     private String serverProduct() {
         return "Juping/" + versionName;

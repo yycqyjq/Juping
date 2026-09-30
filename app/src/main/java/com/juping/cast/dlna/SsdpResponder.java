@@ -214,17 +214,13 @@ public class SsdpResponder extends Thread {
     /** 定期重播线程。持有引用是为了能在 {@link #shutdown()} 里 interrupt 掉。 */
     private volatile Thread announcer;
 
-    public SsdpResponder(String uuid, int httpPort, String serverName) {
-        this(uuid, httpPort, serverName, SSDP_PORT);
-    }
-
     /** 生产入口：版本号随构造注入（SERVER 头产品段的来源），SSDP 端口用默认 1900。 */
     public SsdpResponder(String uuid, int httpPort, String serverName, String versionName) {
         this(uuid, httpPort, serverName, SSDP_PORT, versionName);
     }
 
     /**
-     * 可指定端口的构造函数。
+     * 可指定端口的构造函数（协议测试用）。
      *
      * <p>存在的意义是让协议层测试能在桌面 JVM 上把真实的响应器拉起来跑
      * （用临时端口，不去抢 1900）。生产代码走上面那个构造函数，行为不变。
@@ -233,12 +229,10 @@ public class SsdpResponder extends Thread {
      * LOCATION 里的 IP 必须等组播真的绑上某张网卡之后才知道，
      * 提前从外面传进来就等于把「组播绑哪张网卡」和「告诉手机去哪取描述」
      * 拆成了两次独立选择，它们随时可能分叉。
+     *
+     * <p>版本号随构造注入 —— SERVER 头产品段 "Juping/&lt;版本&gt;" 的来源，
+     * 与 device.xml 的 modelNumber 同源。
      */
-    public SsdpResponder(String uuid, int httpPort, String serverName, int port) {
-        this(uuid, httpPort, serverName, port, "0.0.0");
-    }
-
-    /** 带版本号的构造函数 —— SERVER 头的产品段来自它，与 device.xml 的 modelNumber 同源。 */
     public SsdpResponder(String uuid, int httpPort, String serverName, int port,
                          String versionName) {
         super("ssdp-responder");

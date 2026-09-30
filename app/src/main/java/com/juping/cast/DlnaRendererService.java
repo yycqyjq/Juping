@@ -51,8 +51,10 @@ public class DlnaRendererService extends Service
 
     private static final String TAG = "DlnaRendererService";
 
-    private static final String PREFS = "juping";
-    private static final String KEY_UUID = "device_uuid";    /** DLNA 服务端口。用固定端口方便排查，冲突概率很低。 */
+    static final String PREFS = "juping";
+    private static final String KEY_UUID = "device_uuid";
+
+    /** DLNA 服务端口。用固定端口方便排查，冲突概率很低。 */
     private static final int HTTP_PORT = 49152;
 
     /**

@@ -39,8 +39,7 @@ public class RenameReceiver extends BroadcastReceiver {
     /** 新名字的 extra 键：{@code --es name "客厅盒子"} */
     public static final String EXTRA_NAME = "name";
 
-    /** SharedPreferences 文件与键 —— 与 DlnaRendererService 的 UUID 同一个文件 */
-    static final String PREFS = "juping";
+    /** 键定义在写入方（这里），服务侧读取时引用这里 —— 同一语义只允许写一处 */
     static final String KEY_FRIENDLY_NAME = "friendly_name";
 
     /**
@@ -65,7 +64,8 @@ public class RenameReceiver extends BroadcastReceiver {
         // commit() 不是 apply()：同步落盘。理由与 UUID 同一条 ——
         // 紧接着拉起的服务可能立刻读这个名字，进程若在 apply 落盘前被杀，
         // 改名就悄悄丢了（ApplySharedPref 这条 lint 在本项目是刻意关的）。
-        SharedPreferences sp = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        SharedPreferences sp = context.getSharedPreferences(
+                DlnaRendererService.PREFS, Context.MODE_PRIVATE);
         sp.edit().putString(KEY_FRIENDLY_NAME, name).commit();
 
         // 服务没在跑也没关系：onCreate 会读到新名字；在跑的话，
