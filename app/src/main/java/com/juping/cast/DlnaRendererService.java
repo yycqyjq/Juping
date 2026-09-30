@@ -653,7 +653,9 @@ public class DlnaRendererService extends Service
         jsonPut(sb, "transportStatus", getTransportStatus());
         sb.append("\"positionMs\":").append(getPositionMs()).append(',');
         sb.append("\"durationMs\":").append(getDurationMs()).append(',');
-        jsonPut(sb, "currentUri", currentUri);
+        // 打码后再输出 —— 带签名的 CDN URL 里签名本身就是播放凭证，
+        // 而 /status 是无鉴权端点（详见 maskUri 的注释）。
+        jsonPut(sb, "currentUri", maskUri(currentUri));
         jsonPut(sb, "ip", getLocalIp());
         sb.append("\"httpPort\":").append(getHttpPort()).append(',');
         jsonPut(sb, "version", BuildConfig.VERSION_NAME);
@@ -675,6 +677,36 @@ public class DlnaRendererService extends Service
         sb.append('"').append(key).append("\":\"")
           .append(val.replace("\\", "\\\\").replace("\"", "\\\""))
           .append("\",");
+    }
+
+    /**
+     * 把媒体 URL 打码后再放进 {@code /status} —— 只抹掉排障不需要的那部分。
+     *
+     * <p><b>为什么必须打码：</b>DLNA 控制点推来的地址常常是**带签名的 CDN URL**
+     * （{@code ?token=xxx&expire=...&uid=...}），而**签名本身就是播放凭证** ——
+     * 谁拿到这个 URL 谁就能在别处播。可 {@code /status} 是**无鉴权**的 HTTP 端点
+     * （{@code http://<电视IP>:49152/status}），局域网内任何人都能取走它。
+     * 家庭网络风险低，但访客连过 Wi-Fi、或酒店/公司网络下就是真泄漏；
+     * 而且本仓库开源、README 公开写了这个端点。
+     *
+     * <p><b>为什么保留 host/port/path：</b>排障时要判断「是不是 CDN、端口对不对、
+     * 是哪个文件」—— 这些不敏感且是定位问题的关键。所以只把 {@code ?} 之后的
+     * query（签名/token 所在）整段替换成 {@code ?***}，host/port/path 原样保留。
+     *
+     * <p>没有 {@code ?} 的 URL 原样返回（无签名可泄）；空串原样返回；
+     * {@code null} 也原样返回，交给 {@link #jsonPut} 现有的空串兜底。
+     */
+    private static String maskUri(String uri) {
+        if (uri == null || uri.length() == 0) {
+            return uri;
+        }
+        int q = uri.indexOf('?');
+        if (q < 0) {
+            // 没有 query 就没有签名可泄，原样返回不误伤排障信息。
+            return uri;
+        }
+        // query 整段抹掉：签名/token 参数值不可复原（不留任何前缀字符）。
+        return uri.substring(0, q) + "?***";
     }
 
     /**

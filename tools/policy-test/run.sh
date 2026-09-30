@@ -810,15 +810,28 @@ report('m3u8 不走代理',
        'HLS 的分片逻辑在播放器内部，按字节寻址的代理对它没意义')
 
 # ---- ④ 播放列表（SetNextAVTransportURI）—— BubbleUPnP 歌单连播依赖它 ----
+# 判据必须钉在 KNOWN_ACTIONS 数组**本身**，而不是整个文件：这个字符串在
+# dispatch 分支和 SCPD 声明里也出现，只查整个文件的话，从数组里删掉它
+# 守卫照样绿（破坏性证伪实测：删数组元素 → 红 0 条）。body_of 从数组声明处
+# 按大括号配对抠出初始化体，正好只覆盖那一段。
+ka = body_of(http, 'private static final String[] KNOWN_ACTIONS =')
+report('KNOWN_ACTIONS 数组已找到', ka is not None,
+       '锚点：private static final String[] KNOWN_ACTIONS =')
 report('SetNextAVTransportURI 已在 KNOWN_ACTIONS（SCPD 同步）',
-       'SetNextAVTransportURI' in http,
+       ka is not None and 'SetNextAVTransportURI' in ka,
        'SCPD 里没有的 action 控制点不会发 —— 歌单连播整个失效')
 report('自动续播复用 Set 路径（URI/元数据/事件全部对齐）',
        'nextUrl' in ctrl and 'listener.onSourceChanged' in ctrl,
        '自动续播不走 SOAP，服务层的 URI/元数据状态靠 onSourceChanged 对齐 —— '
        'GetMediaInfo 回读与事件推送都依赖它')
+# 判据必须钉在 stop() 的**方法体**里，而不是整个文件：nextUrl = null 在文件里
+# 共 3 处（play / 续播接棒 / stop），只查整个文件的话，删掉 stop() 里那处
+# 守卫照样绿（破坏性证伪实测：删 stop 里的清零 → 红 0 条）。
+stop_body = body_of(ctrl, 'public synchronized void stop()')
+report('MediaPlayerController.stop 方法体已找到', stop_body is not None,
+       '锚点：public synchronized void stop()')
 report('Stop/换片清下一曲队列（DLNA 语义）',
-       'nextUrl = null' in ctrl,
+       stop_body is not None and 'nextUrl = null' in stop_body,
        '队列不跨 Stop 存活；新 SetAVTransportURI 也作废旧队列')
 
 # ---- ⑤ Auto-Stop：控制点离开后自动停止（借鉴 gmrender --auto-stop）----
@@ -834,6 +847,31 @@ report('/status 诊断页（浏览器可达，排障不需要 adb）',
        '/status' in http and 'buildStatusJson' in http and 'buildStatusJson' in svc,
        'gmrender 生态的 upnp-display 用小屏显示状态 —— 我们的「显示屏」'
        '就是手机浏览器')
+
+# ⑪ /status 无鉴权，currentUri 必须打码 —— 签名即凭证，别把 CDN URL 送出去。
+# 判据先剥注释再判（本节 svc 是原始文本，注释里也会出现 currentUri 等字眼），
+# 且只看 buildStatusJson 的方法体：认结构性事实，不认排版。
+svc_nc = strip_comments(svc)
+bs = body_of(svc_nc, 'public String buildStatusJson()')
+report('buildStatusJson 方法体已找到（/status 数据源）', bs is not None,
+       '锚点：public String buildStatusJson()')
+if bs:
+    report('/status 的 currentUri 已打码（不直接吐原始 URL）',
+           re.search(r'jsonPut\(sb,\s*"currentUri",\s*currentUri\s*\)', bs) is None
+           and re.search(r'maskUri\s*\(\s*currentUri\s*\)', bs) is not None,
+           'DLNA 推来的 CDN 地址常带 token/expire，签名本身就是播放凭证；'
+           '而 /status 无鉴权，局域网内谁都能取走拿去别处播')
+mk = body_of(svc_nc, 'private static String maskUri(String uri)')
+report('maskUri 方法体已找到（currentUri 打码唯一出处）', mk is not None,
+       '锚点：private static String maskUri(String uri)')
+if mk:
+    report('maskUri 只抹 query（host/port/path 保留供排障）',
+           "indexOf('?')" in mk and 'substring(0' in mk,
+           '签名/token 在 ? 之后，整段换成 *** 即不可复原；'
+           'host/path 要留着判断是不是 CDN、是哪个文件')
+    report('maskUri 对无 query 的 URL 原样返回（不误伤）',
+           'return uri' in mk,
+           '没有 ? 就没有签名可泄 —— 原样返回，别把排障信息也抹了')
 
 ct = body_of(ctrl, 'private void scheduleContentTypeProbe(final MediaPlayer mp, final String url)')
 if ct:
