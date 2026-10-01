@@ -1559,8 +1559,11 @@ if gts:
            re.search(r'return\s+hasTransportError\(\)\s*\?', gts) is not None,
            '恒回 OK 等于没改 —— 只是把写死的位置从协议层挪到了服务层')
 
-report('eventedVars 的 TransportStatus 与 getTransportStatus 同源',
-       'vars.put("TransportStatus", getTransportStatus())' in svc_c,
+# AVTransport 的事件现在装在 LastChange 的值里（见下面 ④ 那一节），
+# 所以这条判据从 eventedVars 的本体挪到了它的实参上：LastChange 文档的
+# TransportStatus 必须仍然取自 getTransportStatus()。
+report('LastChange 的 TransportStatus 与 getTransportStatus 同源',
+       re.search(r'avtLastChange\([\s\S]{0,300}?getTransportStatus\(\)', svc_c) is not None,
        '两处各写一份判据的话，迟早有一份忘了跟着改 —— 而不一致'
        '恰恰是最难排查的一类问题：控制点自己都不知道该信哪个')
 
@@ -1621,28 +1624,45 @@ if sc:
            'ERROR' in sc,
            '出错时同样不能停留在 PLAYING，否则控制点会一直以为还在播')
 
+# ---- AVTransport 的事件承载必须是规范的 LastChange 形态 ----
+# 规范里 AVTransport 整张 stateVariable 表只有 LastChange 声明为
+# sendEvents="yes"，其余变量（TransportState / CurrentTrackURI …）都是 "no"，
+# 内容以一段 AVT 命名空间的 XML 文档塞进 LastChange 的**值**里。
+# 逐变量推送时 Cling 系控制点（芒果 TV 实测，按 SCPD 生成桩）会把整条事件
+# 忽略掉 —— 它就一直收不到 TransportState，手机上的按钮/进度条不跟着走。
 ev = body_of(svc_c, 'public Map<String, String> eventedVars(String service)')
 report('DlnaRendererService.eventedVars 方法体已找到', ev is not None,
        '锚点：public Map<String, String> eventedVars(String service)')
 if ev:
-    report('AVTransport 事件里带 RelativeTimePosition',
-           'RelativeTimePosition' in ev,
-           '一部分控制点（国产投屏 SDK 居多）不轮询 GetPositionInfo，'
-           '只靠事件里的这个字段更新进度条 —— 不给就从头到尾不动')
+    report('AVTransport 分支只推 LastChange 一个键（规范形态）',
+           re.search(r'vars\.put\("LastChange",\s*UpnpHttpServer\.avtLastChange\(',
+                     ev) is not None,
+           '装了 LastChange 就不能再逐变量 put —— Cling 系控制点按 SCPD 生成桩，'
+           '未声明的事件变量会被整条忽略')
     # 这里原来还有一条「TransportStatus 如实反映出错与否」（在 ev 里找
     # ERROR_OCCURRED 字面量）。判据挪进 getTransportStatus() 之后它就失效了，
     # 而且它和上面那条「同源」守的是同一个语义 —— 留着只会让一处破坏红两条，
     # 反而定位不出到底哪儿坏了。现在由「同源」+「getTransportStatus 用
     # hasTransportError 判据」两条共同覆盖。
 
+# SCPD 的声明形态（只事件化 LastChange）、事件文档的命名空间 / InstanceID /
+# 双层转义，都由协议测试**行为级**覆盖 —— SCPD 与 avtLastChange 都在
+# UpnpHttpServer 里，协议靶机编的就是这份源码。这里**刻意不重复**同一语义：
+# 两处各写一条，破坏一处会红两条，反而定位不出到底哪儿坏了。
 scpd = re.search(r'SCPD_AV_TRANSPORT =[\s\S]*?</scpd>', http_c)
 report('SCPD_AV_TRANSPORT 找得到', scpd is not None, '锚点：SCPD_AV_TRANSPORT =')
-if scpd:
-    report('SCPD 里 RelativeTimePosition 声明为可事件化',
-           re.search(r'stateVar\("RelativeTimePosition",\s*"string",\s*true\)',
-                     scpd.group(0)) is not None,
-           'SCPD 里没声明的话，事件体里给了控制点也不会用 ——'
-           '声明与实现必须成对出现')
+
+lc = body_of(http_c, 'public static String avtLastChange(')
+report('UpnpHttpServer.avtLastChange 方法体已找到', lc is not None,
+       '锚点：public static String avtLastChange(')
+if lc:
+    # 协议驱动只抽查了 TransportState / CurrentTrackDuration /
+    # RelativeTimePosition 三个字段（外加按值校验的 CurrentTrackURI），
+    # **没有**盯 TransportStatus。这里只补这一个缺口 —— 另外四个已在协议侧
+    # 行为级钉住，再在这儿重列一遍就是同一语义写两处（破坏一处红两条）。
+    report('LastChange 文档带上 TransportStatus（协议驱动没抽查的那个）',
+           'TransportStatus' in lc,
+           '少给这个字段，控制点会一直以为设备"一切正常" —— 而它可能正在反复重连')
 
 gp = body_of(ctrl_c, 'public int getPosition()')
 report('MediaPlayerController.getPosition 方法体已找到', gp is not None,

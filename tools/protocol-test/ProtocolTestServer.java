@@ -349,13 +349,18 @@ public class ProtocolTestServer {
             public Map<String, String> eventedVars(String service) {
                 Map<String, String> vars = new HashMap<String, String>();
                 if ("AVTransport".equals(service)) {
-                    vars.put("TransportState", transportState);
-                    // 与 GetTransportInfo 的 CurrentTransportStatus **同源** ——
-                    // 真实服务里两边都走 DlnaRendererService.getTransportStatus()。
-                    // 靶机也这么写，驱动才能验证"两个接口说法一致"。
-                    vars.put("TransportStatus", handler.getTransportStatus());
-                    vars.put("CurrentTrackURI", currentUri);
-                    vars.put("CurrentTrackDuration", UpnpHttpServer.formatTime(FAKE_DURATION_MS));
+                    // 规范形态：AVTransport 只事件化 LastChange 一个变量，内容是一段
+                    // AVT 命名空间的 XML 文档。XML 的组装走生产代码同一个方法
+                    // （UpnpHttpServer.avtLastChange），靶机与真实服务不会各写一份。
+                    vars.put("LastChange", UpnpHttpServer.avtLastChange(
+                            transportState,
+                            // 与 GetTransportInfo 的 CurrentTransportStatus **同源** ——
+                            // 真实服务里两边都走 DlnaRendererService.getTransportStatus()。
+                            // 靶机也这么写，驱动才能验证"两个接口说法一致"。
+                            handler.getTransportStatus(),
+                            currentUri,
+                            UpnpHttpServer.formatTime(FAKE_DURATION_MS),
+                            UpnpHttpServer.formatTime(FAKE_POSITION_MS)));
                     return vars;
                 }
                 if ("RenderingControl".equals(service)) {

@@ -106,8 +106,8 @@ tools/
 ├── check_gate_counts.py  五道闸门用例总数 ↔ README/AGENTS 文档 一致性
 ├── apk_info.py           APK 包名/minSdk 解析
 ├── make_icon.py          位图资源生成（纯标准库）
-├── protocol-test/        DLNA 协议一致性 241 项（桌面 JVM + 真实协议栈桩）
-├── policy-test/          播放策略 57 断言 + 305 源码级守卫
+├── protocol-test/        DLNA 协议一致性 245 项（桌面 JVM + 真实协议栈桩）
+├── policy-test/          播放策略 57 断言 + 306 源码级守卫
 ├── proxy-test/           MediaProxy 字节一致性 11 项
 └── web-test/             MultipartLite + sanitize 网页逻辑一致性（32 项）
 ```
@@ -121,15 +121,15 @@ tools/
 | verify_apk | 签名/minSdk | 每包 |
 | verify_api | 平台 API 引用逐个核对（目标 API 15/33） | 260+/272+ |
 | verify_dex | R8 后框架回调/Thread 子类/协议常量存活 | 全量 |
-| verify_protocol | DLNA 协议一致性（drive.py，期望 241/241） | 241 |
+| verify_protocol | DLNA 协议一致性（drive.py，期望 245/245） | 245 |
 | ↳ 内含 probe | 控制点自检（**33 或 34 双态**：组播回退分支） | 33/34 |
-| verify_policy | 播放策略 57 断言 + 305 源码级守卫 | 57+ |
+| verify_policy | 播放策略 57 断言 + 306 源码级守卫 | 57+ |
 | ↳ 内含计数 | 文档里的用例总数 ↔ 闸门期望值（`check_gate_counts.py`，覆盖协议/代理/网页/probe/策略） | 一致性 |
 | verify_proxy | MediaProxy 字节一致性（全量/Range/回拖/EOS/中途重连） | 11 |
 | verify_web | multipart 解析逐字节一致 / 名字编码 / 上传页零外链 | 32 |
 | verify_secrets | 密钥泄漏 | 零命中 |
 
-**总数守卫是特性**：协议 241、probe 33/34 双态（组播回退分支）、策略 57、网页逻辑一致性 32 项。
+**总数守卫是特性**：协议 245、probe 33/34 双态（组播回退分支）、策略 57、网页逻辑一致性 32 项。
 有意增删断言后必须同步 build.sh / run.sh 里的期望值。
 
 **计数单一事实来源**：策略的断言/守卫数，以及协议/proxy/web/probe 的用例总数，

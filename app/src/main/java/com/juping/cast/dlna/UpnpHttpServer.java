@@ -1883,6 +1883,63 @@ public class UpnpHttpServer extends Thread {
     }
 
     /**
+     * AVTransport 事件文档（{@code LastChange} 的值）所用的 XML 命名空间。
+     *
+     * <p>规范里 AVTransport:1 的事件文档根元素就落在这个命名空间下，
+     * 与设备描述、SCPD 的命名空间都不同 —— 三者不能混用。
+     */
+    public static final String AVT_EVENT_NS = "urn:schemas-upnp-org:metadata-1-0/AVT/";
+
+    /**
+     * 组一份 AVTransport 的 {@code LastChange} 事件文档。
+     *
+     * <p>UPnP AV 里 AVTransport 的事件**不是**逐个变量推的：SCPD 中只有
+     * {@code LastChange} 一个变量声明为 {@code sendEvents="yes"}，其余
+     * （{@code TransportState} / {@code CurrentTrackURI} …）都是 {@code "no"}。
+     * 变化的内容以**一段 XML 文档**塞进 {@code LastChange} 的**值**里，
+     * 每台实例包在 {@code <InstanceID val="0">} 内，变量写成带 {@code val}
+     * 属性的空元素。
+     *
+     * <p>为什么必须照规范来：Cling 系控制点（芒果 TV 实测）按运行时取回的
+     * SCPD 生成桩，事件里出现未声明的变量会被**整条忽略**。逐变量推送时
+     * 它收不到 {@code TransportState}，手机上的按钮/进度条就不跟着走。
+     *
+     * <p><b>转义是两层</b>：这里转义的是**变量值**（视频 CDN 的 URL 几乎必然
+     * 带 {@code &}，不转就会把这段文档本身写坏）；{@link EventDispatcher} 组装
+     * 事件体时再把整段文档转义一次塞进 {@code <LastChange>}。少一层，
+     * 控制点那边就是整条事件解析失败。
+     *
+     * <p>每次推的是**全量**（规范说的是"变化量"，我们推全部事件化变量）：
+     * 控制点按变量逐项合并，多给已知项没有任何副作用；而"订阅即推全量"
+     * 本来就是规范硬要求，走同一条路径反而少一处分支。
+     *
+     * @param transportState     {@code TransportState} 值
+     * @param transportStatus    {@code TransportStatus} 值
+     * @param trackUri           {@code CurrentTrackURI} 值（无媒体时为空串）
+     * @param trackDuration      {@code CurrentTrackDuration} 值（{@code HH:MM:SS}）
+     * @param relTimePosition    {@code RelativeTimePosition} 值（{@code HH:MM:SS}）
+     */
+    public static String avtLastChange(String transportState, String transportStatus,
+            String trackUri, String trackDuration, String relTimePosition) {
+        StringBuilder sb = new StringBuilder(256);
+        sb.append("<Event xmlns=\"").append(AVT_EVENT_NS).append("\">");
+        sb.append("<InstanceID val=\"0\">");
+        avtVar(sb, "TransportState", transportState);
+        avtVar(sb, "TransportStatus", transportStatus);
+        avtVar(sb, "CurrentTrackURI", trackUri);
+        avtVar(sb, "CurrentTrackDuration", trackDuration);
+        avtVar(sb, "RelativeTimePosition", relTimePosition);
+        sb.append("</InstanceID></Event>");
+        return sb.toString();
+    }
+
+    /** 事件文档里的一个变量：{@code <名字 val="值"/>}，值先转义。 */
+    private static void avtVar(StringBuilder sb, String name, String value) {
+        sb.append('<').append(name).append(" val=\"")
+                .append(escapeXml(value)).append("\"/>");
+    }
+
+    /**
      * XML 转义。**嵌 URL 时必须过这一道**。
      *
      * <p>视频 CDN 的地址几乎必然带查询串，例如
@@ -2040,19 +2097,30 @@ public class UpnpHttpServer extends Thread {
                             "in:NewPlayMode:CurrentPlayMode")
                     + " </actionList>\n"
                     + " <serviceStateTable>\n"
-                    // ---- 声明为可事件化的，**必须**与 DlnaRendererService
-                    //      .eventedVars("AVTransport") 给出的键完全一致。
+                    // ---- AVTransport 的事件承载是**规范形态**：整张表里只有
+                    //      LastChange 一个变量声明为可事件化，变化的内容以一段
+                    //      XML 文档塞在它的值里（见 avtLastChange()）。
+                    //      其余变量一律 sendEvents="no" —— 规范本就如此，而且
+                    //      Cling 系控制点（芒果 TV 实测）是按 SCPD 生成桩的：
+                    //      事件体里出现未声明的变量会被**整条忽略**。逐变量推送时
+                    //      它根本收不到 TransportState。
+                    //      可事件化的集合**必须**与 DlnaRendererService
+                    //      .eventedVars("AVTransport") 给出的键完全一致：
                     //      多一个：控制点会一直等一个永远不来的值；
                     //      少一个：事件体里带了它，控制点按 SCPD 直接忽略。
                     //      两边各写一份，靠 tools/policy-test 的守卫钉住。
-                    + stateVar("TransportState", "string", true)
-                    + stateVar("TransportStatus", "string", true)
-                    + stateVar("CurrentTrackURI", "string", true)
-                    + stateVar("CurrentTrackDuration", "string", true)
-                    // 当前位置也必须声明为可事件化：一部分控制点（国产投屏 SDK 居多）
+                    + stateVar("LastChange", "string", true)
+                    // 下面这些既是事件文档的内容（见 avtLastChange），也被 out
+                    // 参数引用 —— 必须在表里，但**不再单独事件化**，值随
+                    // LastChange 一起走。
+                    + stateVar("TransportState", "string", false)
+                    + stateVar("TransportStatus", "string", false)
+                    + stateVar("CurrentTrackURI", "string", false)
+                    + stateVar("CurrentTrackDuration", "string", false)
+                    // 当前位置也进事件文档：一部分控制点（国产投屏 SDK 居多）
                     // 不轮询 GetPositionInfo，而是靠事件里的 RelativeTimePosition
-                    // 更新进度条。SCPD 里不声明的话，事件体里就算给了它也不会用。
-                    + stateVar("RelativeTimePosition", "string", true)
+                    // 更新进度条。少给这个字段，它的进度条就从头到尾不动。
+                    + stateVar("RelativeTimePosition", "string", false)
                     // ---- 下面这些是"被 out 参数引用到"的变量，规范要求它们
                     //      必须出现在表里，但不需要事件化（sendEvents="no"）。----
                     + stateVar("PlaybackStorageMedium", "string", false)

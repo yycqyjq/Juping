@@ -1219,29 +1219,36 @@ public class DlnaRendererService extends Service
     public Map<String, String> eventedVars(String service) {
         Map<String, String> vars = new HashMap<String, String>();
         if ("AVTransport".equals(service)) {
-            vars.put("TransportState", transportState);
-            // 如实报"出没出错"。原来这里写死 "OK" ——
-            // 而「状态字段必须反映现在」是这个项目一以贯之的纪律（见 onPrepared 里
-            // 清 lastError 的那段说明）。控制点拿到 OK 就不会提示用户，
-            // 于是一个正在反复重连的设备在它眼里是"一切正常"。
-            // 判据与 GetTransportInfo 的 CurrentTransportStatus 共用，
-            // 见 hasTransportError()。
-            vars.put("TransportStatus", getTransportStatus());
-            vars.put("CurrentTrackURI", currentUri == null ? "" : currentUri);
-            vars.put("CurrentTrackDuration",
-                    UpnpHttpServer.formatTime(getDurationMs()));
-            // 当前位置也进事件。
+            // AVTransport 的事件承载是规范形态：**只有 LastChange 一个键**，
+            // 内容是一段 AVT 命名空间的 XML 文档（见 UpnpHttpServer.avtLastChange）。
+            // SCPD 里也只有它声明为 sendEvents="yes" —— 两边必须一致。
             //
-            // 为什么必须带：一部分控制点（国产投屏 SDK 居多）**不轮询
-            // GetPositionInfo**，而是靠事件里的 RelativeTimePosition 更新进度条。
-            // 不给这个字段，它的进度条就从头到尾不动 —— 而设备这边看起来一切正常，
-            // 日志里也全是 200，排查时完全没有线索。
+            // 为什么不能再逐变量推：Cling 系控制点（芒果 TV 实测）按 SCPD 生成桩，
+            // 事件里出现未声明的事件变量会被**整条忽略**，它就一直收不到
+            // TransportState，手机上的按钮/进度条不跟着走。
             //
-            // 事件只在状态变化时发，所以它不会退化成每秒一次的位置流
-            // （那是轮询该干的事）；它的作用是让控制点在**状态切换的那一刻**
-            // 拿到一个正确的位置基准，而不是从 0 开始重新推。
-            vars.put("RelativeTimePosition",
-                    UpnpHttpServer.formatTime(getPositionMs()));
+            // 各字段的取值口径不变，逐条理由见下面几个实参：
+            vars.put("LastChange", UpnpHttpServer.avtLastChange(
+                    transportState,
+                    // 如实报"出没出错"。原来这里写死 "OK" ——
+                    // 而「状态字段必须反映现在」是这个项目一以贯之的纪律（见
+                    // onPrepared 里清 lastError 的那段说明）。控制点拿到 OK 就不会
+                    // 提示用户，于是一个正在反复重连的设备在它眼里是"一切正常"。
+                    // 判据与 GetTransportInfo 的 CurrentTransportStatus 共用，
+                    // 见 hasTransportError()。
+                    getTransportStatus(),
+                    currentUri == null ? "" : currentUri,
+                    UpnpHttpServer.formatTime(getDurationMs()),
+                    // 当前位置也进事件文档。为什么必须带：一部分控制点（国产投屏
+                    // SDK 居多）**不轮询 GetPositionInfo**，靠事件里的
+                    // RelativeTimePosition 更新进度条。不给这个字段，它的进度条
+                    // 就从头到尾不动 —— 而设备这边看起来一切正常，日志里也全是
+                    // 200，排查时完全没有线索。
+                    //
+                    // 事件只在状态变化时发，所以它不会退化成每秒一次的位置流
+                    // （那是轮询该干的事）；它的作用是让控制点在**状态切换的那一刻**
+                    // 拿到一个正确的位置基准，而不是从 0 开始重新推。
+                    UpnpHttpServer.formatTime(getPositionMs())));
             return vars;
         }
         if ("RenderingControl".equals(service)) {

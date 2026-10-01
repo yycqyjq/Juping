@@ -1045,20 +1045,27 @@ def drain(cb, already, timeout=6.0):
     return cb.wait(already + 1, timeout)[already:]
 
 
-def scpd_evented(body_bytes):
-    """SCPD 里所有 sendEvents="yes" 的变量名"""
-    out = set()
+def scpd_statevars(body_bytes):
+    """SCPD 里的 {变量名: 是否 sendEvents="yes"}"""
+    out = {}
     try:
         root = ET.fromstring(body_bytes.decode('utf-8'))
     except Exception:
         return out
     for sv in root.iter():
         if sv.tag.endswith('stateVariable') or sv.tag == 'stateVariable':
-            if (sv.get('sendEvents') or '').lower() == 'yes':
-                for ch in sv:
-                    if ch.tag.endswith('name') or ch.tag == 'name':
-                        out.add(ch.text or '')
+            name = None
+            for ch in sv:
+                if ch.tag.endswith('name') or ch.tag == 'name':
+                    name = ch.text or ''
+            if name:
+                out[name] = (sv.get('sendEvents') or '').lower() == 'yes'
     return out
+
+
+def scpd_evented(body_bytes):
+    """SCPD 里所有 sendEvents="yes" 的变量名"""
+    return {n for n, ev in scpd_statevars(body_bytes).items() if ev}
 
 
 def propmap(body_bytes):
@@ -1076,6 +1083,28 @@ def propmap(body_bytes):
     return out
 
 
+def lastchange_map(body_bytes):
+    """从事件体里取出 LastChange，解析成 {变量名: 值}。
+
+    AVTransport 的事件内容**不是**一组独立的 <property>，而是**一段嵌在
+    LastChange 值里的 XML 文档**（AVT 命名空间）—— 所以要把它的文本再当
+    XML 解析一次，读每个变量的 val 属性。
+
+    用真解析器而不是字符串查找：转义少了一层时（值里的 & / 引号），这里会
+    直接抛异常 —— 那正是控制点遇到的情况（整条事件解析失败，不是少一项）。
+    """
+    raw = propmap(body_bytes).get('LastChange', '')
+    if not raw:
+        return {}
+    root = ET.fromstring(raw)
+    out = {}
+    for node in root.iter():
+        if node.tag.endswith('InstanceID') or node.tag == 'InstanceID':
+            for ch in node:
+                out[ch.tag.split('}')[-1]] = ch.get('val', '')
+    return out
+
+
 # --- 10.1 SCPD 必须先声明"哪些变量可事件化" ---
 # 没有这一节，控制点订阅到的是空事件集 —— 它不会报错，只是永远等不到东西。
 st, _, scpd_body = raw_request('GET', '/upnp/RenderingControl.xml')
@@ -1084,10 +1113,18 @@ check('RenderingControl SCPD 声明 Volume 可事件化', 'Volume' in rcs_evente
       '实际: %s' % (sorted(rcs_evented) or '无'))
 
 st, _, scpd_body = raw_request('GET', '/upnp/AVTransport.xml')
-avt_evented = scpd_evented(scpd_body)
-for want in ('TransportState', 'TransportStatus', 'CurrentTrackURI', 'CurrentTrackDuration'):
-    check('AVTransport SCPD 声明 %s 可事件化' % want, want in avt_evented,
-          '实际: %s' % (sorted(avt_evented) or '无'))
+avt_vars = scpd_statevars(scpd_body)
+avt_evented = {n for n, ev in avt_vars.items() if ev}
+# 规范形态：AVTransport 整张表里**只有 LastChange** 声明为可事件化。
+# 多声明一个就成了「逐变量推送」，而 Cling 系控制点（按 SCPD 生成桩）只认
+# LastChange —— 它会把整条事件忽略掉。
+check('AVTransport SCPD 只把 LastChange 声明为可事件化（规范形态）',
+      avt_evented == {'LastChange'}, '实际: %s' % (sorted(avt_evented) or '无'))
+for want in ('TransportState', 'CurrentTrackURI', 'RelativeTimePosition'):
+    check('AVTransport SCPD 把 %s 声明为非事件化' % want,
+          want in avt_vars and not avt_vars[want],
+          '%s 在表里=%s，可事件化=%s'
+          % (want, want in avt_vars, avt_vars.get(want)))
 
 # --- 10.2 新订阅 ---
 cb_avt = FakeCallback()
@@ -1123,12 +1160,27 @@ if evs:
           e0['headers'].get('content-type', '(缺失)'))
     try:
         m0 = propmap(e0['body'])
-        check('初始事件含 TransportState', 'TransportState' in m0, str(sorted(m0)))
-        check('初始事件含 CurrentTrackDuration',
-              'CurrentTrackDuration' in m0, str(sorted(m0)))
-        # 只报 SCPD 里声明过的变量：多报无益，少报会让控制点一直以为它是空的
-        extra = set(m0) - avt_evented
-        check('初始事件没有多报未声明的变量', not extra, '多报: %s' % sorted(extra))
+        check('初始事件体只有 LastChange 一个属性（其余变量随它走）',
+              set(m0) == {'LastChange'}, str(sorted(m0)))
+        _doc = ET.fromstring(m0.get('LastChange', ''))
+        check('LastChange 是 AVT 命名空间下的 Event 文档',
+              _doc.tag == '{urn:schemas-upnp-org:metadata-1-0/AVT/}Event',
+              _doc.tag)
+        _iid = [n for n in _doc if n.tag.endswith('InstanceID')]
+        check('LastChange 带 <InstanceID val="0">',
+              len(_iid) == 1 and _iid[0].get('val') == '0',
+              _iid[0].get('val') if _iid else '没有 InstanceID')
+        lc0 = lastchange_map(e0['body'])
+        check('初始事件的 LastChange 带 TransportState',
+              'TransportState' in lc0, str(sorted(lc0)))
+        check('初始事件的 LastChange 带 CurrentTrackDuration',
+              'CurrentTrackDuration' in lc0, str(sorted(lc0)))
+        check('初始事件的 LastChange 带 RelativeTimePosition（进度条基准）',
+              'RelativeTimePosition' in lc0, str(sorted(lc0)))
+        # 文档里的变量必须是 SCPD 表里真实存在的：多报无益，少报会让控制点
+        # 一直以为它是空的
+        extra = set(lc0) - set(avt_vars)
+        check('LastChange 没有多报表里没有的变量', not extra, '多报: %s' % sorted(extra))
     except Exception as ex:
         check('初始事件体是合法 XML', False, str(ex))
 
@@ -1145,7 +1197,7 @@ if evs:
     check('第二个事件 SEQ 递增到 1', e['headers'].get('seq') == '1',
           e['headers'].get('seq', '(缺失)'))
     try:
-        m = propmap(e['body'])
+        m = lastchange_map(e['body'])
         check('事件里的 CurrentTrackURI 是刚推的地址（& 已转义）',
               m.get('CurrentTrackURI') == 'http://127.0.0.1:9/gena.mp4?token=a&expire=1',
               repr(m.get('CurrentTrackURI')))
@@ -1160,7 +1212,7 @@ evs = drain(cb_avt, n)
 check('Play 后收到事件', len(evs) >= 1, '收到 %d 条' % len(evs))
 if evs:
     try:
-        m = propmap(evs[-1]['body'])
+        m = lastchange_map(evs[-1]['body'])
         check('事件里的 TransportState 变成 PLAYING',
               m.get('TransportState') == 'PLAYING', repr(m.get('TransportState')))
     except Exception as ex:
@@ -1172,7 +1224,7 @@ evs = drain(cb_avt, n)
 check('Stop 后收到事件', len(evs) >= 1, '收到 %d 条' % len(evs))
 if evs:
     try:
-        m = propmap(evs[-1]['body'])
+        m = lastchange_map(evs[-1]['body'])
         check('Stop 后事件里 CurrentTrackURI 清空',
               m.get('CurrentTrackURI') == '', repr(m.get('CurrentTrackURI')))
         check('Stop 后事件里 TransportState 是 STOPPED',
