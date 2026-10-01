@@ -264,6 +264,12 @@ public final class MultipartLite {
             // 和后面每一道共用同一段代码。
             start = stop + delim.length;
             stop = -1;
+            // ⚠️ 这里必须把"上一段读完了"的状态清掉。段体视图是按**段**复用的，
+            // bodyEof 一旦置位就再不会自己复位 —— 忘了清的表现是：**字段段之后的
+            // 那一段体变成 0 字节**（read() 一进门就回 -1），文件落盘成空文件，
+            // 而且后面所有分段跟着错位。这是真机上传（每次一个文件）永远碰不到的路径，
+            // 只在同一个请求里带多个分段时才现形 —— 由 web-test 的多段用例钉住。
+            bodyEof = false;
 
             byte[] two = new byte[2];
             if (readRaw(two, 0, 2) != 2) {

@@ -16,7 +16,7 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * 「扫码网页传文件投屏」的网页端点（批 0）。
+ * 「扫码网页传文件投屏」的网页端点（批 1）。
  *
  * <table>
  *   <tr><td>{@code GET  /}</td><td>上传页（HTML）。⚠️ 只在请求头带 {@code Accept: text/html}
@@ -26,6 +26,7 @@ import java.util.Locale;
  *   <tr><td>{@code GET  /media/<名字>}</td><td>把已上传的文件流式提供出去（支持 Range）——
  *       投屏播放时取的就是这个地址，理由见 {@code UpnpHttpServer#writeMedia}</td></tr>
  *   <tr><td>{@code POST /cast}</td><td>把已上传的文件投到电视上播放</td></tr>
+ *   <tr><td>{@code POST /delete}</td><td>删掉一个已上传的文件（盒子上空间紧，必要）</td></tr>
  * </table>
  *
  * <p>共用既有 {@link UpnpHttpServer} 的同一个端口、同一个 socket —— 不新起监听。
@@ -97,6 +98,9 @@ public final class WebCastEndpoints implements UpnpHttpServer.WebEndpoints {
             }
             if ("/cast".equals(path)) {
                 return cast(contentLength, in);
+            }
+            if ("/delete".equals(path)) {
+                return delete(contentLength, in);
             }
             return null;
         }
@@ -254,7 +258,7 @@ public final class WebCastEndpoints implements UpnpHttpServer.WebEndpoints {
 
         @Override
         public void field(String name, String value) {
-            // 批 0 的页面上没有普通表单字段。将来加（比如"上传后自动播放"开关）再说。
+            // 上传页上没有普通表单字段（只发文件分段）。将来加（比如"上传后自动播放"开关）再说。
         }
 
         String toJson() {
@@ -463,6 +467,41 @@ public final class WebCastEndpoints implements UpnpHttpServer.WebEndpoints {
                 "{\"message\":" + json(f.getName()) + "}");
     }
 
+    // ------------------------------------------------------------- 删除
+
+    /**
+     * 删掉一个已上传的文件。
+     *
+     * <p><b>这是本功能唯一的破坏性动作</b>，所以三道闸都在前面拦着：
+     * <ol>
+     *   <li>名字过 {@link LocalStore#fileFor} —— sanitize 挡掉 {@code ..}，
+     *       canonical 前缀再核一遍，跑出上传目录的名字拿不到文件；</li>
+     *   <li>{@code isFile()} —— 目录删不掉（这条接口只删文件，不给"清空目录"的口子）；</li>
+     *   <li>只在本目录内 —— {@code fileFor} 出来的对象必然在 {@code uploads} 下，
+     *       也就是**只删得到我们自己存的东西**，U 盘（批 3，只读）与系统文件都不在范围内。</li>
+     * </ol>
+     */
+    private UpnpHttpServer.WebResponse delete(int contentLength, InputStream in) {
+        if (contentLength <= 0 || contentLength > SMALL_BODY_LIMIT) {
+            return error(400, "Bad Request", "请求体不合法");
+        }
+        String name = formValue(readSmall(in, contentLength), "name");
+        File f = (name == null) ? null : store.fileFor(name);
+        if (f == null || !f.isFile()) {
+            return error(404, "Not Found", "没有这个文件");
+        }
+        // 删之前先记住规整后的名字 —— 删完 f.getName() 依然可读，但用变量更清楚
+        String stored = f.getName();
+        if (!f.delete()) {
+            // 老设备上 vfat / 只读挂载点会走到这里（正常不应该，因为落盘在内部存储）
+            Log.w(TAG, "删不掉：" + f.getAbsolutePath());
+            return error(500, "Internal Server Error", "删不掉 " + stored);
+        }
+        Log.i(TAG, "已删除：" + stored);
+        return ok("application/json; charset=\"utf-8\"",
+                "{\"message\":" + json("已删除 " + stored) + "}");
+    }
+
     // ------------------------------------------------------------ 小工具
 
     private static UpnpHttpServer.WebResponse ok(String contentType, String body) {
@@ -565,8 +604,21 @@ public final class WebCastEndpoints implements UpnpHttpServer.WebEndpoints {
     /**
      * 上传页。**内嵌、无外部资源** —— 盒子没有外网，一个 CDN 上的框架就足以让整页白屏。
      *
-     * <p>批 0 的版本刻意很薄：选文件 → 逐个上传（带进度）→ 列表 → 一键投送。
-     * 文件夹上传、多文件单请求、删除，都是后续批次的事。
+     * <p>批 1 的完整版：选文件 / 选文件夹（特性检测降级）→ 逐个上传（带进度）→
+     * 列表（预览 · 投到电视 · 删除）→ 剩余空间。
+     *
+     * <p>几条刻意的写法：
+     * <ul>
+     *   <li><b>ES5</b>：手机上的老浏览器（以及微信内置浏览器）遇到 {@code () => {}} 或
+     *       {@code fetch} 是**语法级报错**，整页白屏 —— 而白屏是这类页面最难排查的故障形态
+     *       （服务端日志里一切正常）；</li>
+     *   <li><b>逐个文件单独请求</b>：一个请求里塞多个文件，浏览器只能给整个请求一个进度，
+     *       中途失败还会连已经传成功的部分一起丢；逐个传才能显示"第 3/8 个"，
+     *       失败的也只影响那一个；</li>
+     *   <li><b>文件夹上传必须特性检测</b>：{@code webkitdirectory} 在 iOS Safari 上要到
+     *       18.4 才完整支持。不支持时**收起入口并说明**，绝不留一个"点了没反应"的按钮
+     *       （那比没有这个功能更让人摸不着头脑）。</li>
+     * </ul>
      */
     private static final String PAGE =
             "<!DOCTYPE html>\n"
@@ -582,6 +634,8 @@ public final class WebCastEndpoints implements UpnpHttpServer.WebEndpoints {
             + "#space{color:#9a9a9a;font-size:13px;margin:0 0 16px}\n"
             + ".box{border:1px dashed #444;border-radius:10px;padding:20px;text-align:center}\n"
             + "input[type=file]{color:#ccc;width:100%}\n"
+            + "#dirbox{margin-top:14px}\n"
+            + ".hint{color:#8a8a8a;font-size:12px;margin:12px 0 0}\n"
             + "button{margin-top:12px;padding:10px 22px;font-size:16px;border:0;"
             + "border-radius:8px;background:#3d7eff;color:#fff}\n"
             + "button:disabled{background:#333;color:#777}\n"
@@ -594,73 +648,114 @@ public final class WebCastEndpoints implements UpnpHttpServer.WebEndpoints {
             + "border-top:1px solid #262626}\n"
             + "li span{flex:1;word-break:break-all;font-size:14px}\n"
             + "li button{margin:0;padding:6px 14px;font-size:14px}\n"
+            + "li button.del{background:#3a2a2a;color:#ff9a9a}\n"
+            + "li a{color:#7fb0ff;font-size:14px;text-decoration:none}\n"
             + "</style></head><body>\n"
             + "<h1>聚屏</h1>\n"
             + "<p id=\"space\">正在读取…</p>\n"
             + "<div class=\"box\">\n"
             + "  <input type=\"file\" id=\"f\" multiple>\n"
-            + "  <br><button id=\"go\">上传</button>\n"
+            + "  <div id=\"dirbox\" style=\"display:none\">\n"
+            + "    <input type=\"file\" id=\"d\" webkitdirectory directory multiple>\n"
+            + "  </div>\n"
+            + "  <p class=\"hint\" id=\"hint\"></p>\n"
+            + "  <button id=\"go\">上传</button>\n"
             + "</div>\n"
             + "<div id=\"bar\"><div id=\"fill\"></div></div>\n"
             + "<p id=\"msg\"></p>\n"
             + "<ul id=\"list\"></ul>\n"
             + "<script>\n"
-            + "var f=document.getElementById('f'),go=document.getElementById('go'),"
-            + "msg=document.getElementById('msg'),bar=document.getElementById('bar'),"
-            + "fill=document.getElementById('fill'),list=document.getElementById('list'),"
-            + "space=document.getElementById('space');\n"
-            + "function fmt(n){if(n<0)return '未知';var u=['B','KB','MB','GB'],i=0;"
+            + "var f=document.getElementById('f'),db=document.getElementById('d'),"
+            + "dirbox=document.getElementById('dirbox'),hint=document.getElementById('hint'),"
+            + "go=document.getElementById('go'),msg=document.getElementById('msg'),"
+            + "bar=document.getElementById('bar'),fill=document.getElementById('fill'),"
+            + "list=document.getElementById('list'),space=document.getElementById('space');\n"
+            + "function fmt(n){if(!(n>0))return '未知';var u=['B','KB','MB','GB'],i=0;"
             + "while(n>=1024&&i<3){n/=1024;i++}return n.toFixed(i?1:0)+u[i]}\n"
             + "function say(t){msg.textContent=t}\n"
+            + "function enc(n){return encodeURIComponent(n)}\n"
+            // 文件夹入口：能选就显示，不能选就说明为什么 —— 见类头"特性检测"那条
+            + "try{if(!('webkitdirectory' in document.createElement('input')))"
+            + "throw 0;dirbox.style.display='block';hint.textContent='也可以选中一整个文件夹一起传'}"
+            + "catch(e){hint.textContent='当前浏览器不支持选文件夹，请一次多选文件'}\n"
             + "function load(){\n"
             + "  var x=new XMLHttpRequest();x.open('GET','/files');\n"
             + "  x.onload=function(){\n"
             + "    var d;try{d=JSON.parse(x.responseText)}catch(e){return}\n"
-            + "    space.textContent='剩余可用 '+fmt(d.usableBytes)+' · 已上传 '+d.files.length+' 个文件';\n"
+            + "    space.textContent='剩余可用 '+fmt(d.usableBytes)+' / 共 '+fmt(d.totalBytes)"
+            + "+' · 已上传 '+d.files.length+' 个文件';\n"
             + "    list.innerHTML='';\n"
-            + "    d.files.forEach(function(n){\n"
-            + "      var li=document.createElement('li');\n"
-            + "      var s=document.createElement('span');s.textContent=n;\n"
-            + "      var b=document.createElement('button');b.textContent='投到电视';\n"
-            + "      b.onclick=function(){cast(n,b)};\n"
-            + "      li.appendChild(s);li.appendChild(b);list.appendChild(li);\n"
-            + "    });\n"
+            + "    for(var k=0;k<d.files.length;k++){list.appendChild(row(d.files[k]))}\n"
             + "  };\n"
             + "  x.send();\n"
             + "}\n"
+            + "function row(n){\n"
+            + "  var li=document.createElement('li');\n"
+            + "  var s=document.createElement('span');s.textContent=n;li.appendChild(s);\n"
+            // 预览直接开 /media/<名字>：图片/视频浏览器自己就能放，不必另写播放器
+            + "  var a=document.createElement('a');a.textContent='预览';a.target='_blank';"
+            + "a.href='/media/'+enc(n);li.appendChild(a);\n"
+            + "  var b=document.createElement('button');b.textContent='投到电视';"
+            + "b.onclick=function(){cast(n,b)};li.appendChild(b);\n"
+            + "  var c=document.createElement('button');c.textContent='删除';c.className='del';"
+            + "c.onclick=function(){del(n,c)};li.appendChild(c);\n"
+            + "  return li;\n"
+            + "}\n"
+            + "function post(url,body,onload,onerror){\n"
+            + "  var x=new XMLHttpRequest();x.open('POST',url);\n"
+            + "  x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');\n"
+            + "  x.onload=onload;x.onerror=onerror;x.send(body);\n"
+            + "}\n"
             + "function cast(n,b){\n"
             + "  b.disabled=true;b.textContent='投送中';\n"
-            + "  var x=new XMLHttpRequest();x.open('POST','/cast');\n"
-            + "  x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');\n"
-            + "  x.onload=function(){\n"
+            + "  post('/cast','name='+enc(n),function(x){\n"
             + "    var d;try{d=JSON.parse(x.responseText)}catch(e){d={message:'响应异常'}}\n"
             + "    say(x.status===200?('已投送 '+n):('投送失败：'+(d.message||x.status)));\n"
             + "    b.disabled=false;b.textContent='投到电视';\n"
-            + "  };\n"
-            + "  x.onerror=function(){say('投送请求发不出去');b.disabled=false;"
-            + "b.textContent='投到电视'};\n"
-            + "  x.send('name='+encodeURIComponent(n));\n"
+            + "  },function(){say('投送请求发不出去');b.disabled=false;b.textContent='投到电视'});\n"
+            + "}\n"
+            + "function del(n,c){\n"
+            + "  if(!confirm('删除「'+n+'」？删了就没了'))return;\n"
+            + "  c.disabled=true;c.textContent='删除中';\n"
+            + "  post('/delete','name='+enc(n),function(x){\n"
+            + "    var d;try{d=JSON.parse(x.responseText)}catch(e){d={message:'响应异常'}}\n"
+            + "    say(x.status===200?('已删除 '+n):('删除失败：'+(d.message||x.status)));\n"
+            + "    load();\n"
+            + "  },function(){say('删除请求发不出去');c.disabled=false;c.textContent='删除'});\n"
+            + "}\n"
+            + "function picked(){\n"
+            + "  var a=[],i;\n"
+            + "  for(i=0;i<f.files.length;i++)a.push(f.files[i]);\n"
+            + "  for(i=0;i<db.files.length;i++)a.push(db.files[i]);\n"
+            + "  return a;\n"
             + "}\n"
             + "go.onclick=function(){\n"
-            + "  if(!f.files.length){say('先选文件');return}\n"
-            + "  go.disabled=true;bar.style.display='block';fill.style.width='0';say('');\n"
-            + "  var i=0;\n"
+            + "  var files=picked();\n"
+            + "  if(!files.length){say('先选文件或文件夹');return}\n"
+            + "  go.disabled=true;bar.style.display='block';fill.style.width='0';\n"
+            + "  var i=0,ok=0,bad=0;\n"
             + "  function next(){\n"
-            + "    if(i>=f.files.length){go.disabled=false;bar.style.display='none';"
-            + "say('上传完成');load();return}\n"
-            + "    var fd=new FormData();fd.append('file',f.files[i]);\n"
+            + "    if(i>=files.length){\n"
+            + "      go.disabled=false;bar.style.display='none';\n"
+            + "      say('上传完成：成功 '+ok+' 个'+(bad?('，失败 '+bad+' 个'):''));\n"
+            + "      load();return;\n"
+            + "    }\n"
+            + "    var file=files[i],fd=new FormData();fd.append('file',file);\n"
+            + "    say('正在上传 '+(i+1)+'/'+files.length+'：'+file.name);\n"
             + "    var x=new XMLHttpRequest();x.open('POST','/upload');\n"
             + "    x.upload.onprogress=function(e){if(e.lengthComputable)"
             + "fill.style.width=Math.round(e.loaded/e.total*100)+'%'};\n"
             + "    x.onload=function(){\n"
-            + "      var d;try{d=JSON.parse(x.responseText)}catch(e){d={message:'响应异常（'+x.status+'）'}}\n"
-            + "      if(x.status!==200){go.disabled=false;bar.style.display='none';"
-            + "say('上传失败：'+(d.message||x.status));load();return}\n"
-            + "      say('已上传 '+(i+1)+'/'+f.files.length+'：'+((d.saved||[]).join('、')||'（无）'));\n"
-            + "      i++;next();\n"
+            + "      var d;try{d=JSON.parse(x.responseText)}catch(e){"
+            + "d={message:'响应异常（'+x.status+'）',saved:[],failed:[]}}\n"
+            + "      if(x.status!==200){bad++;say('第 '+(i+1)+' 个上传失败：'"
+            + "+(d.message||x.status));i++;next();return}\n"
+            + "      ok+=((d.saved&&d.saved.length)?d.saved.length:0);\n"
+            + "      bad+=((d.failed&&d.failed.length)?d.failed.length:0);\n"
+            + "      say('已上传 '+(i+1)+'/'+files.length+'：'+((d.saved||[]).join('、')||'（无）'));\n"
+            + "      i++;fill.style.width='0';next();\n"
             + "    };\n"
-            + "    x.onerror=function(){go.disabled=false;bar.style.display='none';"
-            + "say('上传中断');load()};\n"
+            + "    x.onerror=function(){bad++;say('第 '+(i+1)+' 个上传中断');i++;next()};\n"
             + "    x.send(fd);\n"
             + "  }\n"
             + "  next();\n"

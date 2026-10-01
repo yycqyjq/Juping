@@ -60,14 +60,14 @@ Juping/
 │   │   │   ├── PlaybackPolicy.java         重连策略：纯逻辑，零 Android 依赖
 │   │   │   ├── MediaPlayerController.java  播放 + 看门狗 + 指数退避重连 + 音量状态
 │   │   │   └── MediaProxy.java             本地预取缓冲代理（默认关，见已知边界）
-│   │   └── web/                     扫码网页传文件（批 0，见 .agent/web-cast-plan.md）
+│   │   └── web/                     扫码网页传文件（批 1，见 .agent/web-cast-plan.md）
 │   │       ├── MultipartLite.java   流式 multipart 解析：纯逻辑，零 Android 依赖
 │   │       ├── LocalStore.java      上传落盘（内部存储）+ 剩余空间 + U 盘挂载点探测 + 防穿越
-│   │       └── WebCastEndpoints.java GET / 页 · POST /upload · POST /cast · GET /files · GET /media
+│   │       └── WebCastEndpoints.java GET / 页 · POST /upload · POST /cast · POST /delete · GET /files · GET /media
 │   └── res/                         布局、配色、字符串、图标、banner
 └── tools/
     ├── build.sh              一键构建 + 出包前核验
-    ├── lib.sh                各脚本共用的 JDK 定位（build.sh 与三个 run.sh 都 source 它）
+    ├── lib.sh                各脚本共用的 JDK 定位（build.sh 与四个 run.sh 都 source 它）
     ├── check_api_compat.py   逐个核验平台 API 引用是否在目标版本里存在
     ├── make_icon.py          生成全部位图资源（纯标准库）
     ├── probe-tv.sh           adb 探测盒子真实硬件信息（只读）
@@ -75,7 +75,7 @@ Juping/
     ├── dlna-probe.py         控制点视角自检（站在手机那一侧走完整链路）
     ├── apk_info.py           解析 APK 的包名 / minSdk
     ├── check_no_secrets.py   发布前核查：密钥真实值有没有混进被跟踪的文件
-    ├── check_gate_counts.py  四道闸门用例总数 ↔ README / AGENTS 文档 一致性
+    ├── check_gate_counts.py  五道闸门用例总数 ↔ README / AGENTS 文档 一致性
     ├── check_sources.py      无 JDK 环境下的源码结构检查
     ├── check_dex_entrypoints.py  反汇编 dex，核 R8 有没有把框架回调名改坏
     ├── protocol-test/        DLNA 协议层端到端测试（桌面 JVM，不需要真机）
@@ -87,9 +87,13 @@ Juping/
     ├── policy-test/          播放重连策略测试（纯逻辑，不需要真机）
     │   ├── run.sh            编译 + 57 项断言 + 265 条源码级守卫
     │   └── PolicyTest.java   57 项断言 + 「卡死→重连→又卡死」循环模拟
-    └── proxy-test/           本地预取代理字节一致性测试（11 项）
-        ├── run.sh            编译 → 起源站 → 全量/Range/回拖/EOS/中途重连 逐字节比对
-        └── ProxyTest.java    JDK 自带 HttpServer 当片源
+    ├── proxy-test/           本地预取代理字节一致性测试（11 项）
+    │   ├── run.sh            编译 → 起源站 → 全量/Range/回拖/EOS/中途重连 逐字节比对
+    │   └── ProxyTest.java    JDK 自带 HttpServer 当片源
+    └── web-test/             网页逻辑一致性测试（32 项）
+        ├── run.sh            编译 → multipart 逐字节/名字编码/流式边界 → 上传页源码不变量
+        ├── WebTest.java      MultipartLite + LocalStore.sanitize 的纯逻辑断言
+        └── android/          android.util.Log / android.content.Context 桌面替身（只为编得过）
 ```
 
 ---
@@ -106,6 +110,8 @@ Juping/
 ./tools/build.sh checkapi     # 逐个核验平台 API 引用是否在目标版本里存在
 ./tools/build.sh protocol     # 跑 DLNA 协议层一致性测试（不需要真机）
 ./tools/build.sh policy       # 跑播放重连策略测试（纯逻辑，不需要真机）
+./tools/build.sh proxy        # 跑本地预取代理字节一致性（纯 Java，不需要真机）
+./tools/build.sh web          # 跑网页上传解析一致性（纯逻辑，不需要真机）
 ./tools/build.sh dex          # 反汇编 dist/ 里的 release 包，核 R8 有没有改坏入口点
 ./tools/build.sh clean
 ```
@@ -117,14 +123,16 @@ dist/juping-0.1.7-release.apk   ← 装机用这个（已签名）
 dist/juping-0.1.7-debug.apk     ← 排障用（带 debuggable 标记）
 ```
 
-`dist` 目标会在归集后**自动跑六道闸**，任何一道不过就报错退出 —— 免得把一个装不上的、点开就崩的、投不进来的、断联后恢复不了的、或者带着签名密钥的包交出去：
+`dist` 目标会在归集后**自动跑八道闸**，任何一道不过就报错退出 —— 免得把一个装不上的、点开就崩的、投不进来的、断联后恢复不了的、字节被传坏了、或者带着签名密钥的包交出去：
 
 1. **签名**：以 API 15 为目标验证（`apksigner verify --min-sdk-version 15`）
 2. **API 兼容性**：逐个核对 dex 里引用的每个平台成员在目标版本里是否真的存在
 3. **dex 入口点**：反汇编 dex，确认 R8 没有把框架回调名改坏（改了 = 装得上、点开就崩）
 4. **协议层**：把真实的 UPnP 服务编到桌面 JVM 上，发真实 DLNA 报文核对响应
 5. **播放策略**：退避表 / 卡死阈值 / 熔断边界 + 「卡死→重连→又卡死」循环模拟
-6. **密钥核查**：确认签名密钥的真实值没有混进任何被跟踪的文件（这个仓库是公开的）
+6. **本地预取代理**：代理吐出的字节流与片源逐字节一致（差一字节就是花屏）
+7. **网页上传解析**：multipart 解析与文件名规整的纯逻辑断言（防「传上去了但字节是坏的 / 名字能穿越目录」）
+8. **密钥核查**：确认签名密钥的真实值没有混进任何被跟踪的文件（这个仓库是公开的）
 
 如果工具链已在 PATH 里，也可以直接用 wrapper：
 
@@ -899,7 +907,7 @@ com/juping/cast/player/…                   →  找不到这个前缀
 规则文件只保留 `SourceFile,LineNumberTable`（让崩溃栈里的行号还能读），
 刻意**不**用 `-assumenosideeffects` 去删 `Log` 调用 —— 这个项目全靠日志排障，
 把日志删了等于自断手脚。代价就是上面那类「名字被改坏」的风险，
-而第五道闸门就是为它付的保费。
+而 dex 入口点那道闸门就是为它付的保费。
 
 ### 第九组：投屏基础体验（真机实测报上来的）
 
@@ -1188,7 +1196,7 @@ SSDP 线程就**永久**结束了。
 顺带一条 API 15 的坑：`MEDIA_ERROR_UNSUPPORTED` 这几个常量 API 17 才有，
 **必须用字面量**，引用常量名会在真机上直接 `NoSuchFieldError`。
 
-**④ GitHub Actions CI —— 三道桌面闸门（协议 / 策略 / 密钥）push 即跑。**
+**④ GitHub Actions CI —— 五道桌面闸门（协议 / 策略 / 代理 / 网页 / 密钥）push 即跑。**
 
 都只要 JDK 或 python3，不需要真机也不需要 Android SDK。API 引用核对和
 dex 入口点两道要编整套 APK，收益撑不起 CI 耗时，仍在本地 `dist` 时跑。
@@ -1313,11 +1321,11 @@ bash 在 **UTF-8 locale** 下会把多字节字符的字节一起吞进变量名
   2026-09-30 在第二台真机（海信 Vision-TV / MTK / Android 4.0.4）上实测
   一轮，暴露并修掉：视频误判音频、进度条冻死在 Seek 点、-38 错误刷屏
   死循环、切歌后媒体服务卡死（全部见「排障」一节）。
-  桌面核验现在是十五项全绿：编译 / lint `NewApi` 零命中 /
-  API 引用 287 项（release 297 项）全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
+  桌面核验现在是十六项全绿：编译 / lint `NewApi` 零命中 /
+  API 引用 329 项（release 337 项）全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
   DLNA 协议 237 项通过 / 播放策略 57 项断言 + 265 条源码级守卫通过 /
-  断言/守卫计数与 README、AGENTS 文档一致（`check_gate_counts.py`，覆盖协议/代理/probe/策略四道）/
-  本地预取代理字节一致性 11 项通过 / R8 dex 入口点 33 项通过 /
+  断言/守卫计数与 README、AGENTS 文档一致（`check_gate_counts.py`，覆盖协议/代理/网页/probe/策略五道）/
+  本地预取代理字节一致性 11 项通过 / 网页逻辑一致性 32 项通过 / R8 dex 入口点 33 项通过 /
   控制点自检脚本 33 或 34 项通过（组播回退分支所致，均为合法值）/
   真机验收脚本管道自测 6 项通过 / 密钥核查干净 /
   工具链脚本的变量名边界检查通过（UTF-8 locale 下不再崩）/
@@ -1335,7 +1343,7 @@ bash 在 **UTF-8 locale** 下会把多字节字符的字节一起吞进变量名
 
 ## 真机验收
 
-前面五道闸全是**桌面端**跑的。它们能证明「代码自洽」，证明不了「盒子真的收得到投屏」。
+前面这些闸门全是**桌面端**跑的。它们能证明「代码自洽」，证明不了「盒子真的收得到投屏」。
 真机上只有三件事必须真机验，而且都验不了于桌面：
 
 1. **SSDP 组播收不收得到** —— 受 `MulticastLock`、网卡选择、路由器 IGMP 影响
@@ -1380,15 +1388,18 @@ bash 在 **UTF-8 locale** 下会把多字节字符的字节一起吞进变量名
 > 监听端口 —— 照着显示的那个地址访问即可。回退也会同步到 LOCATION，
 > 手机拿到的描述地址永远指向真正在听的端口。
 
-**扫码网页传文件（批 0，见 `.agent/web-cast-plan.md`）**：同一个 HTTP 服务还挂了一组
+**扫码网页传文件（批 1，见 `.agent/web-cast-plan.md`）**：同一个 HTTP 服务还挂了一组
 网页端点 —— 浏览器打开 `http://<电视IP>:端口/`（带 `Accept: text/html`）就是上传页
-（不带该头时 `/` 仍回 `device.xml`，兼容老控制点）。相关路由：
+（不带该头时 `/` 仍回 `device.xml`，兼容老控制点）。页面上能**多选文件一起传**、
+显示上传进度与**剩余空间**、把已上传的文件**直接投到电视**或**删掉**（浏览器不支持
+选文件夹时自动降级成「多选文件」，见下）。相关路由：
 
 | 路由 | 作用 |
 | --- | --- |
 | `GET /` | 上传页（仅当 `Accept` 含 `text/html`；否则 device.xml） |
 | `POST /upload` | multipart 流式落盘 → `getFilesDir()/uploads`；空间预检 `411 → 413 → 507` |
 | `POST /cast` | 播放已上传的文件（复用既有渲染器） |
+| `POST /delete` | 删掉一个已上传的文件（盒子空间紧，必要） |
 | `GET /files` | 已上传文件列表 + 剩余空间（JSON） |
 | `GET /media/<名字>` | 提供媒体流（支持 `Range`/`HEAD`）—— 播放**实际走这里**，不用 `file://` |
 | `GET /status` | 诊断 JSON（含新增的 `storage` 段：上传目录 / 可用空间 / U 盘挂载点） |

@@ -18,11 +18,12 @@ Android DLNA 投屏接收端（DMR），目标设备是 **2012 年的老电视/�
 ```bash
 cd /Users/yjq/Desktop/Juping   # 所有命令都从这里出发
 
-# ── 构建（六道闸门全跑，绿了才算完）──
+# ── 构建（八道闸门全跑，绿了才算完）──
 ./tools/build.sh dist          # debug+release 双包 + 全部核验 → dist/
 
 # ── 单独闸门 ──
 ./tools/build.sh proxy         # 本地预取代理字节一致性（11 项）
+./tools/build.sh web           # 网页逻辑一致性（32 项）
 ./tools/build.sh lint          # lint
 ./tools/build.sh clean         # 清理
 
@@ -66,20 +67,22 @@ app/src/main/java/com/juping/cast/
 │   ├── MediaProxy.java             本地预取缓冲代理（PROXY_ENABLED 默认关：
 │   │                               海信 CmpbPlayer 黑盒，详见 todo.md）
 │   └── PlaybackPolicy.java         纯逻辑策略/阈值常量（桌面可测）
-└── web/                       扫码网页传文件（批 0；方案 .agent/web-cast-plan.md）
+└── web/                       扫码网页传文件（批 1；方案 .agent/web-cast-plan.md）
     ├── MultipartLite.java     流式 multipart 解析（纯逻辑、零 Android 依赖）
     ├── LocalStore.java        落盘根=getFilesDir()/uploads（**内部优先**，真机
     │                          实测「外部存储=U 盘」已证伪原「外部优先」）；
     │                          剩余空间；/proc/mounts 探 U 盘挂载点；防穿越
-    └── WebCastEndpoints.java  GET / 页 · POST /upload(空间预检 411/413/507) ·
-                               POST /cast · GET /files · GET /media(HTTP+Range+HEAD)
+    └── WebCastEndpoints.java  GET / 页(多文件/文件夹降级/进度/删除) ·
+                               POST /upload(空间预检 411/413/507) ·
+                               POST /cast · POST /delete · GET /files ·
+                               GET /media(HTTP+Range+HEAD)
                                ※ 媒体**不走 file://**：mediaserver 是另一进程、
                                  穿不进 drwx------（真机证伪，见计划 §5.2.1）
                                ※ 这里的 WebEndpoints/WebResponse 接口定义在
                                  UpnpHttpServer 内（协议闸门编译白名单不含 web 包）
 tools/
-├── build.sh              一键构建+六道闸门（apk/api/dex/protocol/policy/proxy/secrets）
-├── lib.sh                各脚本共用的 JDK 定位（build.sh 与三个 run.sh 都 source 它）
+├── build.sh              一键构建+八道闸门（apk/api/dex/protocol/policy/proxy/web/secrets）
+├── lib.sh                各脚本共用的 JDK 定位（build.sh 与四个 run.sh 都 source 它）
 ├── verify-on-device.sh   真机一条命令验收
 ├── probe-tv.sh           电视硬件信息探测（只读）
 ├── dlna-probe.py         控制点视角自检（单播→组播回退→直连降级，33/34 项）
@@ -87,12 +90,13 @@ tools/
 ├── check_dex_entrypoints.py  R8 后 dex 入口点核查
 ├── check_sources.py      无 JDK 环境的源码结构检查
 ├── check_no_secrets.py   密钥泄漏核查
-├── check_gate_counts.py  四道闸门用例总数 ↔ README/AGENTS 文档 一致性
+├── check_gate_counts.py  五道闸门用例总数 ↔ README/AGENTS 文档 一致性
 ├── apk_info.py           APK 包名/minSdk 解析
 ├── make_icon.py          位图资源生成（纯标准库）
 ├── protocol-test/        DLNA 协议一致性 237 项（桌面 JVM + 真实协议栈桩）
 ├── policy-test/          播放策略 57 断言 + 265 源码级守卫
-└── proxy-test/           MediaProxy 字节一致性 11 项
+├── proxy-test/           MediaProxy 字节一致性 11 项
+└── web-test/             MultipartLite + sanitize 网页逻辑一致性（32 项）
 ```
 
 ## 4. 测试与闸门矩阵
@@ -107,14 +111,15 @@ tools/
 | verify_protocol | DLNA 协议一致性（drive.py，期望 237/237） | 237 |
 | ↳ 内含 probe | 控制点自检（**33 或 34 双态**：组播回退分支） | 33/34 |
 | verify_policy | 播放策略 57 断言 + 265 源码级守卫 | 57+ |
-| ↳ 内含计数 | 文档里的用例总数 ↔ 闸门期望值（`check_gate_counts.py`，覆盖协议/代理/probe/策略） | 一致性 |
+| ↳ 内含计数 | 文档里的用例总数 ↔ 闸门期望值（`check_gate_counts.py`，覆盖协议/代理/网页/probe/策略） | 一致性 |
 | verify_proxy | MediaProxy 字节一致性（全量/Range/回拖/EOS/中途重连） | 11 |
+| verify_web | multipart 解析逐字节一致 / 名字编码 / 上传页零外链 | 32 |
 | verify_secrets | 密钥泄漏 | 零命中 |
 
-**总数守卫是特性**：协议 237、probe 33/34 双态（组播回退分支）、策略 57。
+**总数守卫是特性**：协议 237、probe 33/34 双态（组播回退分支）、策略 57、网页逻辑一致性 32 项。
 有意增删断言后必须同步 build.sh / run.sh 里的期望值。
 
-**计数单一事实来源**：策略的断言/守卫数，以及协议/proxy/probe 的用例总数，
+**计数单一事实来源**：策略的断言/守卫数，以及协议/proxy/web/probe 的用例总数，
 手写在 `README.md` 与 `.agent/AGENTS.md` 里（措辞「N 项断言」/「N 条源码级守卫」/
 「N 项一致性」等，量词可有可无）。`verify_policy` 末尾用
 `tools/check_gate_counts.py` 拿这两个文档和闸门里的期望值核对，对不上就红 ——
@@ -198,7 +203,7 @@ adb -s 192.168.1.8:5555 logcat -v time > /tmp/tv_session.log 2>&1
 
 ## 6. 修改纪律（铁律，违反会返工）
 
-1. **六道闸门全绿才能提交**；断言总数变了必须同步期望值（probe 是 33/34 双态）。
+1. **八道闸门全绿才能提交**；断言总数变了必须同步期望值（probe 是 33/34 双态）。
 2. **源码级守卫是资产**：修 bug 时同步加守卫（policy-test 里 report()），
    防回归；改代码结构时同步改守卫锚点。
 3. **破坏性证伪**：修复前先复现红灯，修后确认绿灯；还原文件用反向

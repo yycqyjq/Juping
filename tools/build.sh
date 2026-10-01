@@ -15,6 +15,7 @@
 #   ./tools/build.sh protocol     # 跑 DLNA 协议层一致性测试（桌面 JVM，不需要真机）
 #   ./tools/build.sh policy       # 跑播放重连策略测试（纯逻辑 + 源码不变量守卫）
 #   ./tools/build.sh proxy        # 跑本地预取代理测试（字节一致性）
+#   ./tools/build.sh web          # 跑网页上传解析测试（multipart 逐字节一致 + 名字规整）
 #   ./tools/build.sh clean        # 清理构建产物
 #
 # 产物：
@@ -33,7 +34,7 @@ cd "$ROOT"
 
 # --- 工具链路径 ---
 TOOLCHAIN="${ANDROID_BUILD_HOME:-$HOME/.android-build}"
-# JDK 的定位逻辑已收敛到 tools/lib.sh（原先在本文件 + 三个 run.sh 里各有一份，
+# JDK 的定位逻辑已收敛到 tools/lib.sh（原先在本文件 + 四个 run.sh 里各有一份，
 # 注释里自己写着「改一处要同步另一处」）。选择顺序与理由见该文件。
 . "$ROOT/tools/lib.sh"
 resolve_java_home
@@ -44,14 +45,14 @@ GRADLE_BIN="$TOOLCHAIN/gradle/bin/gradle"
 BT="$ANDROID_HOME/build-tools/33.0.0"
 
 # --- 前置检查：按子命令区分需要什么 ---
-# protocol / policy / proxy 是纯桌面闸门，只需要一个 JDK（CI 上跑的就是它们）；
+# protocol / policy / proxy / web 是纯桌面闸门，只需要一个 JDK（CI 上跑的就是它们）；
 # secrets 连 JDK 都不需要（纯 python3）。**不能一律要求完整工具链** ——
 # 那会让这几道闸门在 CI 上永远跑不起来（实测：workflow 连续 4 次全红，
 # 根因就是这里无条件检查 gradle / android.jar）。
 case "${1:-debug}" in
-    protocol|policy|proxy) NEED_JAVA=1; NEED_TOOLCHAIN=0 ;;
-    secrets)               NEED_JAVA=0; NEED_TOOLCHAIN=0 ;;
-    *)                     NEED_JAVA=1; NEED_TOOLCHAIN=1 ;;
+    protocol|policy|proxy|web) NEED_JAVA=1; NEED_TOOLCHAIN=0 ;;
+    secrets)                   NEED_JAVA=0; NEED_TOOLCHAIN=0 ;;
+    *)                         NEED_JAVA=1; NEED_TOOLCHAIN=1 ;;
 esac
 
 missing=0
@@ -227,7 +228,7 @@ verify_policy() {
         # 计数守卫 —— 防「文档里写的用例总数」与「闸门期望值/实际跑出来的」悄悄对不上。
         # 存在的数字散落在 README.md 与 .agent/AGENTS.md 里手写同步，靠人肉必然漂：
         # 之前有过 proxy 用例 10→11、两处文档漏改（QA 跑测试才发现），README 里还
-        # 长期留着一句 `协议一致性：219 / 219`（实际早是 237）。现在四道闸门的总数
+        # 长期留着一句 `协议一致性：219 / 219`（实际早是 237）。现在五道闸门的总数
         # 都由 tools/check_gate_counts.py 核对：规范值是这里/run.sh 里的期望字符串，
         # 文档跟不上就红。对齐不上就红，逼着改文档或改期望值。
         if [ -f tools/check_gate_counts.py ]; then
@@ -276,6 +277,43 @@ verify_proxy() {
     # FAIL 行散布在各个断言里，tail 一截「是哪几条」就丢了，只剩一句「没通过」。
     grep '\[FAIL\]' "$out" >&2 || true
     grep -E '^  · ' "$out" >&2 || true
+    grep '!!' "$out" >&2 || true
+    tail -15 "$out" >&2
+    rm -f "$out"; return 1
+}
+
+# 网页上传解析核验：multipart 流式解析与文件名规整都是纯逻辑，桌面就能跑。
+# 两条 oracle 都很硬：解析出来的文件内容必须与写进去的**逐字节相同**（差一个字节，
+# 用户传上去的视频就是坏的，而且要播到那一段才发现），规整后的名字必须**只可能是
+# 上传目录内的一个普通名字**（接口无鉴权、名字完全由请求方给）。
+# 附带两条源码级守卫：上传页不许引外部资源（盒子没有外网，一个 CDN 就足以整页白屏），
+# 页面上的按钮背后都要有真路由（防"点了没反应"的静默漂移）。
+verify_web() {
+    if [ ! -x tools/web-test/run.sh ]; then
+        echo "  网页: 跳过（没有 tools/web-test/run.sh）"
+        return 0
+    fi
+    local out
+    out="$(mktemp)"
+    if tools/web-test/run.sh >"$out" 2>&1; then
+        # 断言总数守卫 —— 同 verify_protocol / verify_proxy：防的是「断言被静默删掉」。
+        # 这道闸门刚立起来就抓到一条真 bug（字段段之后的那一段体恒为 0 字节，
+        # 只在同一请求里带多个分段时才现形 —— 真机每次传一个文件永远碰不到），
+        # 正是"断言只会越写越多、总数变少必有蹊跷"这条判据的意义。
+        local summary
+        summary="$(grep -oE '网页逻辑：[0-9]+ / [0-9]+' "$out" | head -1)"
+        if [ "$summary" != "网页逻辑：32 / 32" ]; then
+            echo "  !! 网页用例总数变了：期望「网页逻辑：32 / 32」，实际「${summary:-（没找到）}」" >&2
+            echo "     总数变少几乎必然是有一条断言被静默删掉或跳过 —— 先查清楚，" >&2
+            echo "     确认是有意增删后再同步这里的期望值。" >&2
+            rm -f "$out"; return 1
+        fi
+        echo "  网页: ${summary}（逐字节一致 / 名字规整 / 源码级不变量）"
+        rm -f "$out"; return 0
+    fi
+    echo "  !! 网页上传解析核验未通过 —— 传上来的文件可能是坏的，或名字能穿越出目录：" >&2
+    # 同 verify_protocol / verify_policy：失败清单必须完整打出来，不能只 tail。
+    grep '\[FAIL\]' "$out" >&2 || true
     grep '!!' "$out" >&2 || true
     tail -15 "$out" >&2
     rm -f "$out"; return 1
@@ -385,6 +423,10 @@ PY
         verify_proxy
         ;;
 
+    web)
+        verify_web
+        ;;
+
     dist)
         if [ ! -f keystore.properties ]; then
             echo "!! 缺少 keystore.properties，跳过 release 构建。" >&2
@@ -410,6 +452,9 @@ PY
         echo
         echo "=== 本地预取代理（同上，纯 Java，不需要真机）==="
         verify_proxy
+        echo
+        echo "=== 网页上传解析（同上，纯逻辑，不需要真机）==="
+        verify_web
         echo
         echo "=== 密钥核查（这个仓库要公开）==="
         verify_secrets

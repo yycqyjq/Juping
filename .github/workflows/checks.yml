@@ -1,9 +1,10 @@
 # 桌面闸门 —— 不需要真机、也不需要 Android SDK 的那几道。
 #
-# 六道闸里有四道只依赖 JDK / python3，全部进 CI：
+# 八道闸里有五道只依赖 JDK / python3，全部进 CI：
 #   protocol —— 把真实的 DLNA 协议层编译到桌面 JVM，用原始 socket 跑 237 项一致性检查
 #   policy   —— 播放重连策略的 57 项断言 + 全部源码级不变量守卫
 #   proxy    —— 本地预取代理的字节一致性（全量 / Range / 回拖 / EOS 边界，11 项）
+#   web      —— 网页上传解析的一致性（multipart 逐字节 / 名字编码 / 上传页零外链，32 项）
 #   secrets  —— 签名密钥没有混进被跟踪的文件（这仓库是公开的，这道不能省）
 #
 # 其余三道（签名/minSdk、API 引用核对、dex 入口点）必须先编 APK、装整套
@@ -14,7 +15,7 @@
 # 这份 workflow 本身不碰任何机密：它只读仓库、只跑测试，没有 deploy key、
 # 没有签名密钥 —— 所以 secrets 那道闸对它自己也是适用的。
 #
-# protocol / policy / proxy 三个 job 只差「跑哪道闸门」这一个参数，故合成一个
+# protocol / policy / proxy / web 四个 job 只差「跑哪道闸门」这一个参数，故合成一个
 # matrix job：失败诊断那段 shell 原先逐字复制了三份，改一处要改三处（历史上就
 # 因此漂过 —— 注释里还留着「旧写法 head -8 会把真正的失败挤出注解」的教训）。
 # 注意 fail-fast: false —— 原先三个 job 彼此独立，一道挂了另外两道照样跑；
@@ -47,6 +48,8 @@ jobs:
             name: 播放策略断言
           - gate: proxy
             name: 预取代理字节一致性
+          - gate: web
+            name: 网页上传解析一致性
     steps:
       - uses: actions/checkout@v4
       # setup-java v4 已被上游标记弃用（会收到 "migrate to @v5" 的告警），

@@ -3,7 +3,7 @@
 
 为什么需要它
 -----------
-四道闸门的用例总数散落在 README.md 与 .agent/AGENTS.md 里**手写同步**，
+五道闸门的用例总数散落在 README.md 与 .agent/AGENTS.md 里**手写同步**，
 靠人肉必然漂。本轮之前就出过漂移：proxy 用例 10→11 时两处文档漏改
 （QA 跑测试才发现），README 里还留着一句样本输出写着 `协议一致性：219 / 219`
 （实际早就是 237）。「全部通过」和「该测的都测了」是两回事：断言被静默
@@ -14,6 +14,7 @@
 本脚本**不抄任何字面量**，而是把「闸门里那句比较用的期望字符串」读出来当规范值：
   · 协议总数 ← tools/build.sh 的 `协议一致性：N / N`
   · 代理总数 ← tools/build.sh 的 `代理一致性：N / N`
+  · 网页总数 ← tools/build.sh 的 `网页逻辑：N / N`
   · probe 总数 ← tools/protocol-test/run.sh 的 `控制点自检：N / N 通过`（双态）
   · 策略断言/守卫 ← 本次策略测试的实际输出（argv[1]）
 改期望值只需改闸门那一处；文档跟不上就红。
@@ -68,6 +69,11 @@ ANCHORS = (
     ('probe', 'README.md',        r'自检脚本 (\d+) 或 (\d+) 项'),
     ('probe', '.agent/AGENTS.md', r'直连降级，(\d+)/(\d+) 项'),
     ('probe', '.agent/AGENTS.md', r'自检（\*\*(\d+) 或 (\d+) 双态'),
+    # ---- 网页 32 ----
+    ('web', 'README.md',          r'网页逻辑一致性测试（(\d+) 项）'),
+    ('web', 'README.md',          r'网页逻辑一致性 (\d+) 项通过'),
+    ('web', '.agent/AGENTS.md',   r'网页逻辑一致性（(\d+) 项）'),
+    ('web', '.agent/AGENTS.md',   r'网页逻辑一致性 (\d+) 项'),
 )
 
 
@@ -79,9 +85,12 @@ def gate_expectations():
     m = re.search(r'代理一致性：[0-9]+ / ([0-9]+)', build)
     proxy = int(m.group(1)) if m else None
 
+    m = re.search(r'网页逻辑：[0-9]+ / ([0-9]+)', build)
+    web = int(m.group(1)) if m else None
+
     run = pathlib.Path(PROTOCOL_RUN).read_text(encoding='utf-8')
     probe = sorted({int(x) for x in re.findall(r'控制点自检：[0-9]+ / ([0-9]+) 通过', run)})
-    return {'protocol': protocol, 'proxy': proxy, 'probe': probe}
+    return {'protocol': protocol, 'proxy': proxy, 'web': web, 'probe': probe}
 
 
 def stated_policy(path):
@@ -152,8 +161,8 @@ def check_totals(expect, drift):
                     drift.append('%s 锚点 %r 写了 %d，期望 %s（漂移）'
                                  % (doc, pattern, v,
                                     '/'.join(str(x) for x in allowed)))
-    lines.append('  总数: 协议 %s · 代理 %s · probe %s'
-                 % (expect['protocol'], expect['proxy'],
+    lines.append('  总数: 协议 %s · 代理 %s · 网页 %s · probe %s'
+                 % (expect['protocol'], expect['proxy'], expect['web'],
                     '/'.join(str(x) for x in expect['probe']) or '?'))
     return lines
 
