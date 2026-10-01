@@ -1722,6 +1722,27 @@ check('13.2 SCPD 里没有非标准的 SetPlaySpeed',
       note='AVTransport:1 的标准 action 里没有它（可对照 Platinum 的 SCPD）。'
            '写进 :1 的 SCPD 本身就是错的 —— 控制点会以为这台设备支持变速播放')
 
+# (5) Play 的 in:Speed **必须声明** —— 这条是踩出来的
+#
+# 反面案例（2026-10-01 真机）：曾经为了「不做变速就不声明」把它摘掉，
+# 结果芒果 TV（UA `Cling/2.0`）点「继续播放」毫无反应。原因是 Cling 系控制点
+# 用编译期生成的桩发 Play，桩里固定 `setInput("Speed", …)`，而 Cling 在 setInput
+# 时拿**运行时取回的 SCPD** 校验参数存不存在，不存在就抛 IllegalArgumentException，
+# 请求根本发不出去 —— 取证日志里暂停后 28 秒只有 Get* 轮询、零 Play。
+# Pause 没有 Speed 参数，所以暂停一直正常，现象就成了「能暂停、不能继续播放」。
+#
+# 这类 bug **桌面测不出来**（我们的协议用例自己发 Play 时是硬写 body 的），
+# 只有真实 Cling 控制点才暴露，所以必须钉死。A_ARG_TYPE_Speed 也不能少：
+# 少了就是 relatedStateVariable 悬空，严格的 SCPD 校验器会判整份非法。
+_avt_state, _avt_actions = scpd_model(_avt_body)
+_play_in = [n for n, _d, _rv in _avt_actions.get('Play', []) if _d == 'in']
+check('13.2 SCPD 的 Play 声明了 in:Speed 与 A_ARG_TYPE_Speed',
+      'Speed' in _play_in and 'A_ARG_TYPE_Speed' in _avt_state,
+      'Play 的 in 参数 = %r，A_ARG_TYPE_Speed 在表里 = %s'
+      % (_play_in, 'A_ARG_TYPE_Speed' in _avt_state),
+      note='Cling 系控制点（芒果 TV）据此校验 Play 的入参，缺了 Speed 会让它'
+           '连 Play 都发不出来，表现为「能暂停、不能继续播放」')
+
 
 # --- 13.3 SetMute / GetMute 必须真的接通 ---
 

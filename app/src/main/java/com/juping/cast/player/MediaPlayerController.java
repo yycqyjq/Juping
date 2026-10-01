@@ -745,19 +745,26 @@ public class MediaPlayerController {
         // 兼着看门狗的豁免开关 —— 那种竞态只会表现为"偶发重连"，最难查。
         long pending = pendingSeekMs;
         if (pending >= 0) {
-            if (pendingSeekLanded
-                    || PlaybackPolicy.isSeekExpired(System.currentTimeMillis() - pendingSeekAtMs)) {
-                Log.w(TAG, "seek 到 " + pending + "ms 超过 "
-                        + PlaybackPolicy.SEEK_PENDING_TIMEOUT_MS + "ms 仍未落地，放弃等待");
+            long seekElapsed = System.currentTimeMillis() - pendingSeekAtMs;
+            if (pendingSeekLanded || PlaybackPolicy.isSeekExpired(seekElapsed)) {
                 pendingSeekMs = -1L;
-                // 放弃之后必须**立刻把基准对齐到当前位置**。
-                // 不对齐的话，"seek 期间位置没动"这段静止会被下一轮检查直接
-                // 算成卡死 —— 于是超时兜底反而制造出一次多余的重连。
+                // 立刻把基准对齐到当前位置：不对齐的话，"seek 期间位置没动"这段
+                // 静止会被下一轮检查算成卡死 —— 超时兜底反而制造一次多余的重连。
                 lastProgressAt = System.currentTimeMillis();
                 try {
                     lastPosition = player.getCurrentPosition();
                 } catch (Exception ignored) {
                     // 读不到就保持原值，下一轮会自行对齐
+                }
+                // 「落地」与「超时」是两回事，日志必须分开：原来共用一句
+                // 「超过 15000ms 仍未落地，放弃等待」，正常落地也报超时告警，
+                // 且打的是阈值常量而非真实耗时 —— 排障时完全误导。这里打真实 elapsed。
+                if (pendingSeekLanded) {
+                    Log.i(TAG, "seek 到 " + pending + "ms 已落地（耗时 " + seekElapsed + "ms）");
+                } else {
+                    Log.w(TAG, "seek 到 " + pending + "ms 超过 "
+                            + PlaybackPolicy.SEEK_PENDING_TIMEOUT_MS + "ms 仍未落地（实际 "
+                            + seekElapsed + "ms），放弃等待");
                 }
             }
             return;

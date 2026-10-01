@@ -80,7 +80,7 @@ Juping/
     ├── check_dex_entrypoints.py  反汇编 dex，核 R8 有没有把框架回调名改坏
     ├── protocol-test/        DLNA 协议层端到端测试（桌面 JVM，不需要真机）
     │   ├── run.sh            编译 → 起服务 → 驱动 → 验证两个自检脚本
-    │   ├── drive.py          240 项一致性检查（原始 socket 精确控字节）
+    │   ├── drive.py          241 项一致性检查（原始 socket 精确控字节）
     │   ├── ProtocolTestServer.java  在桌面跑真实的 UpnpHttpServer + SsdpResponder
     │   ├── verify-device-selftest.sh  用假 adb 验 verify-on-device.sh 的管道
     │   └── android/util/Log.java    android.util.Log 的桌面替身
@@ -438,7 +438,7 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 ```
 
 ```
-协议一致性：240 / 240 通过
+协议一致性：241 / 241 通过
 ```
 
 覆盖两大故障场景 —— **「手机搜不到设备」和「投屏没反应」**：
@@ -1303,7 +1303,7 @@ bash 在 **UTF-8 locale** 下会把多字节字符的字节一起吞进变量名
 | 其他 DLNA 控制点 | ☐ 欢迎补充 | 搜不到 / 投不上 / 状态不跟手，先对照本表，再走「排障」流程 |
 
 > 真机实测 = 在目标盒子（MT5880 / Android 4.0.4）上用真实 App 走通投屏全链路。
-> 桌面协议测试的 240 项通过不能替代这张表——桌面证明的是「协议自洽」，
+> 桌面协议测试的 241 项通过不能替代这张表——桌面证明的是「协议自洽」，
 > 这张表证明的是「真实控制点可用」。
 
 ---
@@ -1334,7 +1334,7 @@ bash 在 **UTF-8 locale** 下会把多字节字符的字节一起吞进变量名
   死循环、切歌后媒体服务卡死（全部见「排障」一节）。
   桌面核验现在是十六项全绿：编译 / lint `NewApi` 零命中 /
   API 引用 377 项（release 383 项）全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
-  DLNA 协议 240 项通过 / 播放策略 57 项断言 + 305 条源码级守卫通过 /
+  DLNA 协议 241 项通过 / 播放策略 57 项断言 + 305 条源码级守卫通过 /
   断言/守卫计数与 README、AGENTS 文档一致（`check_gate_counts.py`，覆盖协议/代理/网页/probe/策略五道）/
   本地预取代理字节一致性 11 项通过 / 网页逻辑一致性 32 项通过 / R8 dex 入口点 42 项通过 /
   控制点自检脚本 33 或 34 项通过（组播回退分支所致，均为合法值）/

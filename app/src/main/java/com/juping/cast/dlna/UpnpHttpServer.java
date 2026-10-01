@@ -1259,6 +1259,15 @@ public class UpnpHttpServer extends Thread {
         if ("Next".equals(action) || "Previous".equals(action)) {
             return "没有播放列表，谈不上下一首 / 上一首";
         }
+        if ("Play".equals(action)) {
+            // Play 的 in:Speed 是**声明过的**参数（不声明会让 Cling 系控制点
+            // 连 Play 都发不出来，见 SCPD 里那段注释），既然声明了就得对它负责：
+            // 这台盒子没有变速播放能力，非 1x 如实回 701，**不静默按 1x 播**。
+            // 规范里 AllowedValue 只有 1 和 1/2，所以 "1" 与缺省之外都是 1/2。
+            String speed = get(args, "Speed");
+            return (speed.length() == 0 || "1".equals(speed))
+                    ? null : "没有变速播放能力，收到 Speed=" + speed;
+        }
         if ("SetPlayMode".equals(action)) {
             String mode = get(args, "NewPlayMode");
             return "NORMAL".equals(mode) ? null : "只支持 NORMAL，收到 " + mode;
@@ -2000,11 +2009,22 @@ public class UpnpHttpServer extends Thread {
                             "in:InstanceID:A_ARG_TYPE_InstanceID",
                             "out:Actions:CurrentTransportActions")
                     + action("Stop", "in:InstanceID:A_ARG_TYPE_InstanceID")
-                    // Play 的 in:Speed **刻意不声明**：老平台没有变速播放能力，
-                    // 声明了又不照做（Speed=2 也按 1x 播）就是"声明做不到的事"。
-                    // 控制点据此就不会发 Speed；即便发了也被忽略（仍按 1x 播，
-                    // CurrentSpeed 如实回 1）。
-                    + action("Play", "in:InstanceID:A_ARG_TYPE_InstanceID")
+                    // Play 的 in:Speed **必须声明** —— 这条是踩出来的，别再删。
+                    //
+                    // Cling 系控制点（芒果 TV 的 UA 就是 `Cling/2.0`）发 Play 用的是
+                    // 编译期生成的桩，桩里固定会 `setInput("Speed", …)`；而 Cling 在
+                    // setInput 时拿**运行时取回的 SCPD** 校验参数存不存在，不存在就抛
+                    // IllegalArgumentException。结果是 Play **根本发不出去** ——
+                    // 盒子侧连一条 POST 都收不到（真机取证：暂停后 28 秒只有
+                    // Get* 轮询，零 Play）。Pause 没有 Speed 参数，所以暂停一直正常，
+                    // 现象就是「能暂停、不能继续播放」。
+                    //
+                    // 规范里 Speed 是**可选**参数、AllowedValue 只有 1 和 1/2。
+                    // 我们不支持变速：值非 1 时如实拒绝（见 dispatch），
+                    // 1 或缺省按 1x 播，CurrentSpeed 如实回 1。
+                    + action("Play",
+                            "in:InstanceID:A_ARG_TYPE_InstanceID",
+                            "in:Speed:A_ARG_TYPE_Speed")
                     + action("Pause", "in:InstanceID:A_ARG_TYPE_InstanceID")
                     + action("Seek",
                             "in:InstanceID:A_ARG_TYPE_InstanceID",
@@ -2060,6 +2080,10 @@ public class UpnpHttpServer extends Thread {
                     + stateVar("A_ARG_TYPE_InstanceID", "ui4", false)
                     + stateVar("A_ARG_TYPE_SeekMode", "string", false)
                     + stateVar("A_ARG_TYPE_SeekTarget", "string", false)
+                    // Play 的 Speed 参数类型。**不声明它的话，Play 里的
+                    // relatedStateVariable 就是悬空的**，严格的 SCPD 校验器
+                    // （以及我们自己的策略守卫）会判整份 SCPD 非法。
+                    + stateVar("A_ARG_TYPE_Speed", "string", false)
                     + " </serviceStateTable>\n"
                     + "</scpd>\n";
 
