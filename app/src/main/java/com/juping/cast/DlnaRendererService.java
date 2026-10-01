@@ -218,6 +218,32 @@ public class DlnaRendererService extends Service
      */
     private volatile String currentTitle = "";
 
+    /**
+     * 从元数据里解析出来的艺术家（{@code upnp:artist}）。
+     *
+     * <p>与 {@link #currentTitle} 同一套语义：只给界面显示，不参与协议回读。
+     * 取不到时为空串，界面据此把歌手行 {@code GONE} 掉（不显示空行）。
+     */
+    private volatile String currentArtist = "";
+
+    /**
+     * 从元数据里解析出来的封面地址（{@code upnp:albumArtURI}，仅 http/https）。
+     *
+     * <p>只给界面用（{@link MainActivity} 拿去后台拉取 + 降采样解码）。
+     * 取不到（多数控制点不送，或只给了相对地址）时为空串，界面退回
+     * {@code ic_music} 图标 —— 绝不留空白方块。
+     */
+    private volatile String currentAlbumArtUri = "";
+
+    /**
+     * 从元数据里碰运气解析出来的歌词。
+     *
+     * <p>DLNA 没有标准歌词字段，这一路是机会性的：控制点若塞进
+     * {@code lyrics}/{@code dc:description} 等元素就显示，否则为空串，
+     * 界面把歌词行 {@code GONE} 掉。不接任何外部歌词服务。
+     */
+    private volatile String currentLyrics = "";
+
     /** 传给 SSDP 的 SERVER 头。抽成字段是因为重建时要用同一个值 */
     private String serverName;
 
@@ -694,6 +720,11 @@ public class DlnaRendererService extends Service
         // 解析失败不抛异常 —— DidlLite 取不到就返回空串，界面回退到文件名。
         currentMetadata = metadata == null ? "" : metadata;
         currentTitle = DidlLite.title(currentMetadata);
+        // 歌手 / 封面 / 歌词：与标题**同一处**解析（收到新片源的唯一入口）。
+        // 取不到一律空串，界面据此降级（歌手行/歌词行 GONE、封面退回图标）。
+        currentArtist = DidlLite.artist(currentMetadata);
+        currentAlbumArtUri = DidlLite.albumArtUri(currentMetadata);
+        currentLyrics = DidlLite.lyrics(currentMetadata);
         if (currentTitle.length() > 0) {
             Log.i(TAG, "片源标题: " + currentTitle);
         }
@@ -1237,6 +1268,11 @@ public class DlnaRendererService extends Service
         // 界面会短暂显示**上一首**的名字 —— 旧标题配新地址，自相矛盾。
         currentMetadata = "";
         currentTitle = "";
+        // 歌手 / 封面 / 歌词一并清空。留着的话，停止后再投下一首，界面在解析出
+        // 新值之前会短暂显示**上一首**的封面/歌手 —— 旧内容配新地址，自相矛盾。
+        currentArtist = "";
+        currentAlbumArtUri = "";
+        currentLyrics = "";
         // 下一曲队列一并作废：Stop 是控制点明确结束，歌单不跨 Stop 存活
         // （DLNA 语义：新的 SetAVTransportURI/Stop 都会清掉 Next）。
         nextUri = "";
@@ -1328,6 +1364,11 @@ public class DlnaRendererService extends Service
         currentUri = uri;
         currentMetadata = metadata == null ? "" : metadata;
         currentTitle = DidlLite.title(currentMetadata);
+        // 自动续播与手动投屏走**同一套**解析：换歌时歌手/封面/歌词必须一起跟上，
+        // 否则界面上会留着上一首的封面或歌手（新歌名配旧封面，自相矛盾）。
+        currentArtist = DidlLite.artist(currentMetadata);
+        currentAlbumArtUri = DidlLite.albumArtUri(currentMetadata);
+        currentLyrics = DidlLite.lyrics(currentMetadata);
         kindFromMetadata = kindOfAny(uri, currentMetadata);
         audioOnly = (kindFromMetadata == KIND_AUDIO);
         videoMissing = false;
@@ -1709,6 +1750,36 @@ public class DlnaRendererService extends Service
      */
     public String getCurrentTitle() {
         return currentTitle;
+    }
+
+    /**
+     * 从元数据里解析出的艺术家，给界面用。
+     *
+     * <p>可能为空串（控制点没给）—— 界面此时把歌手行 {@code GONE} 掉，
+     * 不显示一行空白。与 {@link #getCurrentTitle()} 一样**不参与协议回读**。
+     */
+    public String getCurrentArtist() {
+        return currentArtist;
+    }
+
+    /**
+     * 从元数据里解析出的封面地址（仅 http/https），给界面用。
+     *
+     * <p>可能为空串（控制点没给封面，或只给了相对地址）—— 界面此时退回
+     * {@code ic_music} 图标，不发起任何网络请求、不留空白方块。
+     */
+    public String getCurrentAlbumArtUri() {
+        return currentAlbumArtUri;
+    }
+
+    /**
+     * 从元数据里碰运气解析出的歌词，给界面用。
+     *
+     * <p>绝大多数控制点不送（DLNA 无标准歌词字段）—— 为空串时界面把歌词行
+     * {@code GONE} 掉，对现状零影响。
+     */
+    public String getCurrentLyrics() {
+        return currentLyrics;
     }
 
     /**

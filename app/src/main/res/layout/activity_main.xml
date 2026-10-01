@@ -33,39 +33,69 @@
         android:paddingRight="48dp"
         android:visibility="gone">
 
+        <!-- 封面：220dp 见方。取不到封面时它继续显示 ic_music 图标（src 兜底）——
+             绝不留一个"加载中/取不到"的空白方块（空白块在深色卡片上看着像界面坏了）。
+             fitCenter 而不是 fitXY：宁可留边，也不要把封面/图标拉变形。
+             它画在**不透明**的音乐层之上，即便封面自带透明通道，透出的也是深色底，
+             不是底下 SurfaceView 的蓝色。 -->
         <ImageView
-            android:layout_width="96dp"
-            android:layout_height="96dp"
-            android:contentDescription="@string/music_title"
+            android:id="@+id/music_cover"
+            android:layout_width="220dp"
+            android:layout_height="220dp"
+            android:contentDescription="@string/music_cover_desc"
+            android:scaleType="fitCenter"
             android:src="@drawable/ic_music" />
 
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="28dp"
-            android:text="@string/music_title"
-            android:textColor="@color/text_primary"
-            android:textSize="34sp"
-            android:textStyle="bold" />
-
+        <!-- 歌名：音乐层里**最大**的一行（32sp 粗体、主色）。
+             原来这里最大的是写死的「音乐投屏」（34sp），而真正的歌名被挤在 17sp ——
+             字号层级排反了。现在删掉那个静态大字，把主位还给歌名。 -->
         <TextView
             android:id="@+id/music_source"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="14dp"
-            android:ellipsize="middle"
+            android:layout_marginTop="28dp"
+            android:ellipsize="end"
+            android:gravity="center"
+            android:singleLine="true"
+            android:textColor="@color/text_primary"
+            android:textSize="32sp"
+            android:textStyle="bold" />
+
+        <!-- 歌手行：取不到时整行 GONE（不显示空行）。 -->
+        <TextView
+            android:id="@+id/music_artist"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:ellipsize="end"
             android:gravity="center"
             android:singleLine="true"
             android:textColor="@color/text_secondary"
-            android:textSize="17sp" />
+            android:textSize="20sp"
+            android:visibility="gone" />
 
         <TextView
             android:id="@+id/music_progress"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="10dp"
+            android:layout_marginTop="14dp"
             android:textColor="@color/accent"
             android:textSize="22sp" />
+
+        <!-- 歌词行：DLNA 没有标准歌词字段，控制点不送就整行 GONE（不显示 = 现状）。
+             maxLines + 省略号：歌词可能很长，不能撑爆布局。 -->
+        <TextView
+            android:id="@+id/music_lyrics"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:ellipsize="end"
+            android:gravity="center"
+            android:lineSpacingExtra="4dp"
+            android:maxLines="6"
+            android:textColor="@color/text_hint"
+            android:textSize="16sp"
+            android:visibility="gone" />
 
         <TextView
             android:layout_width="wrap_content"

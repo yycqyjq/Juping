@@ -142,7 +142,56 @@ public class ProtocolTestServer {
         // 未知实体原样保留 —— 悄悄吃掉会让问题藏起来，暴露出来才好修
         expect("未知实体原样保留", "&nbsp;", DidlLite.title("<title>&nbsp;</title>"));
 
-        System.out.println("  DidlLite 自检：9 / 9 通过");
+        // ---- 音乐界面优化（批 3.6）新增字段：封面 / 专辑 / 歌词 ----
+        // 这些断言都挂在**协议闸门**上（不是 drive.py）：本文件反正要编译并运行，
+        // 解析器坏了协议闸门直接红，不需要新增脚本和闸门。
+
+        // 封面地址（upnp:albumArtURI）标准命名空间 + 属性写法
+        expect("albumArtURI 单尺寸", "http://192.168.1.5:8080/art/123_large.jpg",
+                DidlLite.albumArtUri("<item><upnp:albumArtURI dlna:profileID=\"JPEG_LRG\">"
+                        + "http://192.168.1.5:8080/art/123_large.jpg"
+                        + "</upnp:albumArtURI></item>"));
+
+        // 多尺寸择优：优先「中/大」，**绝不**无脑取第一个（这里第一个恰恰是缩略图）
+        expect("albumArtURI 多尺寸择优（MED 优先于 LRG/TN）", "http://h/med.jpg",
+                DidlLite.albumArtUri("<item>"
+                        + "<upnp:albumArtURI dlna:profileID=\"JPEG_TN\">http://h/tn.jpg</upnp:albumArtURI>"
+                        + "<upnp:albumArtURI dlna:profileID=\"JPEG_LRG\">http://h/lrg.jpg</upnp:albumArtURI>"
+                        + "<upnp:albumArtURI dlna:profileID=\"JPEG_MED\">http://h/med.jpg</upnp:albumArtURI>"
+                        + "</item>"));
+
+        // 相对地址不可用 —— 相对路径的基准（控制点主机）我们没有可靠来源，
+        // 一律视为没有封面（返回空串，界面退回图标）
+        expect("albumArtURI 相对地址不可用", "",
+                DidlLite.albumArtUri("<item><upnp:albumArtURI>/art/1.jpg</upnp:albumArtURI></item>"));
+
+        // 没有封面字段 → 空串（界面据此退回 ic_music 图标，不发起网络请求）
+        expect("albumArtURI 缺失返回空", "",
+                DidlLite.albumArtUri("<item><dc:title>x</dc:title></item>"));
+
+        // 专辑名（upnp:album）—— 本轮界面不用，但解析器补齐
+        expect("upnp:album", "十一月的萧邦",
+                DidlLite.album("<item><upnp:album>十一月的萧邦</upnp:album></item>"));
+
+        // 歌词：DLNA 无标准歌词字段，控制点若塞进 dc:description 就显示（机会性）
+        expect("歌词取自 dc:description", "从前从前 有个人爱你很久",
+                DidlLite.lyrics("<item><dc:description>从前从前 有个人爱你很久</dc:description></item>"));
+
+        // 歌词：优先专用 lyrics 元素（若控制点真的送了这个扩展）
+        expect("歌词优先 lyrics 元素", "L1\nL2",
+                DidlLite.lyrics("<item><lyrics>L1\nL2</lyrics>"
+                        + "<dc:description>别的</dc:description></item>"));
+
+        // 没有歌词字段 → 空串（这一行默认 GONE，不显示 = 现状，零影响）
+        expect("歌词缺失返回空", "",
+                DidlLite.lyrics("<item><dc:title>x</dc:title></item>"));
+
+        // ⚠️ 下面这行的形状与 probe 的「控制点自检：33 / 33 通过」**几乎一样**。
+        // 它**没有**被任何闸门期望值或文档锚点引用（build.sh 只比对 drive.py 的
+        // 「协议一致性：N / N」），所以改这个数字是安全的 —— 但前提是
+        // check_gate_counts.py 里那条锚点正则始终是具体的「控制点自检：」。
+        // 若哪天有人把它放宽成「自检：…」，DidlLite 的这个数就会漏进 probe 计数。
+        System.out.println("  DidlLite 自检：17 / 17 通过");
     }
 
     private static void expect(String what, String want, String got) {

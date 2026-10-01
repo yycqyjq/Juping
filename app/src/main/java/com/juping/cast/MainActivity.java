@@ -105,6 +105,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private TextView playingText;
     private TextView musicSource;
     private TextView musicProgress;
+    /** 封面控件。取不到封面时它继续显示布局里写死的 ic_music 图标（不留白块）。 */
+    private ImageView musicCover;
+    /** 歌手行。取不到歌手时 GONE（不显示空行）。 */
+    private TextView musicArtist;
+    /** 歌词行。DLNA 无标准歌词字段，控制点不送就整行 GONE（不显示 = 现状）。 */
+    private TextView musicLyrics;
     private Button btnRestart;
 
     private DlnaRendererService service;
@@ -144,6 +150,41 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * 在这台 0.6GB 的盒子上是纯粹的浪费。记下来，等地址换了再试。
      */
     private String imageFailedUri;
+
+    /**
+     * 当前显示的那张封面对应的地址 —— 同时也是「要不要重新下载」的缓存键。
+     *
+     * <p>与 {@link #imageUri} 同构：{@link #refresh()} 每 0.5 秒跑一次，
+     * 封面地址没变就一个字节都不重下、不重解。
+     */
+    private String coverUri;
+    private Bitmap coverBitmap;
+    /**
+     * 正在后台下载解码的封面地址（去重，避免每 tick 重复排队）。
+     *
+     * <p>一张封面解码要几百毫秒，这期间会经过好几个 tick —— 没有它的话，
+     * 每 tick 都往后台再排一个下载任务，同一个封面被重复下一堆。
+     */
+    private String coverLoadingUri;
+    /**
+     * 已经下载/解码**失败**过的封面地址 —— 同一个地址不再每 tick 重试。
+     *
+     * <p>封面地址是控制点给的任意 URL，可能 404 / 超时。失败地址既不进
+     * {@code coverUri} 也不进 {@code coverLoadingUri}，不记的话下一个 tick
+     * 又原样重来一遍 —— 图片层已踩过这个坑（真机实测 15 秒 30 次请求）。
+     * 记下来，等地址换了再试。
+     */
+    private String coverFailedUri;
+
+    /**
+     * 封面下载的字节上限（约 4MB）。
+     *
+     * <p>封面地址是控制点给的**任意** URL —— 可能指向一个巨大文件。
+     * {@link #decodeScaled(String, long)} 原本把整个响应读进内存（那是给本地
+     * {@code /media/} 照片写的），对封面必须加闸：超限即中断、判失败、退回图标，
+     * 绝不让它成为 0.6GB 设备上的 OOM 入口。
+     */
+    private static final long COVER_MAX_BYTES = 4L * 1024 * 1024;
 
     private final Handler handler = new Handler();
 
@@ -198,6 +239,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         playingText = (TextView) findViewById(R.id.playing_text);
         musicSource = (TextView) findViewById(R.id.music_source);
         musicProgress = (TextView) findViewById(R.id.music_progress);
+        musicCover = (ImageView) findViewById(R.id.music_cover);
+        musicArtist = (TextView) findViewById(R.id.music_artist);
+        musicLyrics = (TextView) findViewById(R.id.music_lyrics);
         btnRestart = (Button) findViewById(R.id.btn_restart);
 
         // 版本号只在进程启动时取一次：它是构建产物里的常量（BuildConfig 由
@@ -316,7 +360,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 : getString(R.string.music_live);
         if (mode == MODE_AUDIO) {
             musicSource.setText(currentLabel());
+            updateArtist(service.getCurrentArtist());
+            updateLyrics(service.getCurrentLyrics());
             musicProgress.setText(progress);
+            // 封面每个 tick 都问一次：地址在**同一个形态之内**就会换（连投几首），
+            // 而 applyModeIfChanged 只在形态真的变了时才走 applyMode —— 形态不变
+            // 就永远轮不到封面更新。updateCover 自己按地址去重，不会重复下载。
+            updateCover(service.getCurrentAlbumArtUri());
         }
         // 顶部条现在只在暂停 / 出错 / 缓冲时出现，那些时刻用户要的正是
         // 「放到哪儿了」，所以两种形态都报进度。原来音频时这里固定写
@@ -410,7 +460,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         new Thread(new Runnable() {
             @Override
             public void run() {
-                final Bitmap bmp = decodeScaled(target);
+                final Bitmap bmp = decodeScaled(target, 0L);
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
@@ -432,21 +482,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     /**
-     * 下载 + 降采样解码。
+     * 下载 + 降采样解码，可选**下载大小上限**。
      *
      * <p><b>为什么必须降采样</b>：手机随手一张照片就是 4000×3000，直接
      * 解码成 ARGB_8888 要 4000×3000×4 ≈ 48MB —— 而整台设备的可用内存
      * 远没这么多，结果必然是 {@code OutOfMemoryError}，崩的是整个应用，
      * 用户看到的是"投屏把电视搞崩了"。所以先用 {@code inJustDecodeBounds}
      * 只读尺寸，算出 {@code inSampleSize} 再真正解码。
+     *
+     * <p><b>为什么要有 {@code maxBytes}</b>：图片投屏的地址是本地
+     * {@code /media/}（我们自己的文件），传 0 = 不限；而封面地址是控制点给的
+     * **任意** URL，可能指向一个巨大文件 —— 传 {@link #COVER_MAX_BYTES}，
+     * 超限即中断、判失败，绝不让它成为 OOM 入口。
      */
-    private Bitmap decodeScaled(String uri) {
+    private Bitmap decodeScaled(String uri, long maxBytes) {
         try {
             URLConnection conn = new URL(uri).openConnection();
             conn.setConnectTimeout(5000);
             conn.setReadTimeout(15000);
             InputStream in = conn.getInputStream();
-            byte[] data = readAll(in);
+            byte[] data = readAll(in, maxBytes);
             in.close();
             if (data == null) {
                 return null;
@@ -490,13 +545,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return sample;
     }
 
-    /** 把输入流整个读进内存；失败返回 null（不抛，调用方只需要"成没成"） */
-    private static byte[] readAll(InputStream in) {
+    /**
+     * 把输入流读进内存，可选**字节上限**；失败 / 超限返回 null
+     * （不抛，调用方只需要"成没成"）。
+     *
+     * <p>{@code maxBytes > 0} 时边读边计字节，超限立即返回 null（判失败）——
+     * 这是封面拉取的专用闸：地址来自控制点，可能指向一个巨大文件，不设限的话
+     * 整个响应会被读进内存，在 0.6GB 的设备上就是 OOM 入口。
+     * 图片投屏走本地 {@code /media/}（我们自己的文件），传 0 = 不限。
+     */
+    private static byte[] readAll(InputStream in, long maxBytes) {
         try {
             ByteArrayOutputStream bos = new ByteArrayOutputStream();
             byte[] buf = new byte[16 * 1024];
             int n;
+            long total = 0;
             while ((n = in.read(buf)) > 0) {
+                total += n;
+                if (maxBytes > 0 && total > maxBytes) {
+                    return null;
+                }
                 bos.write(buf, 0, n);
             }
             return bos.toByteArray();
@@ -547,6 +615,162 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             if (!b.isRecycled()) {
                 b.recycle();
             }
+        }
+    }
+
+    /**
+     * 歌手行：取不到就 {@code GONE} —— 不显示一行空白。
+     *
+     * <p>每个 tick 都会被调一次（{@link #refresh()} 的频率）。空值时只设可见性、
+     * 不设文本，避免反复给一个隐藏的行塞字符串。
+     */
+    private void updateArtist(String artist) {
+        if (musicArtist == null) {
+            return;
+        }
+        if (artist != null && artist.length() > 0) {
+            musicArtist.setText(artist);
+            musicArtist.setVisibility(View.VISIBLE);
+        } else {
+            musicArtist.setVisibility(View.GONE);
+        }
+    }
+
+    /**
+     * 歌词行：DLNA 没有标准歌词字段，控制点不送就整行 {@code GONE}
+     * （不显示 = 现状，对界面零影响）。
+     */
+    private void updateLyrics(String lyrics) {
+        if (musicLyrics == null) {
+            return;
+        }
+        if (lyrics != null && lyrics.length() > 0) {
+            musicLyrics.setText(lyrics);
+            musicLyrics.setVisibility(View.VISIBLE);
+        } else {
+            musicLyrics.setVisibility(View.GONE);
+        }
+    }
+
+    /**
+     * 封面：**只在地址真的变了**时才重新下载。
+     *
+     * <p>与 {@link #updateQr(String)} / {@link #loadImage(String)} 同一套缓存纪律：
+     * {@link #refresh()} 每 0.5 秒跑一次，封面地址不变时一个字节都不重下、不重解。
+     *
+     * <p><b>三级降级，任何一级都不留白块</b>：
+     * <ol>
+     *   <li>地址为空（控制点没送封面）→ 退回 ic_music 图标，**不发起网络请求**；</li>
+     *   <li>已失败过 → 同样退回图标（同一个坏地址不每 tick 重试）；</li>
+     *   <li>加载中 → 仍显示图标（不留空白、不留透明）。</li>
+     * </ol>
+     */
+    private void updateCover(String uri) {
+        if (musicCover == null) {
+            return;
+        }
+        if (uri == null || uri.length() == 0) {
+            // 这一首没有封面：把上一首残留的封面放掉、退回图标。
+            // releaseCover 自身幂等 —— 已经退回图标时不会重复设置。
+            releaseCover();
+            return;
+        }
+        if (uri.equals(coverUri) || uri.equals(coverLoadingUri) || uri.equals(coverFailedUri)) {
+            return;
+        }
+        loadCover(uri);
+    }
+
+    /**
+     * 把封面下载、解码、显示出来 —— **整件事必须在后台线程**。
+     *
+     * <p>地址是控制点给的 {@code albumArtURI}，要真的联网去取；解码本身也要
+     * 几百毫秒。放主线程上 Android 会直接抛 {@code NetworkOnMainThreadException}，
+     * 就算不抛界面也会卡住 —— 而此刻界面正要显示它。
+     */
+    private void loadCover(String uri) {
+        coverLoadingUri = uri;
+        final String target = uri;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final Bitmap bmp = decodeScaled(target, COVER_MAX_BYTES);
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (!target.equals(coverLoadingUri)) {
+                            // 下载期间用户又换了歌：这次的结果作废。但位图是 native
+                            // 内存，GC 看不见它 —— 必须手动回收，否则就是泄漏。
+                            if (bmp != null && !bmp.isRecycled()) {
+                                bmp.recycle();
+                            }
+                            return;
+                        }
+                        coverLoadingUri = null;
+                        showCover(target, bmp);
+                    }
+                });
+            }
+        }).start();
+    }
+
+    /**
+     * 把解码好的封面换上屏幕；失败时退回 ic_music 图标（**绝不留白块**）。
+     *
+     * <p>失败（下载不到 / 解不开 / 超限 / 内存不够）时记下 {@link #coverFailedUri}：
+     * {@link #refresh()} 每 0.5 秒就会再问一次 {@link #updateCover}，不记的话
+     * 同一个坏地址会被无限重试（图片层已踩过：15 秒 30 次请求）。
+     */
+    private void showCover(String uri, Bitmap bmp) {
+        if (bmp == null) {
+            coverFailedUri = uri;
+            Bitmap old = coverBitmap;
+            coverBitmap = null;
+            coverUri = null;
+            if (old != null && !old.isRecycled()) {
+                old.recycle();
+            }
+            if (musicCover != null) {
+                musicCover.setImageResource(R.drawable.ic_music);
+            }
+            return;
+        }
+        // 先拿住旧的，换完新的再回收 —— 顺序反过来的话，ImageView 手上那张
+        // 已经被回收，屏幕上会是一块空白（或直接崩）。
+        Bitmap old = coverBitmap;
+        coverBitmap = bmp;
+        coverUri = uri;
+        if (musicCover != null) {
+            musicCover.setImageBitmap(bmp);
+        }
+        if (old != null && old != bmp && !old.isRecycled()) {
+            old.recycle();
+        }
+    }
+
+    /**
+     * 放掉当前封面、退回 ic_music 图标，并清空三字段缓存。
+     *
+     * <p>位图是 native 内存，GC 看不见它 —— 换形态（离开音乐态）时必须手动
+     * {@code recycle}，与图片层的 {@link #releaseImage()} 同一套路。
+     *
+     * <p><b>幂等</b>：没有任何封面时是个空操作（不会反复给 ImageView 设图标）。
+     */
+    private void releaseCover() {
+        Bitmap b = coverBitmap;
+        boolean had = (b != null) || (coverUri != null) || (coverLoadingUri != null)
+                || (coverFailedUri != null);
+        coverBitmap = null;
+        coverUri = null;
+        coverLoadingUri = null;
+        coverFailedUri = null;
+        if (b != null && !b.isRecycled()) {
+            b.recycle();
+        }
+        if (had && musicCover != null) {
+            // 退回布局里那张 ic_music 图标：绝不留一个"加载中/取不到"的空白方块
+            // —— 空白块在深色卡片上看着像界面坏了（图片投屏那批的教训）。
+            musicCover.setImageResource(R.drawable.ic_music);
         }
     }
 
@@ -647,6 +871,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // 接下来要放视频时它白占着内存 —— 而这台盒子总共才 0.6GB。
         if (!image) {
             releaseImage();
+        }
+        // 离开音乐形态同理放掉封面位图：一张 220dp 的 ARGB_8888 位图在电视密度下
+        // 也有几百 KB，切到视频/图片时它白占着内存。
+        if (mode != MODE_AUDIO) {
+            releaseCover();
         }
 
         // SurfaceView 在空闲态必须**藏起来**。这不是省资源，是修一个真故障：

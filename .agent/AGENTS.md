@@ -57,10 +57,15 @@ app/src/main/java/com/juping/cast/
 │                              组播就绪解耦（joinGroup 失败后台带退避重试）
 ├── EventDispatcher.java       GENA 订阅表+NOTIFY 投递；订阅数=Auto-Stop 判据
 ├── NetUtil.java               网卡选择唯一出处
-├── DidlLite.java              DIDL-Lite 元数据解析
+├── DidlLite.java              DIDL-Lite 元数据解析（title/artist/class/album/
+│                              albumArtURI 多尺寸择优/lyrics 机会性；取不到返回空串）
 ├── MainActivity.java          界面：前台唤醒/播完延迟退后台（MTK 蓝屏规避）
 │                              空闲时画二维码（扫码进上传页，批 2）：按地址缓存、
 │                              换图 recycle 旧位图、生成失败整块 GONE
+│                              音乐态（批 3.6）：歌名放大（32sp 主位）+ 封面 +
+│                              歌手/歌词行；封面走 albumArtURI（后台线程 / ≤4MB /
+│                              降采样 / 三字段缓存 / 代次作废 / recycle），取不到
+│                              一律退回 ic_music（不留白块）
 ├── QrRenderer.java            二维码位图绘制：QrCode → 逐格 int[] → 一次 setPixels
 │                              （替代上游 toImage()，Android 无 java.awt/ImageIO）
 ├── RenameReceiver.java        adb 改名广播入口（唯一 exported 指令面）
@@ -116,7 +121,7 @@ tools/
 ├── apk_info.py           APK 包名/minSdk 解析
 ├── make_icon.py          位图资源生成（纯标准库）
 ├── protocol-test/        DLNA 协议一致性 245 项（桌面 JVM + 真实协议栈桩）
-├── policy-test/          播放策略 78 断言 + 364 源码级守卫
+├── policy-test/          播放策略 78 断言 + 374 源码级守卫
 ├── proxy-test/           MediaProxy 字节一致性 11 项
 └── web-test/             MultipartLite + sanitize + ApkScan 网页逻辑一致性（52 项）
 ```
@@ -128,11 +133,11 @@ tools/
 | 闸门 | 内容 | 断言数 |
 |------|------|--------|
 | verify_apk | 签名/minSdk | 每包 |
-| verify_api | 平台 API 引用逐个核对（目标 API 15/33） | 260+/272+ |
+| verify_api | 平台 API 引用逐个核对（目标 API 15/33） | 407/413 |
 | verify_dex | R8 后框架回调/Thread 子类/协议常量存活 | 全量 |
 | verify_protocol | DLNA 协议一致性（drive.py，期望 245/245） | 245 |
 | ↳ 内含 probe | 控制点自检（**33 或 34 双态**：组播回退分支） | 33/34 |
-| verify_policy | 播放策略 78 断言 + 364 源码级守卫 | 78+ |
+| verify_policy | 播放策略 78 断言 + 374 源码级守卫 | 78+ |
 | ↳ 内含计数 | 文档里的用例总数 ↔ 闸门期望值（`check_gate_counts.py`，覆盖协议/代理/网页/probe/策略） | 一致性 |
 | verify_proxy | MediaProxy 字节一致性（全量/Range/回拖/EOS/中途重连） | 11 |
 | verify_web | multipart 解析逐字节一致 / 名字编码 / APK 扫描内核 / 上传页与安装页零外链 | 52 |

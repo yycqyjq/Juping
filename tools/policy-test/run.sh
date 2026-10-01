@@ -388,6 +388,67 @@ if music_bg:
 for rid in ('@+id/music_source', '@+id/music_progress'):
     report('布局里有 %s' % rid, rid in by_id, '')
 
+# ⑲ 音乐层字号层级（批 3.6）：最大最粗的那一行必须是**歌名**，不是静态装饰。
+#
+# 守的是一个已经发生过的真实 bug：原来音乐层里最大的是写死的「音乐投屏」
+# （34sp 粗体），而真正的歌名（music_source）被挤在 17sp —— 字号层级整个排反。
+# 这种回归编译、运行、日志全都正常，只是用户最想看的信息又变回最小那行。
+report('布局里有封面 @+id/music_cover', '@+id/music_cover' in by_id,
+       '封面控件；取不到封面时它继续显示 ic_music 图标（不留白块）')
+report('布局里有歌手行 @+id/music_artist', '@+id/music_artist' in by_id,
+       '歌手行；取不到歌手时整行 GONE（不显示空行）')
+report('布局里有歌词行 @+id/music_lyrics', '@+id/music_lyrics' in by_id,
+       '歌词行；DLNA 无标准歌词字段，控制点不送就整行 GONE')
+
+_cover = by_id.get('@+id/music_cover')
+report('封面 ImageView 有默认 src（取不到封面不留白块）',
+       _cover is not None and bool(_cover.get(AND + 'src')),
+       '实际：%r —— 没有兜底图，取不到封面时那一块就是空白，'
+       '在深色卡片上看着像界面坏了'
+       % (_cover.get(AND + 'src') if _cover is not None else None))
+
+def _tsize(el):
+    v = el.get(AND + 'textSize')
+    if not v:
+        return None
+    m = re.match(r'([0-9.]+)sp$', v)
+    return float(m.group(1)) if m else None
+
+_music = by_id.get('@+id/music')
+if _music is not None:
+    _texts = [(el, _tsize(el)) for el in _music.iter()
+              if el.tag == 'TextView' and _tsize(el) is not None]
+    _src = by_id.get('@+id/music_source')
+    _src_size = _tsize(_src) if _src is not None else None
+    report('歌名字号 ≥ 音乐层内所有其它 TextView',
+           _src_size is not None and all(sz <= _src_size for _, sz in _texts),
+           '歌名 %s，其余 %s —— 排反了的话，用户最想看的信息又变成最小那行'
+           % (_src_size, [sz for _, sz in _texts]))
+    report('写死的「音乐投屏」大字已移除',
+           not any(el.get(AND + 'text') == '@string/music_title' and (sz or 0) >= 30
+                   for el, sz in _texts),
+           '静态大标题永远不变，既重复又抢走歌名的视觉权重')
+
+# ⑳ 封面拉取的源码级不变量（批 3.6）：封面是**唯一新增的网络 + 解码路径**，
+# 与图片投屏同一套纪律，少一条就会在 0.6GB 的盒子上卡 UI / OOM / 刷屏重试。
+_lc = body_of(act_src, 'private void loadCover(String uri)')
+report('loadCover 方法体已找到', _lc is not None,
+       '锚点：private void loadCover(String uri)')
+if _lc:
+    report('封面下载解码在后台线程（不占主线程）',
+           'new Thread' in _lc,
+           '封面地址是控制点给的任意 URL，要真的联网取。放主线程会抛 '
+           'NetworkOnMainThreadException，或直接卡住界面')
+report('封面有三字段缓存（coverUri / coverLoadingUri / coverFailedUri）',
+       all(k in act_src for k in ('coverUri', 'coverLoadingUri', 'coverFailedUri')),
+       '少了缓存键就会每 tick 重下；少了失败记录就会对坏地址刷屏式重试'
+       '（图片层已踩过：15 秒 30 次请求）')
+_sc = body_of(act_src, 'private void showCover(String uri, Bitmap bmp)')
+report('showCover 换图时回收旧位图',
+       _sc is not None and 'recycle()' in _sc,
+       'Bitmap 占的是 native 内存，GC 看不见它。换歌不 recycle，'
+       '在 0.6GB 的盒子上几首就能把内存耗光')
+
 # ⑬b 顶部条那个圆点必须**有 id**，否则代码改不了它的颜色。
 # 它原来是写死的 dot_online（绿）—— 而顶部条现在只在「暂停 / 出错 / 缓冲」
 # 时出现，出错时左边绿点、右边「出错：…」，自己跟自己打架。
@@ -795,9 +856,9 @@ if am2:
            '图片不经过视频层，那个 Surface 上什么都没有 —— 老 MTK 平台会'
            '露出一屏蓝底，把刚画上去的照片盖住（和 idle 态是同一个坑）')
 
-ds = body_of(act_code, 'private Bitmap decodeScaled(String uri)')
+ds = body_of(act_code, 'private Bitmap decodeScaled(String uri, long maxBytes)')
 report('decodeScaled 方法体已找到（去注释后）', ds is not None,
-       '锚点：private Bitmap decodeScaled(String uri)')
+       '锚点：private Bitmap decodeScaled(String uri, long maxBytes)')
 if ds:
     report('图片解码先量尺寸再降采样（inJustDecodeBounds + inSampleSize）',
            'inJustDecodeBounds' in ds and 'inSampleSize' in ds,

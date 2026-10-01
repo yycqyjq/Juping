@@ -68,6 +68,114 @@ public final class DidlLite {
     }
 
     /**
+     * 取专辑名（{@code upnp:album}）。取不到返回空串。
+     *
+     * <p>本轮界面**不用**它（信息已经够），但解析器一并补齐 —— 与
+     * {@link #title}/{@link #artist} 同构，将来若要在界面上加一行专辑名，
+     * 不必再动解析器。
+     */
+    public static String album(String metadata) {
+        return element(metadata, "album");
+    }
+
+    /**
+     * 封面尺寸档位的择优顺序。
+     *
+     * <p>DIDL-Lite 里封面地址（{@code upnp:albumArtURI}）常带
+     * {@code dlna:profileID} 属性，同一个封面会以多个尺寸各出现一次
+     * （{@code JPEG_TN} / {@code JPEG_SM} / {@code JPEG_MED} / {@code JPEG_LRG}）。
+     * 界面上的封面框约 220dp，取「中/大」这一档刚好够用。
+     *
+     * <p><b>为什么不无脑取最大</b>：0.6GB 的设备上，拉一张几 MB 的大图再降采样，
+     * 是纯浪费带宽与内存。{@code MED} 优先，{@code LRG} 次之，缩略图排最后。
+     */
+    private static final String[] ART_PROFILES = {"MED", "LRG", "SM", "TN"};
+
+    /**
+     * 取封面地址（{@code upnp:albumArtURI}）。取不到返回空串。
+     *
+     * <p>多尺寸时按 {@link #ART_PROFILES} 择优；没有档位信息就取**第一个**
+     * 非空地址。只认 {@code http://} / {@code https://} 开头的绝对地址 ——
+     * 相对地址的基准（控制点主机）我们没有可靠来源，一律**视为不可用**
+     * （返回空串，界面据此退回 {@code ic_music} 图标）。
+     *
+     * <p>返回空串是「没有封面」的唯一信号，界面靠它决定降级 ——
+     * 所以这里**不返回 null、不抛异常**。
+     */
+    public static String albumArtUri(String metadata) {
+        if (metadata == null || metadata.length() == 0) {
+            return "";
+        }
+        // 带属性捕获：需要读 dlna:profileID 才能择优
+        Pattern p = Pattern.compile(
+                "<(?:\\w+:)?albumArtURI(\\s[^>]*)?>(.*?)</(?:\\w+:)?albumArtURI>",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+        Matcher m = p.matcher(metadata);
+        String first = "";
+        String best = "";
+        int bestRank = ART_PROFILES.length;
+        while (m.find()) {
+            String attrs = m.group(1) == null ? "" : m.group(1);
+            String url = unescape(m.group(2).trim());
+            if (!isHttpUrl(url)) {
+                continue;
+            }
+            if (first.length() == 0) {
+                first = url;
+            }
+            int rank = profileRank(attrs);
+            if (rank < bestRank) {
+                bestRank = rank;
+                best = url;
+            }
+        }
+        // 一个档位都没认出来（best 仍为空）时退回第一个可用地址
+        return best.length() > 0 ? best : first;
+    }
+
+    /** 档位在 {@link #ART_PROFILES} 里的名次；没有档位信息返回「比所有已知档位都差」 */
+    private static int profileRank(String attrs) {
+        String up = attrs.toUpperCase(java.util.Locale.ROOT);
+        for (int i = 0; i < ART_PROFILES.length; i++) {
+            if (up.indexOf(ART_PROFILES[i]) >= 0) {
+                return i;
+            }
+        }
+        return ART_PROFILES.length;
+    }
+
+    /** 只认绝对 HTTP(S) 地址；相对地址的基准我们拿不到，视为不可用 */
+    private static boolean isHttpUrl(String url) {
+        return url.startsWith("http://") || url.startsWith("https://");
+    }
+
+    /**
+     * 歌词的候选元素，按「可能性」从高到低。
+     *
+     * <p><b>DLNA 没有标准歌词字段</b>，所以这一路是**机会性**的：控制点若把歌词
+     * 塞进某个扩展元素或 {@code dc:description}，我们就显示；否则什么都不显示
+     * （不显示 = 现状，对界面零影响）。不引入任何外部歌词服务。
+     */
+    private static final String[] LYRICS_ELEMENTS = {"lyrics", "description", "longDescription"};
+
+    /**
+     * 取歌词（机会性）。依次尝试 {@link #LYRICS_ELEMENTS} 里的候选元素，
+     * 返回第一个非空；都取不到返回空串。
+     *
+     * <p>绝大多数控制点不送歌词 —— 这是**预期内**的结果，不是错误。
+     * 返回空串让界面把整行 {@code GONE} 掉即可。
+     */
+    public static String lyrics(String metadata) {
+        for (String name : LYRICS_ELEMENTS) {
+            String v = element(metadata, name);
+            if (v.length() > 0) {
+                return v;
+            }
+        }
+        return "";
+    }
+
+    /**
      * 抠出某个元素的文本内容。
      *
      * <p>命名空间前缀用 {@code (?:\w+:)?} 吃掉 —— 同一个字段，控制点可能写
