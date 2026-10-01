@@ -187,6 +187,34 @@ public final class LocalStore {
         return f;
     }
 
+    /**
+     * {@code target} 是否在 {@code root} 之下（含相等）—— 共享的**防目录穿越**判据。
+     *
+     * <p>批 3（U 盘只读浏览）与批 3.5（外接卷 APK 安装）共用同一条：路径完全由请求方
+     * 提供，必须用**真实路径**（{@code getCanonicalPath()}，会解析 {@code ..} 与
+     * 符号链接）做前缀校验，而不是字符串前缀 —— 后者能被
+     * {@code /mnt/sdcard/../data/data/…} 这种名字绕过。
+     *
+     * @return 在 root 之下返回 true；任一取不到真实路径时返回 false（保守拒绝）
+     */
+    public static boolean isUnder(File root, File target) {
+        if (root == null || target == null) {
+            return false;
+        }
+        try {
+            String rc = root.getCanonicalPath();
+            String tc = target.getCanonicalPath();
+            if (tc.equals(rc)) {
+                return true;
+            }
+            // root 恰好是文件系统根（"//"）时不能拼出 "//"，兜一下
+            String prefix = rc.endsWith(File.separator) ? rc : rc + File.separator;
+            return tc.startsWith(prefix);
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
     /** 取一个不会覆盖已有文件的落点（重名时加 {@code (1)}、{@code (2)} …） */
     public File uniqueFileFor(String safeName) {
         File f = new File(root, safeName);

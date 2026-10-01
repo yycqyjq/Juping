@@ -19,6 +19,17 @@
     <!-- 开机自启动 -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
+    <!-- 外接存储（U 盘 / SD）上的 APK 扫描与安装（批 3.5）。
+         API 15 上读写外部存储只有 WRITE_EXTERNAL_STORAGE 这一个权限
+         （READ_EXTERNAL_STORAGE 要到 API 16 才出现）—— 本功能只读不写，
+         但老平台没有只读变体，只能声明它。READ_EXTERNAL_STORAGE 是为
+         API 16+ 的设备准备的，在 API 15 上是 no-op（系统忽略不认识的名字），
+         声明它无副作用。两条都是装机时授予（targetSdk 19 < 23，无运行期弹框）。
+         权限面刻意保持最小：不加 INSTALL_PACKAGES / REQUEST_INSTALL_PACKAGES ——
+         targetSdk 19 走 ACTION_VIEW 唤起系统安装器，本就不需要它们。 -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+
     <!-- 声明为 TV 应用：不需要触摸屏（遥控器操作），
          leanback 标记为可选，这样手机/平板也能装来调试。 -->
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />

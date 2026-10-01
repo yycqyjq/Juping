@@ -61,6 +61,9 @@ FRAMEWORK_INTERFACES = {
     # 列进来是为了让「名字被改过」这件事照样被核到 —— 不列的话它只会被
     # 当成「不在核查表内」报出来，闸门照样红。
     'Ljava/lang/Cloneable;': ['clone'],
+    # ApkScan（批 3.5）用一个匿名 Comparator 给目录项排序，只为让「到顶即停」
+    # 的结果可复现（同一台机器两次刷新顺序一致）。列进来同样是让它被核到。
+    'Ljava/util/Comparator;': ['compare'],
     'Ljava/util/concurrent/ThreadFactory;': ['newThread'],
     'Landroid/view/SurfaceHolder$Callback;': ['surfaceCreated', 'surfaceChanged',
                                               'surfaceDestroyed'],

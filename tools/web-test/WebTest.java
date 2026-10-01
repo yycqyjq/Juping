@@ -361,6 +361,10 @@ public class WebTest {
                 "得到 " + (fixed == null ? "null" : fixed.length() + " 字符，结尾 "
                         + fixed.substring(Math.max(0, fixed.length() - 6))));
 
+        // 批 3.5：外接存储 APK 扫描内核（ApkScan，纯逻辑）的断言。
+        // 计数与上面共用（都走 WebTest.check），所以汇总行会把两批一起算。
+        ApkScanTest.run();
+
         System.out.println();
         System.out.println("网页逻辑：" + passed + " / " + total + " 通过");
         if (!FAILS.isEmpty()) {

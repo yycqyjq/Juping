@@ -23,7 +23,7 @@ cd /Users/yjq/Desktop/Juping   # 所有命令都从这里出发
 
 # ── 单独闸门 ──
 ./tools/build.sh proxy         # 本地预取代理字节一致性（11 项）
-./tools/build.sh web           # 网页逻辑一致性（32 项）
+./tools/build.sh web           # 网页逻辑一致性（47 项）
 ./tools/build.sh lint          # lint
 ./tools/build.sh clean         # 清理
 
@@ -71,19 +71,28 @@ app/src/main/java/com/juping/cast/
 │   ├── MediaProxy.java             本地预取缓冲代理（PROXY_ENABLED 默认关：
 │   │                               海信 CmpbPlayer 黑盒，详见 todo.md）
 │   └── PlaybackPolicy.java         纯逻辑策略/阈值常量（桌面可测）
-└── web/                       扫码网页传文件（批 1；方案 .agent/web-cast-plan.md）
+└── web/                       扫码网页传文件（批 1）/ 外接存储装应用（批 3.5）
     ├── MultipartLite.java     流式 multipart 解析（纯逻辑、零 Android 依赖）
     ├── LocalStore.java        落盘根=getFilesDir()/uploads（**内部优先**，真机
     │                          实测「外部存储=U 盘」已证伪原「外部优先」）；
-    │                          剩余空间；/proc/mounts 探 U 盘挂载点；防穿越
-    └── WebCastEndpoints.java  GET / 页(多文件/文件夹降级/进度/删除) ·
-                               POST /upload(空间预检 411/413/507) ·
-                               POST /cast · POST /delete · GET /files ·
-                               GET /media(HTTP+Range+HEAD)
-                               ※ 媒体**不走 file://**：mediaserver 是另一进程、
-                                 穿不进 drwx------（真机证伪，见计划 §5.2.1）
-                               ※ 这里的 WebEndpoints/WebResponse 接口定义在
-                                 UpnpHttpServer 内（协议闸门编译白名单不含 web 包）
+    │                          剩余空间；/proc/mounts 探 U 盘挂载点；防穿越；
+    │                          isUnder(root,target) 共享防穿越 helper（批 3/3.5）
+    ├── WebCastEndpoints.java  GET / 页(多文件/文件夹降级/进度/删除) ·
+    │                           POST /upload(空间预检 411/413/507) ·
+    │                           POST /cast · POST /delete · GET /files ·
+    │                           GET /media(HTTP+Range+HEAD)
+    │                           ※ 媒体**不走 file://**：mediaserver 是另一进程、
+    │                             穿不进 drwx------（真机证伪，见计划 §5.2.1）
+    │                           ※ 这里的 WebEndpoints/WebResponse 接口定义在
+    │                             UpnpHttpServer 内（协议闸门编译白名单不含 web 包）
+    ├── ApkEntry.java          APK 记录：路径/名/大小/包名/应用名/版本
+    ├── ApkScan.java           外接卷 APK 扫描内核（纯逻辑、零 Android 依赖）：
+    │                          迭代遍历、深度≤8、条数≤300、时间≤8s、跳过系统/隐藏目录
+    ├── ApkScanner.java        Android 胶水：枚举存储卷 + getPackageArchiveInfo 补元数据
+    │                          + 专用线程扫描 + 代次取消 + 结果缓存
+    ├── ApkEndpoints.java      GET /apk 页 · GET /apk/list · POST /apk/install ·
+    │                          POST /apk/refresh（安装=唯一有副作用路由；白名单+isUnder 两道加固）
+    └── WebRouter.java         复合路由：串 WebCastEndpoints + ApkEndpoints → 一个 WebEndpoints
 app/src/main/java/io/nayuki/qrcodegen/            ← **唯一的第三方源码**
 ├── QrCode.java · QrSegment.java · BitBuffer.java · DataTooLongException.java
 │                              Nayuki QR Code generator 1.8.0
@@ -109,7 +118,7 @@ tools/
 ├── protocol-test/        DLNA 协议一致性 245 项（桌面 JVM + 真实协议栈桩）
 ├── policy-test/          播放策略 78 断言 + 364 源码级守卫
 ├── proxy-test/           MediaProxy 字节一致性 11 项
-└── web-test/             MultipartLite + sanitize 网页逻辑一致性（32 项）
+└── web-test/             MultipartLite + sanitize + ApkScan 网页逻辑一致性（47 项）
 ```
 
 ## 4. 测试与闸门矩阵
@@ -126,10 +135,10 @@ tools/
 | verify_policy | 播放策略 78 断言 + 364 源码级守卫 | 78+ |
 | ↳ 内含计数 | 文档里的用例总数 ↔ 闸门期望值（`check_gate_counts.py`，覆盖协议/代理/网页/probe/策略） | 一致性 |
 | verify_proxy | MediaProxy 字节一致性（全量/Range/回拖/EOS/中途重连） | 11 |
-| verify_web | multipart 解析逐字节一致 / 名字编码 / 上传页零外链 | 32 |
+| verify_web | multipart 解析逐字节一致 / 名字编码 / APK 扫描内核 / 上传页与安装页零外链 | 47 |
 | verify_secrets | 密钥泄漏 | 零命中 |
 
-**总数守卫是特性**：协议 245、probe 33/34 双态（组播回退分支）、策略 78、网页逻辑一致性 32 项。
+**总数守卫是特性**：协议 245、probe 33/34 双态（组播回退分支）、策略 78、网页逻辑一致性 47 项。
 有意增删断言后必须同步 build.sh / run.sh 里的期望值。
 
 **计数单一事实来源**：策略的断言/守卫数，以及协议/proxy/web/probe 的用例总数，
@@ -239,7 +248,8 @@ adb -s 192.168.1.8:5555 logcat -v time > /tmp/tv_session.log 2>&1
 
 ## 7. 当前状态指针
 
-- 版本 0.1.13（versionCode 14），全部推送 GitHub（main）。
+- 版本 0.2.0（versionCode 15）—— 批 3.5「外接存储 APK 扫描 + 安装」为中等更新
+  （新能力），版本从 0.1.13 → 0.2.0。历史版本已全部推送 GitHub（main）。
 - **发版规则（用户定的，每次打包都要遵守）**：改 `app/build.gradle` 的
   `versionName`，界面「版本」那一行读的就是它（不写死字面量）。
   **小更新**（修 bug、小改进）→ 改最后一位（0.1.12 → 0.1.13）；

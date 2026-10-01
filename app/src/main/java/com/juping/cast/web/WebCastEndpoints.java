@@ -650,9 +650,14 @@ public final class WebCastEndpoints implements UpnpHttpServer.WebEndpoints {
             + "li button{margin:0;padding:6px 14px;font-size:14px}\n"
             + "li button.del{background:#3a2a2a;color:#ff9a9a}\n"
             + "li a{color:#7fb0ff;font-size:14px;text-decoration:none}\n"
+            + ".nav{margin:0 0 16px}\n"
+            + ".nav a{color:#7fb0ff;font-size:14px;text-decoration:none}\n"
             + "</style></head><body>\n"
             + "<h1>聚屏</h1>\n"
             + "<p id=\"space\">正在读取…</p>\n"
+            // 安装包页入口（批 3.5）。放在上传页同族、分列端点 —— 装应用与传文件
+            // 是两件事，混一屏会互相抢注意力（方案 §2 备选 B 的否决理由）。
+            + "<p class=\"nav\"><a href=\"/apk\">安装包（U 盘里的 APK）→</a></p>\n"
             + "<div class=\"box\">\n"
             // 两个入口都留，但必须各有一句说明 —— 否则手机上会看到两个
             // 长得一样的「选择文件」按钮，不知道点哪个（实测反馈）。

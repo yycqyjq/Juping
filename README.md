@@ -62,10 +62,15 @@ Juping/
 │   │   │   ├── PlaybackPolicy.java         重连策略：纯逻辑，零 Android 依赖
 │   │   │   ├── MediaPlayerController.java  播放 + 看门狗 + 指数退避重连 + 音量状态
 │   │   │   └── MediaProxy.java             本地预取缓冲代理（默认关，见已知边界）
-│   │   └── web/                     扫码网页传文件（批 1，见 .agent/web-cast-plan.md）
+│   │   └── web/                     扫码网页传文件（批 1）/ 外接存储装应用（批 3.5）
 │   │       ├── MultipartLite.java   流式 multipart 解析：纯逻辑，零 Android 依赖
 │   │       ├── LocalStore.java      上传落盘（内部存储）+ 剩余空间 + U 盘挂载点探测 + 防穿越
-│   │       └── WebCastEndpoints.java GET / 页 · POST /upload · POST /cast · POST /delete · GET /files · GET /media
+│   │       ├── WebCastEndpoints.java GET / 页 · POST /upload · POST /cast · POST /delete · GET /files · GET /media
+│   │       ├── ApkEntry.java        APK 记录：路径 / 名 / 大小 / 包名 / 应用名 / 版本
+│   │       ├── ApkScan.java         外接卷 APK 扫描内核：纯逻辑，零 Android 依赖
+│   │       ├── ApkScanner.java      Android 胶水：枚举存储卷 + 取 APK 元数据 + 后台线程
+│   │       ├── ApkEndpoints.java    GET /apk 页 · GET /apk/list · POST /apk/install · POST /apk/refresh
+│   │       └── WebRouter.java       复合路由：把上传端点与安装包端点串成一个 WebEndpoints
 │   └── res/                         布局、配色、字符串、图标、banner
 └── tools/
     ├── build.sh              一键构建 + 出包前核验
@@ -92,9 +97,10 @@ Juping/
     ├── proxy-test/           本地预取代理字节一致性测试（11 项）
     │   ├── run.sh            编译 → 起源站 → 全量/Range/回拖/EOS/中途重连 逐字节比对
     │   └── ProxyTest.java    JDK 自带 HttpServer 当片源
-    └── web-test/             网页逻辑一致性测试（32 项）
-        ├── run.sh            编译 → multipart 逐字节/名字编码/流式边界 → 上传页源码不变量
+    └── web-test/             网页逻辑一致性测试（47 项）
+        ├── run.sh            编译 → multipart 逐字节/名字编码/流式边界 → APK 扫描内核 → 源码不变量
         ├── WebTest.java      MultipartLite + LocalStore.sanitize 的纯逻辑断言
+        ├── ApkScanTest.java  ApkScan 纯逻辑断言（跳过规则/深度/上限/时间预算/取消/去重）
         └── android/          android.util.Log / android.content.Context 桌面替身（只为编得过）
 ```
 
@@ -121,8 +127,8 @@ Juping/
 产物：
 
 ```
-dist/juping-0.1.13-release.apk   ← 装机用这个（已签名）
-dist/juping-0.1.13-debug.apk     ← 排障用（带 debuggable 标记）
+dist/juping-0.2.0-release.apk   ← 装机用这个（已签名）
+dist/juping-0.2.0-debug.apk     ← 排障用（带 debuggable 标记）
 ```
 
 `dist` 目标会在归集后**自动跑八道闸**，任何一道不过就报错退出 —— 免得把一个装不上的、点开就崩的、投不进来的、断联后恢复不了的、字节被传坏了、或者带着签名密钥的包交出去：
@@ -186,7 +192,7 @@ release 密钥在 `keystore/juping-release.jks`，密码在 `keystore.properties
 可以用这个命令确认：
 
 ```bash
-unzip -p dist/juping-0.1.13-release.apk META-INF/MANIFEST.MF | grep Digest
+unzip -p dist/juping-0.2.0-release.apk META-INF/MANIFEST.MF | grep Digest
 # 应该看到 SHA1-Digest: ...，而不是 SHA-256-Digest
 ```
 
@@ -206,7 +212,7 @@ unzip -p dist/juping-0.1.13-release.apk META-INF/MANIFEST.MF | grep Digest
 
 ```bash
 adb connect <盒子IP>:5555        # 或 USB 连接
-adb install -r dist/juping-0.1.13-release.apk
+adb install -r dist/juping-0.2.0-release.apk
 ```
 
 局域网 adb 需要盒子侧已经开着网络调试并在监听 5555 —— 零售盒子默认是关的，
@@ -214,7 +220,7 @@ adb install -r dist/juping-0.1.13-release.apk
 
 ### 路径 B：U 盘（最通用，不依赖任何调试通道）
 
-1. 把 `dist/juping-0.1.13-release.apk` 拷到 U 盘。**用 FAT32** ——
+1. 把 `dist/juping-0.2.0-release.apk` 拷到 U 盘。**用 FAT32** ——
    老盒子对 exFAT / NTFS 的支持看 ROM 心情，FAT32 是唯一稳的
 2. U 盘插上盒子，用盒子自带的「文件管理 / 本地媒体 / USB 设备」找到这个文件
 3. 点它安装
@@ -228,7 +234,7 @@ adb install -r dist/juping-0.1.13-release.apk
   和源文件比一下大小，不一致就重拷一遍：
 
   ```bash
-  ls -l dist/juping-0.1.13-release.apk   # 记下这个字节数，再和 U 盘里那个比
+  ls -l dist/juping-0.2.0-release.apk   # 记下这个字节数，再和 U 盘里那个比
   # 两个数一致就说明拷完整了。
   # 刻意不写死具体数字 —— 每次重新构建都会变，写死的那份迟早对不上，
   # 反而会让人以为文件拷坏了（这里原来就写着一个过期的字节数）。
@@ -1363,7 +1369,7 @@ SCPD 如实声明、控制点发的动作如实响应 —— 做不到的如实�
   API 引用 381 项（release 387 项）全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
   DLNA 协议 245 项通过 / 播放策略 78 项断言 + 364 条源码级守卫通过 /
   断言/守卫计数与 README、AGENTS 文档一致（`check_gate_counts.py`，覆盖协议/代理/网页/probe/策略五道）/
-  本地预取代理字节一致性 11 项通过 / 网页逻辑一致性 32 项通过 / R8 dex 入口点 42 项通过 /
+  本地预取代理字节一致性 11 项通过 / 网页逻辑一致性 47 项通过 / R8 dex 入口点 47 项通过 /
   控制点自检脚本 33 或 34 项通过（组播回退分支所致，均为合法值）/
   真机验收脚本管道自测 6 项通过 / 密钥核查干净 /
   工具链脚本的变量名边界检查通过（UTF-8 locale 下不再崩）/
@@ -1447,6 +1453,46 @@ SCPD 如实声明、控制点发的动作如实响应 —— 做不到的如实�
 > 它穿不进应用私有目录（`drwx------`）—— 真机实测直接 `error (1, -2147483648)`。
 > 改由盒子自己的 HTTP 服务供流后，顺带修好了老芯片「视频被判成纯音频」的老毛病
 > （`getVideoWidth()` 恒 0，只能靠 `Content-Type` 探测）。详见方案 §5.2.1。
+
+**外接存储装应用（批 3.5，见 `.agent/apk-scan-plan.md`）**：上传页页顶多了一个
+「安装包（U 盘里的 APK）→」链接，进去就是安装包页（`GET /apk`）。它**只扫外接可移动
+设备**（U 盘 / SD 卡，即 `LocalStore.removableMounts()` 认出的那些卷），**不列盒子内部
+存储** —— 内部存储里的 APK 系统安装器（另一个进程）根本读不到，列出来只会给用户一个
+「点了没反应」的按钮。相关路由：
+
+| 路由 | 作用 |
+| --- | --- |
+| `GET /apk` | 安装包页（HTML，ES5、零外链） |
+| `GET /apk/list` | 扫描结果（JSON：`apps` / `scanning` / `truncated` / `installAllowed` / `roots`） |
+| `POST /apk/refresh` | 强制重扫（页面「刷新」按钮）—— 单开一条路，因为查询串在 HTTP 层就被剥掉了 |
+| `POST /apk/install` | 触发系统安装器（本功能**唯一有副作用**的路由） |
+
+安装就是发一个 `ACTION_VIEW` + `application/vnd.android.package-archive` 的 Intent，
+把电视上的**系统安装器**叫起来 —— 真正的安装要**用户拿遥控器在电视前确认**。
+`targetSdk 19` 让这条路**免掉** FileProvider、`REQUEST_INSTALL_PACKAGES`、运行时权限三件套
+（`file://` 在 `targetSdk < 24` 上不抛 `FileUriExposedException`）。
+
+两条加固把「任意安装」这个新攻击面收窄：① `/apk/install` **只接受本次扫描结果里出现过
+的路径**（服务端白名单）；② 落点再叠一道 `LocalStore.isUnder`（canonical 前缀校验，防
+`..` 穿越、防私有目录）。即便这样，局域网内最多也只能让电视**弹一个安装确认框** ——
+装不装成，得人（遥控器）点头。
+
+「未知来源」开关（`Settings.Secure.INSTALL_NON_MARKET_APPS`，API 15 上是全局开关）关着时，
+页面顶部只显示一条**文字指引**（`设置 → 安全 → 未知来源`），**不提供跳转按钮**；
+`/status` 里也加了 `installAllowed` 布尔，排障一眼可见。
+
+扫描要面对**可能很大的 U 盘**，硬要求是**不卡 UI、不 OOM、可中断**：扫描跑在专用线程
+（不是主线程，也不是 HTTP 连接线程）、**迭代而非递归**（深目录不爆栈）、只 `stat` 不读文件
+内容（元数据用 `getPackageArchiveInfo`，只读 zip 中央目录，几十 MB 的包也不整包读入）、
+**深度 ≤ 8 / 条数 ≤ 300 / 时间 ≤ 8s** 到顶即停、新扫描取消旧扫描（连点刷新不堆叠线程）、
+结果按代次缓存。策略全在纯逻辑内核 `ApkScan` 里（零 Android 依赖），所以能在桌面用临时目录
+把每条边界都断言一遍。
+
+> ⚠️ **装的是聚屏自己时会断服务**：安装过程中系统会杀掉本进程 → 前台服务随之中断 →
+> 装完需**重新打开聚屏**。这是系统行为，无解。装别的 APK 不受影响。
+
+> ⚠️ **两条只能在真机上验**：① U 盘（vfat）上的 APK 能否被**系统安装器**读到
+> （不可从应用私有目录的失败外推）；② 0.6GB 盒子插大 U 盘时扫描**不卡、不 OOM**。
 
 **电视上的二维码（批 2）**：空闲形态下主面板会显示一个二维码，内容就是上传页地址
 （与 `device.xml` 的 `presentationURL` **同源**：同一个本机 IP、同一个实际监听端口 ——

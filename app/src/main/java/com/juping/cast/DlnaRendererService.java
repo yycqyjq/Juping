@@ -16,6 +16,7 @@ import android.net.wifi.WifiManager;
 import android.os.Binder;
 import android.os.Handler;
 import android.os.IBinder;
+import android.provider.Settings;
 import android.util.Log;
 
 import com.juping.cast.dlna.DidlLite;
@@ -25,8 +26,11 @@ import com.juping.cast.dlna.SsdpResponder;
 import com.juping.cast.dlna.UpnpHttpServer;
 import com.juping.cast.player.MediaPlayerController;
 import com.juping.cast.player.PlaybackPolicy;
+import com.juping.cast.web.ApkEndpoints;
+import com.juping.cast.web.ApkScanner;
 import com.juping.cast.web.LocalStore;
 import com.juping.cast.web.WebCastEndpoints;
+import com.juping.cast.web.WebRouter;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -55,7 +59,10 @@ public class DlnaRendererService extends Service
         // 网页上传的东西要能"投到电视"，而这件事的落点在本类（onSetUri + onPlay
         // 才是真正的播放动作）。让 WebCastEndpoints 反向拿一个回调接口，
         // 而不是自己去碰播放器 —— 播放状态机只此一处，多一个入口就多一套竞态。
-        WebCastEndpoints.CastTarget {
+        WebCastEndpoints.CastTarget,
+        // 外接存储 APK 安装（批 3.5）：唤起系统安装器需要 Service 上下文（startActivity），
+        // 落点同样在本类。端点拿回调接口，不自己碰 Intent。
+        ApkEndpoints.InstallTarget {
 
     private static final String TAG = "DlnaRendererService";
 
@@ -144,6 +151,11 @@ public class DlnaRendererService extends Service
      */
     private LocalStore webStore;
     private WebCastEndpoints webEndpoints;
+    /** APK 扫描与安装端点（批 3.5）。生命周期跟服务走。 */
+    private ApkScanner apkScanner;
+    private ApkEndpoints apkEndpoints;
+    /** 复合路由：上传端点 + 安装包端点，串成 UpnpHttpServer 要的那一个 WebEndpoints。 */
+    private WebRouter webRouter;
 
     private String uuid;
     private String friendlyName;
@@ -340,9 +352,14 @@ public class DlnaRendererService extends Service
         // 这台盒子上"外部存储"就是插着的那支 U 盘）。
         webStore = new LocalStore(this);
         webEndpoints = new WebCastEndpoints(webStore, this);
+        // 外接存储 APK 扫描 / 安装（批 3.5）。与上传端点共用同一个 HTTP 服务，
+        // 由 WebRouter 串起来 —— HTTP 层只认一个 WebEndpoints。
+        apkScanner = new ApkScanner(this);
+        apkEndpoints = new ApkEndpoints(apkScanner, this);
+        webRouter = new WebRouter(webEndpoints, apkEndpoints);
 
         httpServer = new UpnpHttpServer(HTTP_PORT, uuid, friendlyName, BuildConfig.VERSION_NAME, this, this,
-                webEndpoints);
+                webRouter);
         // 图标要在 start() 之前给 —— 设备描述是随请求现生成的，
         // 但早点给上可以让"第一台来搜的控制点"就看到图标。
         provideDeviceIcon();
@@ -619,7 +636,7 @@ public class DlnaRendererService extends Service
             h.shutdown();
         }
         httpServer = new UpnpHttpServer(HTTP_PORT, uuid, friendlyName, BuildConfig.VERSION_NAME, this, this,
-                webEndpoints);
+                webRouter);
         provideDeviceIcon();
         httpServer.start();
         int after = httpServer.getPort();
@@ -765,6 +782,10 @@ public class DlnaRendererService extends Service
         // 这台盒子上"外部存储"就是那支 U 盘，纸面上推不出来，只能看实机。
         if (webEndpoints != null) {
             sb.append("\"storage\":").append(webEndpoints.storageJson()).append(',');
+        }
+        // 未知来源开关（批 3.5）：装不上时先看这里 —— 无鉴权端点，只暴露一个布尔。
+        if (apkEndpoints != null) {
+            sb.append("\"installAllowed\":").append(apkEndpoints.isInstallAllowed()).append(',');
         }
         sb.append("\"uptimeSec\":").append(
                 (System.currentTimeMillis() - startedAtMs) / 1000);
@@ -1017,6 +1038,61 @@ public class DlnaRendererService extends Service
                 + "/media/" + Uri.encode(file.getName());
         onSetUri(url, didlFor(file));
         onPlay();
+    }
+
+    // ------------------------------------------- ApkEndpoints.InstallTarget
+
+    /**
+     * 「未知来源」开关是否已开（批 3.5）。
+     *
+     * <p>Android 4.0 上是**全局开关**：读 {@code INSTALL_NON_MARKET_APPS}
+     * （API 3 起可用；API 17 起 deprecated 但仍可读），1 = 已开。关着时系统安装器会拒绝，
+     * 所以先查它、把「去打开」这条指引提前给出来，而不是让用户点了没反应。
+     *
+     * <p>读不出来（个别 ROM 没这个键）时返回 true —— 让系统安装器自己判断，
+     * 好过我们误判成「未开」把用户挡在门外。
+     */
+    @Override
+    public boolean isInstallAllowed() {
+        try {
+            return Settings.Secure.getInt(getContentResolver(),
+                    Settings.Secure.INSTALL_NON_MARKET_APPS, 0) == 1;
+        } catch (Throwable t) {
+            Log.w(TAG, "读「未知来源」开关失败，按已开处理", t);
+            return true;
+        }
+    }
+
+    /**
+     * 唤起系统安装器安装外接卷上的一个 APK（批 3.5）。
+     *
+     * <p>用 {@code ACTION_VIEW} + {@code application/vnd.android.package-archive}
+     * 而不是 {@code ACTION_INSTALL_PACKAGE}：前者是 Android 4.0 上最通用的安装唤起方式，
+     * 系统安装器必然注册了它。地址用 {@code file://}（{@code Uri.fromFile}）——
+     * 本项目 {@code targetSdk 19 < 24}，{@code FileUriExposedException} 不生效，
+     * 无需 FileProvider。必须带 {@code FLAG_ACTIVITY_NEW_TASK}（从 Service 上下文启动）。
+     *
+     * <p><b>若装的是聚屏自己</b>：安装过程中系统会杀掉本进程 → 前台服务随之中断 →
+     * 装完需重新打开聚屏。这是系统行为，无解（方案 §6.2），已在 README 写明。
+     *
+     * @return 是否成功发起；真正装上要等电视端遥控器确认
+     */
+    @Override
+    public boolean installApk(File apk) {
+        if (apk == null) {
+            return false;
+        }
+        Intent i = new Intent(Intent.ACTION_VIEW);
+        i.setDataAndType(Uri.fromFile(apk), "application/vnd.android.package-archive");
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            startActivity(i);
+            Log.i(TAG, "已唤起安装器：" + apk.getName());
+            return true;
+        } catch (RuntimeException e) {
+            Log.e(TAG, "唤起安装器失败：" + apk.getName(), e);
+            return false;
+        }
     }
 
     /**
