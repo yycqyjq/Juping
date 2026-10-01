@@ -449,6 +449,25 @@ report('showCover 换图时回收旧位图',
        'Bitmap 占的是 native 内存，GC 看不见它。换歌不 recycle，'
        '在 0.6GB 的盒子上几首就能把内存耗光')
 
+# ㉑ 封面解码目标必须按 View 尺寸，不能复用照片那个 1600（批 3.6 收尾）。
+#
+# 守的是一条真实的内存回归：封面只显示在 220dp 方框里，拿 1600px 去解一张
+# 3000×3000 的封面会解出约 9–10MB（4 倍过采样），在 0.6GB 的设备上是纯浪费。
+# 项目里已有正确答案（qrSizePx 的同一条原则），封面必须遵循同一条。
+_cs = body_of(act_src, 'private int coverSizePx()')
+report('coverSizePx 方法体已找到', _cs is not None,
+       '锚点：private int coverSizePx()')
+if _cs:
+    report('coverSizePx 按 View 尺寸取（拿不到退回下限）',
+           'getLayoutParams()' in _cs and 'COVER_SIZE_FALLBACK_PX' in _cs,
+           '必须读 musicCover 的实际尺寸（照 qrSizePx 的写法），拿不到再退回下限 —— '
+           '不能写死一个"够大"的数')
+_ld = body_of(act_src, 'private void loadCover(String uri)')
+report('封面解码用 View 尺寸作目标（不复用照片的 1600）',
+       _ld is not None and 'coverSizePx()' in _ld,
+       'loadCover 必须把 coverSizePx() 的结果传给 decodeScaled；'
+       '传 1600 就是 4 倍过采样，3000×3000 封面解出约 9–10MB')
+
 # ⑬b 顶部条那个圆点必须**有 id**，否则代码改不了它的颜色。
 # 它原来是写死的 dot_online（绿）—— 而顶部条现在只在「暂停 / 出错 / 缓冲」
 # 时出现，出错时左边绿点、右边「出错：…」，自己跟自己打架。
@@ -856,9 +875,15 @@ if am2:
            '图片不经过视频层，那个 Surface 上什么都没有 —— 老 MTK 平台会'
            '露出一屏蓝底，把刚画上去的照片盖住（和 idle 态是同一个坑）')
 
-ds = body_of(act_code, 'private Bitmap decodeScaled(String uri, long maxBytes)')
+# ⚠️ 这条锚点**跟着 decodeScaled 的签名走**，已经被重定向过两次了：
+#     (String uri) → (String uri, long maxBytes) → (String uri, long maxBytes, int targetPx)。
+# 为什么必须钉签名：`body_of` 用 `src.find(marker)` 找方法，**marker 是子串匹配** ——
+# 一旦有人给 decodeScaled 加参数（比如这次加 targetPx），旧锚点就找不到（`...maxBytes)`
+# 不再出现），守卫会红；更阴的是：若保留一个同名前缀的重载（委派给真实现），
+# find 可能锚到那个空壳方法体上，守卫**静默失效**。所以改签名必须同步改这里。
+ds = body_of(act_code, 'private Bitmap decodeScaled(String uri, long maxBytes, int targetPx)')
 report('decodeScaled 方法体已找到（去注释后）', ds is not None,
-       '锚点：private Bitmap decodeScaled(String uri, long maxBytes)')
+       '锚点：private Bitmap decodeScaled(String uri, long maxBytes, int targetPx)')
 if ds:
     report('图片解码先量尺寸再降采样（inJustDecodeBounds + inSampleSize）',
            'inJustDecodeBounds' in ds and 'inSampleSize' in ds,

@@ -180,11 +180,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * 封面下载的字节上限（约 4MB）。
      *
      * <p>封面地址是控制点给的**任意** URL —— 可能指向一个巨大文件。
-     * {@link #decodeScaled(String, long)} 原本把整个响应读进内存（那是给本地
+     * {@link #decodeScaled(String, long, int)} 原本把整个响应读进内存（那是给本地
      * {@code /media/} 照片写的），对封面必须加闸：超限即中断、判失败、退回图标，
      * 绝不让它成为 0.6GB 设备上的 OOM 入口。
      */
     private static final long COVER_MAX_BYTES = 4L * 1024 * 1024;
+
+    /**
+     * 照片解码的目标长边（像素）。
+     *
+     * <p>图片投屏是**全屏**显示，压到面板分辨率量级即可 —— 1600 是「够清楚又不爆内存」
+     * 的折中。**封面不复用它**：封面只显示在 220dp 的方框里，1600 是 4 倍过采样，
+     * 一张 3000×3000 的封面会解出约 9–10MB（见 {@link #coverSizePx()}）。
+     */
+    private static final int IMAGE_DECODE_TARGET_PX = 1600;
+
+    /**
+     * 封面尺寸拿不到时的解码目标下限（像素）。
+     *
+     * <p>{@link #coverSizePx()} 正常情况下取布局里 220dp 换算出的像素；布局若哪天
+     * 改成 {@code wrap_content} 会拿到非正值，这时退回这个下限 —— 512px 在电视密度下
+     * 已超过 220dp，够用又不至于像 1600 那样浪费。
+     */
+    private static final int COVER_SIZE_FALLBACK_PX = 512;
 
     private final Handler handler = new Handler();
 
@@ -436,6 +454,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     /**
+     * 封面位图的边长（像素）—— 解码目标，**按 View 的实际尺寸算**。
+     *
+     * <p>照 {@link #qrSizePx()} 的同一条原则：封面只显示在 220dp 的方框里，布局那
+     * 220dp 在 inflate 时就被换算成像素存在 LayoutParams 里了，直接拿来用。
+     *
+     * <p><b>为什么封面不能复用照片那个 1600</b>：照片是**全屏**显示，1600 合适；
+     * 而封面只有 220dp —— 拿 1600 去解一张 3000×3000 的封面会解出约 9–10MB
+     * （4 倍过采样），在 0.6GB 的设备上是纯浪费。布局若哪天改成 {@code wrap_content}，
+     * 拿到的是非正值，这时退回 {@link #COVER_SIZE_FALLBACK_PX}。
+     *
+     * <p>必须在**主线程**调（要读 View），所以 {@link #loadCover(String)} 在起后台
+     * 线程之前先把它算好、带进闭包。
+     */
+    private int coverSizePx() {
+        android.view.ViewGroup.LayoutParams lp = musicCover.getLayoutParams();
+        int w = (lp == null) ? 0 : lp.width;
+        return w > 0 ? w : COVER_SIZE_FALLBACK_PX;
+    }
+
+    /**
      * 把图片下载、解码、显示出来。
      *
      * <p><b>为什么整件事必须在后台线程</b>：地址是盒子上那个 HTTP 端口的
@@ -460,7 +498,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         new Thread(new Runnable() {
             @Override
             public void run() {
-                final Bitmap bmp = decodeScaled(target, 0L);
+                final Bitmap bmp = decodeScaled(target, 0L, IMAGE_DECODE_TARGET_PX);
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
@@ -482,7 +520,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     /**
-     * 下载 + 降采样解码，可选**下载大小上限**。
+     * 下载 + 降采样解码，可选**下载大小上限**，解码目标**按调用方给**。
      *
      * <p><b>为什么必须降采样</b>：手机随手一张照片就是 4000×3000，直接
      * 解码成 ARGB_8888 要 4000×3000×4 ≈ 48MB —— 而整台设备的可用内存
@@ -494,8 +532,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * {@code /media/}（我们自己的文件），传 0 = 不限；而封面地址是控制点给的
      * **任意** URL，可能指向一个巨大文件 —— 传 {@link #COVER_MAX_BYTES}，
      * 超限即中断、判失败，绝不让它成为 OOM 入口。
+     *
+     * <p><b>为什么目标像素要传进来</b>：照片是全屏显示（目标
+     * {@link #IMAGE_DECODE_TARGET_PX}），封面只显示在 220dp 的方框里（目标由
+     * {@link #coverSizePx()} 按 View 尺寸算）—— 两者差 4 倍以上，写死一个数必然
+     * 对其中一边是浪费。**这个参数是「按显示尺寸解码」这条纪律的落点。**
      */
-    private Bitmap decodeScaled(String uri, long maxBytes) {
+    private Bitmap decodeScaled(String uri, long maxBytes, int targetPx) {
         try {
             URLConnection conn = new URL(uri).openConnection();
             conn.setConnectTimeout(5000);
@@ -515,7 +558,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 return null;
             }
             BitmapFactory.Options opts = new BitmapFactory.Options();
-            opts.inSampleSize = sampleSizeFor(probe.outWidth, probe.outHeight);
+            opts.inSampleSize = sampleSizeFor(probe.outWidth, probe.outHeight, targetPx);
             return BitmapFactory.decodeByteArray(data, 0, data.length, opts);
         } catch (Exception e) {
             Log.w(TAG, "图片处理失败: " + uri + "（" + e + "）");
@@ -532,11 +575,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * 算 {@code inSampleSize}：**必须是 2 的幂**。
      *
      * <p>Android 的文档明写它会向下取整到 2 的幂，非 2 的幂的取值等于白算。
-     * 目标是把最长边压到面板分辨率量级以内：压过头画面发糊，
+     * 目标是把最长边压到 {@code target} 像素量级以内：压过头画面发糊，
      * 压不够等于没省内存。
+     *
+     * <p>{@code target} 由调用方按**实际显示尺寸**给（照片 {@link #IMAGE_DECODE_TARGET_PX}、
+     * 封面 {@link #coverSizePx()}）—— 这是「不为一个 220dp 的方框去解一张 1600px 的图」
+     * 这条纪律的落点。非正值兜底成 1（避免除零式死循环）。
      */
-    private static int sampleSizeFor(int width, int height) {
-        int target = 1600;
+    private static int sampleSizeFor(int width, int height, int target) {
+        if (target < 1) {
+            target = 1;
+        }
         int longest = Math.max(width, height);
         int sample = 1;
         while (longest / sample > target) {
@@ -691,10 +740,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private void loadCover(String uri) {
         coverLoadingUri = uri;
         final String target = uri;
+        // 在主线程把「按 View 尺寸算的解码目标」取好，再带进后台线程 ——
+        // 读 LayoutParams 是主线程的事，后台线程碰 View 不安全。
+        final int targetPx = coverSizePx();
         new Thread(new Runnable() {
             @Override
             public void run() {
-                final Bitmap bmp = decodeScaled(target, COVER_MAX_BYTES);
+                final Bitmap bmp = decodeScaled(target, COVER_MAX_BYTES, targetPx);
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
