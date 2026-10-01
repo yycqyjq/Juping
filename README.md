@@ -80,12 +80,12 @@ Juping/
     ├── check_dex_entrypoints.py  反汇编 dex，核 R8 有没有把框架回调名改坏
     ├── protocol-test/        DLNA 协议层端到端测试（桌面 JVM，不需要真机）
     │   ├── run.sh            编译 → 起服务 → 驱动 → 验证两个自检脚本
-    │   ├── drive.py          237 项一致性检查（原始 socket 精确控字节）
+    │   ├── drive.py          239 项一致性检查（原始 socket 精确控字节）
     │   ├── ProtocolTestServer.java  在桌面跑真实的 UpnpHttpServer + SsdpResponder
     │   ├── verify-device-selftest.sh  用假 adb 验 verify-on-device.sh 的管道
     │   └── android/util/Log.java    android.util.Log 的桌面替身
     ├── policy-test/          播放重连策略测试（纯逻辑，不需要真机）
-    │   ├── run.sh            编译 + 57 项断言 + 265 条源码级守卫
+    │   ├── run.sh            编译 + 57 项断言 + 305 条源码级守卫
     │   └── PolicyTest.java   57 项断言 + 「卡死→重连→又卡死」循环模拟
     ├── proxy-test/           本地预取代理字节一致性测试（11 项）
     │   ├── run.sh            编译 → 起源站 → 全量/Range/回拖/EOS/中途重连 逐字节比对
@@ -403,14 +403,14 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 当前结果：
 
 ```
-被引用的平台类 70 个 · 方法 249 个 · 字段 5 个
-结论：254 个平台引用全部命中，无 API 越界。
+被引用的平台类 101 个 · 方法 369 个 · 字段 13 个
+结论：382 个平台引用全部命中，无 API 越界。
 ```
 
 为什么要两道：lint 依赖内置数据库，而且本项目关掉了 8 项检查 ——
 万一其中某一项顺带掩盖了 API 问题，lint 不会吭声。第二道是**独立判据**。
 
-> **release 的数字比 debug 还大（254 vs 244），这不是 bug。** 反了才对得上：
+> **release 的数字比 debug 还大（382 vs 376），这不是 bug。** 反了才对得上：
 > javac 编译 `MainActivity` 时，`findViewById` 这类继承来的调用**以子类为 owner**
 > 发出去（`Lcom/juping/cast/MainActivity;.findViewById`），而这个检查器只看
 > **平台类** owner 的引用 —— 于是 debug 包里有几条被静默跳过。
@@ -438,7 +438,7 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 ```
 
 ```
-协议一致性：237 / 237 通过
+协议一致性：239 / 239 通过
 ```
 
 覆盖两大故障场景 —— **「手机搜不到设备」和「投屏没反应」**：
@@ -454,7 +454,7 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 | **10** | **GENA 事件订阅**：SCPD 必须声明哪些变量可事件化；订阅后必须立刻收到 SEQ 0 的初始事件；状态一变必须推、SEQ 必须递增；非法订阅（CALLBACK 与 SID 同给/同不给、NT 不对、SID 不认识、服务名不对）必须回 412/404；退订后不许再推 |
 | 11     | 请求行变体：绝对形式（`GET http://host/path`）、多余空格、带查询串                                                                                                                                                          |
 | **12** | **三处「无上限」的防御**：超大 `Content-Length` 必须回 413（而不是照着它分配内存）、并发连接有上限且到顶后服务仍活着、订阅表到顶时最旧的被淘汰                        |
-| **13** | **照成熟 DMR 补齐的那批**：`<device>` 子元素顺序合 schema、`dlna:X_DLNADOC=DMR-1.50`、`iconList` 声明的宽高与 PNG 实际像素一致；三个 SCPD 的 `relatedStateVariable` 无悬空引用、有出参、声明了实现支持的每个 action；`SetMute`/`GetMute` 真接通（含 `yes`/`no` 两种布尔写法）；`Next`/`Previous` 回 701；协议清单里没有 `image/*`；M-SEARCH 按 MX 随机延迟 |
+| **13** | **照成熟 DMR 补齐的那批**：`<device>` 子元素顺序合 schema、`dlna:X_DLNADOC=DMR-1.50`、`iconList` 声明的宽高与 PNG 实际像素一致；三个 SCPD 的 `relatedStateVariable` 无悬空引用、有出参、声明了实现支持的每个 action；`SetMute`/`GetMute` 真接通（含 `yes`/`no` 两种布尔写法）；`Next`/`Previous` 回 701；协议清单里声明了 `image/*` 且真有图片这条路；M-SEARCH 按 MX 随机延迟 |
 | **14** | **网络变化与元数据那批**：`GetMediaInfo`/`GetPositionInfo` 原样回读控制点推来的元数据（不是恒回空）且在响应里正确转义（裸 DIDL 恰好是合法 XML，解析不报错只会拿到空文本 —— 两条断言必须一起看）；停止后元数据回空不残留 |
 
 > **这套测试累计抓出十二处问题**，绝大多数都能让投屏在真机上失效，
@@ -1119,8 +1119,12 @@ SSDP 线程就**永久**结束了。
   部分控制点先看它，认不出就不把设备列进投屏列表）、`manufacturerURL` /
   `modelDescription` / `modelURL` / `serialNumber` / `iconList`，
   并按 schema 定死的顺序排列子元素（顺序错同样会导致整份解析失败）。
-  **刻意不声明** `presentationURL`（我们没有任何 Web 界面，写 `/` 只会把
-  `device.xml` 本身喂给浏览器）和 `UPC`（不是零售商品，编个假码没有意义）。
+  **声明了** `presentationURL = http://<本机地址>:<端口>/`：上传页就在 `/`，
+  这正是这个字段的规范用途 —— 控制点的设备列表里会多一个按钮，点开就是上传页。
+  地址取自 `handler.getLocalIp()`、端口取自 `getPort()`，与 SSDP 的 `LOCATION`
+  **同源**（谁自己再算一遍，在"第一张候选网卡 joinGroup 失败、换到第二张"时就会分叉）；
+  拿不到有效地址（空 / `0.0.0.0`）时**不声明**（同 `iconList` 的纪律）。
+  仍然**刻意不声明** `UPC`（不是零售商品，编个假码没有意义）。
   图标由服务启动时从 `R.drawable.ic_launcher` 解码一次递进来，
   宽高按**实际像素**声明（`R.drawable` 在运行时只会解析成当前密度的那一张，
   声明四档就是撒谎）；没有图标时**完全不声明 `iconList`** ——
@@ -1136,15 +1140,21 @@ SSDP 线程就**永久**结束了。
   只放行"设成我们本来就处于的状态" —— `SetPlayMode(NORMAL)` 回 200、
   收到 `SHUFFLE` 才回 701。
 
-**③ 一处"声明了却做不到"**
+**③ 一处"声明了却做不到"（这一轮补齐了）**
 
 `SINK_PROTOCOL_INFO` 里曾经声明 `image/jpeg` / `image/png`，但整套实现里
 根本没有图片这条路（`kindOf()` 只认 audioItem / videoItem，`MediaPlayer`
 本身也不解图片）。**这份清单是控制点判断"能不能推给我"的唯一依据**，
 声明了却做不到，控制点（相册、文件管理器）就会把图片推过来然后必然失败 ——
-用户看到的是"投屏坏了"。宁可让控制点一开始就说"这台设备不支持"。
-已删掉图片格式，并加断言钉住两个出口（`GetProtocolInfo` 与事件里的
-`SinkProtocolInfo`）用的是同一份字符串。
+用户看到的是"投屏坏了"。当时的处置是先把图片格式删掉，宁可让控制点一开始
+就说"这台设备不支持"。
+
+这一轮把这条路真的修了出来：`kindOf()` 新增 `KIND_IMAGE`（认出 `imageItem`
+后**不进 `MediaPlayer`**），界面新增 `MODE_IMAGE`，由 `BitmapFactory`
+降采样解码后画在 `ImageView` 上。清单才重新声明 `image/jpeg` / `image/png`。
+断言（drive.py 的 `GetProtocolInfo` 段 + 事件段）与源码守卫同时钉住两个出口
+用的是同一份字符串 —— **声明与实现必须一起变**，否则就又回到
+"声明了却做不到"。
 
 > **这一轮证伪了 14 处，每处都让"恰好预期的那几条"变红，无连带误伤。**
 > 其中两处是**守卫自己写错**，靠证伪才抓出来 —— 记下来当例子：
@@ -1293,7 +1303,7 @@ bash 在 **UTF-8 locale** 下会把多字节字符的字节一起吞进变量名
 | 其他 DLNA 控制点 | ☐ 欢迎补充 | 搜不到 / 投不上 / 状态不跟手，先对照本表，再走「排障」流程 |
 
 > 真机实测 = 在目标盒子（MT5880 / Android 4.0.4）上用真实 App 走通投屏全链路。
-> 桌面协议测试的 237 项通过不能替代这张表——桌面证明的是「协议自洽」，
+> 桌面协议测试的 239 项通过不能替代这张表——桌面证明的是「协议自洽」，
 > 这张表证明的是「真实控制点可用」。
 
 ---
@@ -1303,11 +1313,12 @@ bash 在 **UTF-8 locale** 下会把多字节字符的字节一起吞进变量名
 - **乐联（LeLink）协议不支持**。B站、抖音、部分腾讯视频走的是乐播的私有闭源协议，开源界没有实现，无法对接。能收的是标准 DLNA / UPnP 推送。
 - **AirPlay 未实现**。iOS 侧目前只能用支持 DLNA 的 App 投。要做 AirPlay 接收需要移植 UxPlay（C/C++，GPLv3），是独立的一大块工作。
 - **镜像（Miracast）不做**。老盒子 Wi-Fi Direct 驱动不稳，正是断联根因，不值得修。
-- **图片投屏不支持，而且协议清单里也不再声明它**。`MediaPlayer` 本身不解图片，
-  实现里也没有图片这条路。所以 `SINK_PROTOCOL_INFO` 里**刻意没有** `image/*` ——
-  这份清单是控制点判断"能不能推给我"的唯一依据，声明了却做不到，
-  控制点会把图片推过来然后必然失败，用户看到的是"投屏坏了"。
-  宁可让控制点一开始就说"这台设备不支持"。
+- **图片投屏已支持**。`MediaPlayer` 本身不解静态图，所以图片走的是**独立通道**：
+  `kindOf()` 认出 `imageItem` 后不进 `MediaPlayer`（否则必然 `error`、全黑），
+  界面切到 `MODE_IMAGE`，用 `BitmapFactory`（`inJustDecodeBounds` 量尺寸 +
+  `inSampleSize` 降采样防 OOM，解码完 `recycle()`）画在 `ImageView` 上。
+  `SINK_PROTOCOL_INFO` 因此**重新声明**了 `image/jpeg` / `image/png` ——
+  这份清单是控制点判断"能不能推给我"的唯一依据，声明与实现必须一起变。
 - **事件用的是 AVTransport:1 的「逐变量」模型，没实现 `LastChange`**。
   即 `TransportState` / `TransportStatus` / `CurrentTrackURI` /
   `CurrentTrackDuration` / `RelativeTimePosition` 各自声明为可事件化、
@@ -1322,10 +1333,10 @@ bash 在 **UTF-8 locale** 下会把多字节字符的字节一起吞进变量名
   一轮，暴露并修掉：视频误判音频、进度条冻死在 Seek 点、-38 错误刷屏
   死循环、切歌后媒体服务卡死（全部见「排障」一节）。
   桌面核验现在是十六项全绿：编译 / lint `NewApi` 零命中 /
-  API 引用 329 项（release 337 项）全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
-  DLNA 协议 237 项通过 / 播放策略 57 项断言 + 265 条源码级守卫通过 /
+  API 引用 376 项（release 382 项）全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
+  DLNA 协议 239 项通过 / 播放策略 57 项断言 + 305 条源码级守卫通过 /
   断言/守卫计数与 README、AGENTS 文档一致（`check_gate_counts.py`，覆盖协议/代理/网页/probe/策略五道）/
-  本地预取代理字节一致性 11 项通过 / 网页逻辑一致性 32 项通过 / R8 dex 入口点 33 项通过 /
+  本地预取代理字节一致性 11 项通过 / 网页逻辑一致性 32 项通过 / R8 dex 入口点 42 项通过 /
   控制点自检脚本 33 或 34 项通过（组播回退分支所致，均为合法值）/
   真机验收脚本管道自测 6 项通过 / 密钥核查干净 /
   工具链脚本的变量名边界检查通过（UTF-8 locale 下不再崩）/
@@ -1388,9 +1399,10 @@ bash 在 **UTF-8 locale** 下会把多字节字符的字节一起吞进变量名
 > 监听端口 —— 照着显示的那个地址访问即可。回退也会同步到 LOCATION，
 > 手机拿到的描述地址永远指向真正在听的端口。
 
-**扫码网页传文件（批 1，见 `.agent/web-cast-plan.md`）**：同一个 HTTP 服务还挂了一组
+**扫码网页传文件（批 1–2，见 `.agent/web-cast-plan.md`）**：同一个 HTTP 服务还挂了一组
 网页端点 —— 浏览器打开 `http://<电视IP>:端口/`（带 `Accept: text/html`）就是上传页
-（不带该头时 `/` 仍回 `device.xml`，兼容老控制点）。页面上能**多选文件一起传**、
+（不带该头时 `/` 仍回 `device.xml`，兼容老控制点）。**电视空闲时会把这个地址画成
+二维码**，手机扫一下就进去，不用手打 IP。页面上能**多选文件一起传**、
 显示上传进度与**剩余空间**、把已上传的文件**直接投到电视**或**删掉**（浏览器不支持
 选文件夹时自动降级成「多选文件」，见下）。相关路由：
 
@@ -1408,6 +1420,21 @@ bash 在 **UTF-8 locale** 下会把多字节字符的字节一起吞进变量名
 > 它穿不进应用私有目录（`drwx------`）—— 真机实测直接 `error (1, -2147483648)`。
 > 改由盒子自己的 HTTP 服务供流后，顺带修好了老芯片「视频被判成纯音频」的老毛病
 > （`getVideoWidth()` 恒 0，只能靠 `Content-Type` 探测）。详见方案 §5.2.1。
+
+**电视上的二维码（批 2）**：空闲形态下主面板会显示一个二维码，内容就是上传页地址
+（与 `device.xml` 的 `presentationURL` **同源**：同一个本机 IP、同一个实际监听端口 ——
+端口回退时两处一起变）。位图由 `QrRenderer` 逐格画：上游 Nayuki 库的 `toImage()`
+依赖 `java.awt` / `javax.imageio`，Android 没有，所以只取它算好的模块矩阵，
+攒成一个 `int[]` 一次 `setPixels` 灌进去（0.6GB 的机器上，逐点 `setPixel` 会肉眼可见地卡）。
+地址没变就不重画（`refresh()` 每 tick 路过这里），换图时 `recycle()` 旧位图。
+
+> **依赖说明**：二维码编码（Reed-Solomon + 掩码 + 版本选择）**不适合自己写** ——
+> 写错的表现是「扫不出来」，而人眼看不出来。这里把
+> [Nayuki QR Code generator](https://www.nayuki.io/page/qr-code-generator-library)
+> 1.8.0 的 Java 源码（MIT）**逐个文件内嵌**进 `app/src/main/java/io/nayuki/qrcodegen/`，
+> 不引任何构建期依赖（无 gradle dependency、无 aar/jar），是项目「零第三方依赖」
+> 铁律的**唯一明示例外**。为 API 15 只改了两处：`Objects.requireNonNull` → 显式判空、
+> 取 UTF-8 字节走 `Charset`（`java.util.Objects` 与 `StandardCharsets` 都要 API 19）。
 
 电视上直接能看到诊断信息，不用连电脑：
 

@@ -12,6 +12,11 @@
     <string name="guide_title">在手机上开始投屏</string>
     <string name="guide_body">打开手机 App 的投屏功能（腾讯视频 / 网易云音乐等已实测可用），\n选择下面这个名字</string>
 
+    <!-- 二维码那一块。文案只说"手机扫码"，因为码旁边就是地址 ——
+         扫不出来的话照着上面那行地址手输也一样。 -->
+    <string name="qr_hint">手机扫码\n传文件播放</string>
+    <string name="qr_desc">上传页二维码</string>
+
     <string name="btn_restart">重启服务</string>
 
     <string name="state_starting">启动中…</string>
@@ -41,8 +46,14 @@
     <string name="err_unknown">播放出错</string>
 
     <string name="toast_restarted">服务已重启</string>
+    <string name="toast_image_failed">这张图没能显示出来，换一张试试</string>
     <string name="notify_title">聚屏运行中</string>
     <string name="notify_text">等待投屏 · 点击打开界面</string>
+
+    <!-- 图片投屏。
+         MediaPlayer 解不了静态图（喂进去只会立刻报错、全黑），所以图片由
+         BitmapFactory 解码后画在 ImageView 上，这条无障碍描述就属于那一层。 -->
+    <string name="image_desc">正在展示的图片</string>
 
     <!-- 音乐投屏。
          纯音频流在 SurfaceView 上什么都没有，电视就是一片黑 —— 声音明明在放，

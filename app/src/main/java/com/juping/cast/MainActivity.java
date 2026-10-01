@@ -5,34 +5,47 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
+import android.util.Log;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
 import android.widget.Button;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import com.juping.cast.player.PlaybackPolicy;
 
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.net.URL;
+import java.net.URLConnection;
+
 /**
  * 主界面。
  *
- * <p>三种形态，靠播放状态自动切换：
+ * <p>四种形态，靠播放状态自动切换：
  * <ul>
  *   <li><b>等待投屏</b> —— 显示引导 + 设备信息卡片，用户照着做就行</li>
  *   <li><b>视频播放中</b> —— 隐藏面板、全屏出画面，顶部留一条半透明状态条</li>
  *   <li><b>音乐播放中</b> —— 纯音频流在 SurfaceView 上什么都没有，必须换成
  *       音符卡片。不然电视就是**一片黑**：声音明明在放，看着却像投屏坏了</li>
+ *   <li><b>图片展示中</b> —— MediaPlayer 解不了静态图，所以图片走的是另一条
+ *       通道：BitmapFactory 解码后画在 ImageView 上。见 {@link #loadImage}</li>
  * </ul>
  *
  * <p>界面刻意做得极简：0.6GB 内存的设备上，每一点 UI 开销都是奢侈的。
  * 所以没有列表、没有动画，图形资源只有脚本生成的那几张 PNG。
  */
 public class MainActivity extends Activity implements SurfaceHolder.Callback {
+
+    private static final String TAG = "MainActivity";
 
     /**
      * 空闲时的刷新间隔。面板上的信息几乎不变，刷快了纯属浪费 ——
@@ -51,21 +64,33 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final long REFRESH_INTERVAL_PLAYING_MS = 500L;
 
     /**
-     * 界面三态。
+     * 界面四态。
      *
-     * <p>用三态整数而不是「播放中 / 没播放」两个布尔，是因为音频与视频**互斥**：
-     * 写成两个布尔就允许出现"既是音频又是视频"这种非法组合，而它一旦出现，
-     * 界面会同时显示画面和音符卡片 —— 排查起来非常费劲。
+     * <p>用四态整数而不是「播放中 / 没播放」两个布尔，是因为音频、视频、图片
+     * **互斥**：写成几个布尔就允许出现"既是音频又是视频"这种非法组合，
+     * 而它一旦出现，界面会同时显示画面和音符卡片 —— 排查起来非常费劲。
      */
     private static final int MODE_IDLE = 0;
     private static final int MODE_AUDIO = 1;
     private static final int MODE_VIDEO = 2;
+    private static final int MODE_IMAGE = 3;
 
     private SurfaceView surfaceView;
+    /**
+     * 图片层。投静态图时用它显示画面 —— 与 SurfaceView 互斥。
+     *
+     * <p>为什么单开一层：SurfaceView 上的内容是 MediaPlayer 解码出来的，
+     * 而它解不了静态图，喂进去只会立刻报错、屏幕全黑。所以图片走
+     * {@code BitmapFactory} + ImageView 这条完全独立的通道。
+     */
+    private ImageView imageView;
     private LinearLayout panel;
     private LinearLayout overlay;
     private LinearLayout rowSource;
     private LinearLayout music;
+    /** 二维码整块（码 + 小字）。位图生成不出来时整块藏起来，不留一个空白方块。 */
+    private LinearLayout qrBox;
+    private ImageView qrImage;
     private View statusDot;
     /** 顶部状态条左边那个点。它必须能变颜色 —— 见 applyTopBar 里的说明。 */
     private View overlayDot;
@@ -83,6 +108,31 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private DlnaRendererService service;
     private boolean bound;
     private int lastMode = MODE_IDLE;
+
+    /**
+     * 当前二维码对应的地址 —— 同时也是「要不要重画」的缓存键。
+     *
+     * <p>见 {@link #updateQr(String)}：地址没变就一个像素都不重算。
+     */
+    private String qrPayload;
+    private Bitmap qrBitmap;
+
+    /**
+     * 当前显示的那张图对应的地址 —— 同时也是「要不要重新解码」的缓存键。
+     *
+     * <p>同 {@link #updateQr(String)} 的套路：{@link #refresh()} 每 0.5 秒跑一次，
+     * 地址没变就一个字节都不重下、不重解。图片往往好几 MB，每个 tick 重来一遍
+     * 会直接把 CPU 和内存吃满。
+     */
+    private String imageUri;
+    private Bitmap imageBitmap;
+    /**
+     * 已经排了队、正在后台下载解码的地址。
+     *
+     * <p>没有它的话，一张大图解码要几百毫秒，而这期间会经过好几个 tick ——
+     * 每 tick 都往后台再排一个下载任务，同一个文件被重复下一堆。
+     */
+    private String imageLoadingUri;
 
     private final Handler handler = new Handler();
 
@@ -118,10 +168,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         setContentView(R.layout.activity_main);
 
         surfaceView = (SurfaceView) findViewById(R.id.surface);
+        imageView = (ImageView) findViewById(R.id.image);
         panel = (LinearLayout) findViewById(R.id.panel);
         overlay = (LinearLayout) findViewById(R.id.overlay);
         rowSource = (LinearLayout) findViewById(R.id.row_source);
         music = (LinearLayout) findViewById(R.id.music);
+        qrBox = (LinearLayout) findViewById(R.id.qr_box);
+        qrImage = (ImageView) findViewById(R.id.qr_image);
         statusDot = findViewById(R.id.status_dot);
         overlayDot = findViewById(R.id.overlay_dot);
 
@@ -198,6 +251,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             infoDevice.setText(service.getFriendlyName());
             infoAddress.setText(getString(R.string.fmt_address,
                     service.getLocalIp(), service.getHttpPort()));
+            // 二维码编码的就是面板上那行地址（ip:port），点开是上传页。
+            //
+            // 与设备描述里的 presentationURL 是**同一个地址、同一对来源**
+            // （getLocalIp() + 实际监听端口）—— 只是那边在 UpnpHttpServer 里拼
+            // （它手上有 getPort()）。两边若各算各的，就会出现「控制点点开的页面
+            // 能开、二维码扫出来却连不上」这种最难查的分叉。
+            updateQr("http://" + service.getLocalIp() + ":" + service.getHttpPort() + "/");
             infoNetwork.setText(service.getBoundInterfaceName());
             infoState.setText(describeState());
             return;
@@ -230,6 +290,213 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         playingText.setText(dur > 0 ? progress : currentLabel());
     }
 
+    /**
+     * 二维码：**只在地址真的变了**时才重画。
+     *
+     * <p>{@link #refresh()} 每 1.5 秒跑一次（播放中 0.5 秒），而这个位图在地址
+     * 不变时永远是同一张。每个 tick 重画一次的话，0.6GB 的盒子上就是白烧
+     * CPU：一次重画要跑一遍 QR 编码 + 填几万个像素。所以缓存键就是地址本身 ——
+     * 地址没变，直接返回。
+     *
+     * <p>缓存键里带端口，这一点是**必须**的：端口有 fallback（49152 被厂家自带的
+     * DLNA 栈占了就往上移），地址变了缓存自然失效，二维码跟着变 ——
+     * 否则电视上会留着一张指着死端口的码，扫出来怎么都打不开。
+     */
+    private void updateQr(String url) {
+        if (qrBox == null || qrImage == null || url.equals(qrPayload)) {
+            return;
+        }
+        qrPayload = url;
+        Bitmap bmp = QrRenderer.render(url, qrSizePx());
+        // 先拿住旧的，换完新的再回收 —— 顺序反过来的话，ImageView 手上那张
+        // 已经被回收，屏幕上会是一块空白（或直接崩）。
+        Bitmap old = qrBitmap;
+        qrBitmap = bmp;
+        if (bmp == null) {
+            qrBox.setVisibility(View.GONE);
+        } else {
+            qrImage.setImageBitmap(bmp);
+            qrBox.setVisibility(View.VISIBLE);
+        }
+        // 这张位图是 ARGB_8888、近 200dp 见方，在电视的分辨率下不算小。
+        // 缓存失效时旧的那张没人再引用，就地回收，别留给 GC 去猜。
+        if (old != null && old != bmp && !old.isRecycled()) {
+            old.recycle();
+        }
+    }
+
+    /**
+     * 二维码位图的边长（像素）。
+     *
+     * <p>按 View 的实际尺寸生成，而不是写死一个"够大"的数：布局里那 196dp
+     * 在 inflate 时就被换算成像素存在 LayoutParams 里了，直接拿来用 ——
+     * 既不会因为放大而糊，也不会为了一个 196dp 的方框去分配一张 512×512 的
+     * 位图（这台设备的内存得省着用）。布局若哪天改成 wrap_content，
+     * 拿到的是负值，这时退回一个够用的下限。
+     */
+    private int qrSizePx() {
+        android.view.ViewGroup.LayoutParams lp = qrImage.getLayoutParams();
+        int w = (lp == null) ? 0 : lp.width;
+        return w > 0 ? w : 256;
+    }
+
+    /**
+     * 把图片下载、解码、显示出来。
+     *
+     * <p><b>为什么整件事必须在后台线程</b>：地址是盒子上那个 HTTP 端口的
+     * {@code /media/<名字>}，要真的联网去取。而且图片解码本身也要几百毫秒。
+     * 放在主线程上，Android 会直接抛 {@code NetworkOnMainThreadException}；
+     * 就算不抛，界面也会卡住 —— 而此刻界面正要显示这张图。
+     *
+     * <p><b>为什么地址没变就什么都不做</b>：{@link #refresh()} 每 0.5 秒跑一次，
+     * 每次都会走到这里。同一张图重复下载 + 重复解码，在这台 0.6GB 的盒子上
+     * 是纯粹的浪费，而且每 0.5 秒重新设置一次位图还会让画面闪。
+     */
+    private void loadImage(String uri) {
+        if (uri == null || uri.length() == 0) {
+            return;
+        }
+        if (uri.equals(imageUri) || uri.equals(imageLoadingUri)) {
+            return;
+        }
+        imageLoadingUri = uri;
+        final String target = uri;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final Bitmap bmp = decodeScaled(target);
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (!target.equals(imageLoadingUri)) {
+                            // 下载期间用户又投了另一张：这次的结果作废，
+                            // 但不能留着不回收 —— 位图是 native 内存，
+                            // GC 看不见它，只能手动放。
+                            if (bmp != null && !bmp.isRecycled()) {
+                                bmp.recycle();
+                            }
+                            return;
+                        }
+                        imageLoadingUri = null;
+                        showImage(target, bmp);
+                    }
+                });
+            }
+        }).start();
+    }
+
+    /**
+     * 下载 + 降采样解码。
+     *
+     * <p><b>为什么必须降采样</b>：手机随手一张照片就是 4000×3000，直接
+     * 解码成 ARGB_8888 要 4000×3000×4 ≈ 48MB —— 而整台设备的可用内存
+     * 远没这么多，结果必然是 {@code OutOfMemoryError}，崩的是整个应用，
+     * 用户看到的是"投屏把电视搞崩了"。所以先用 {@code inJustDecodeBounds}
+     * 只读尺寸，算出 {@code inSampleSize} 再真正解码。
+     */
+    private Bitmap decodeScaled(String uri) {
+        try {
+            URLConnection conn = new URL(uri).openConnection();
+            conn.setConnectTimeout(5000);
+            conn.setReadTimeout(15000);
+            InputStream in = conn.getInputStream();
+            byte[] data = readAll(in);
+            in.close();
+            if (data == null) {
+                return null;
+            }
+            // 先只读尺寸（不解像素）
+            BitmapFactory.Options probe = new BitmapFactory.Options();
+            probe.inJustDecodeBounds = true;
+            BitmapFactory.decodeByteArray(data, 0, data.length, probe);
+            if (probe.outWidth <= 0 || probe.outHeight <= 0) {
+                Log.w(TAG, "图片解不出尺寸: " + uri);
+                return null;
+            }
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            opts.inSampleSize = sampleSizeFor(probe.outWidth, probe.outHeight);
+            return BitmapFactory.decodeByteArray(data, 0, data.length, opts);
+        } catch (Exception e) {
+            Log.w(TAG, "图片处理失败: " + uri + "（" + e + "）");
+            return null;
+        } catch (OutOfMemoryError e) {
+            // 位图是 native 内存，OOM 是个 Error 而不是 Exception，
+            // 只 catch Exception 的话它会直接掀掉整个进程。
+            Log.w(TAG, "图片太大，内存不足: " + uri);
+            return null;
+        }
+    }
+
+    /**
+     * 算 {@code inSampleSize}：**必须是 2 的幂**。
+     *
+     * <p>Android 的文档明写它会向下取整到 2 的幂，非 2 的幂的取值等于白算。
+     * 目标是把最长边压到面板分辨率量级以内：压过头画面发糊，
+     * 压不够等于没省内存。
+     */
+    private static int sampleSizeFor(int width, int height) {
+        int target = 1600;
+        int longest = Math.max(width, height);
+        int sample = 1;
+        while (longest / sample > target) {
+            sample *= 2;
+        }
+        return sample;
+    }
+
+    /** 把输入流整个读进内存；失败返回 null（不抛，调用方只需要"成没成"） */
+    private static byte[] readAll(InputStream in) {
+        try {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            byte[] buf = new byte[16 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                bos.write(buf, 0, n);
+            }
+            return bos.toByteArray();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * 把解码好的位图换上屏幕。
+     *
+     * <p>失败（下载不到 / 解不开 / 内存不够）时**必须给出可见提示**：
+     * 电视上没有日志可看，静默失败在用户眼里就是"投屏坏了"，
+     * 而真相可能只是"这张图太大了"或"网络断了"。
+     */
+    private void showImage(String uri, Bitmap bmp) {
+        if (bmp == null) {
+            imageView.setImageBitmap(null);
+            Toast.makeText(this, R.string.toast_image_failed, Toast.LENGTH_LONG).show();
+            return;
+        }
+        // 先拿住旧的，换完新的再回收 —— 顺序反过来的话，ImageView 手上那张
+        // 已经被回收，屏幕上会是一块空白（或直接崩）。
+        Bitmap old = imageBitmap;
+        imageBitmap = bmp;
+        imageUri = uri;
+        imageView.setImageBitmap(bmp);
+        if (old != null && old != bmp && !old.isRecycled()) {
+            old.recycle();
+        }
+    }
+
+    /** 放掉当前那张位图。位图是 native 内存，GC 看不见，只能手动 recycle。 */
+    private void releaseImage() {
+        Bitmap b = imageBitmap;
+        imageBitmap = null;
+        imageUri = null;
+        imageLoadingUri = null;
+        if (b != null) {
+            imageView.setImageBitmap(null);
+            if (!b.isRecycled()) {
+                b.recycle();
+            }
+        }
+    }
+
     private boolean isPlaying() {
         if (service == null || service.getPlayer() == null) {
             return false;
@@ -244,14 +511,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     /**
      * 当前该用哪种形态。
      *
-     * <p>判据分两层：先看「有没有内容」（{@link #isPlaying()}），
-     * 再看「内容有没有画面」（{@code service.isAudioOnly()}）。
-     * 第二层的权威来源在服务里 —— 由元数据里的 {@code upnp:class} 与
+     * <p>判据分三层：先看「有没有内容」（{@link #isPlaying()}），再看
+     * 「是不是一张静态图」（{@code service.isImage()}），最后才是
+     * 「内容有没有画面」（{@code service.isAudioOnly()}）。
+     * 后两层的权威来源在服务里 —— 由元数据里的 {@code upnp:class} 与
      * MediaPlayer 报的真实视频尺寸两个信号合并得出，界面不自己猜。
      */
     private int currentMode() {
         if (!isPlaying()) {
             return MODE_IDLE;
+        }
+        // 图片要**先于**音频判。它不是音频，但它同样没有 MediaPlayer 画面 ——
+        // 落到下面那个 isAudioOnly() 二选一里，只会被判成"视频"，
+        // 然后界面去等一个永远不会来的视频帧，屏幕上就是一块黑屏。
+        if (service.isImage()) {
+            return MODE_IMAGE;
         }
         return service.isAudioOnly() ? MODE_AUDIO : MODE_VIDEO;
     }
@@ -272,7 +546,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         //
         // 期间重新投屏（mode 离开 IDLE）会自动取消退避；
         // 手动打开的界面（标志位 false）不动 —— 不能把人踢出他自己开的页面。
-        boolean wasPlaying = (lastMode == MODE_AUDIO || lastMode == MODE_VIDEO);
+        boolean wasPlaying = (lastMode == MODE_AUDIO || lastMode == MODE_VIDEO
+                || lastMode == MODE_IMAGE);
         if (mode == MODE_IDLE && wasPlaying && service != null) {
             if (service.hasAutoFrontFlag()) {
                 handler.removeCallbacks(autoBackTask);
@@ -306,13 +581,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
     };
 
-    /** 切换三种形态 */
+    /** 切换四种形态 */
     private void applyMode(int mode) {
         boolean idle = (mode == MODE_IDLE);
+        boolean image = (mode == MODE_IMAGE);
         panel.setVisibility(idle ? View.VISIBLE : View.GONE);
         // 音乐层与画面层互斥。两者同时可见时，不透明的那层会盖住另一层，
         // 表面看"正常"，但底下还在渲染 —— 0.6GB 的盒子上不该浪费这份开销。
         music.setVisibility(mode == MODE_AUDIO ? View.VISIBLE : View.GONE);
+        imageView.setVisibility(image ? View.VISIBLE : View.GONE);
+        // 离开图片形态就把那张位图放掉：一张降采样后的图仍有好几 MB，
+        // 接下来要放视频时它白占着内存 —— 而这台盒子总共才 0.6GB。
+        if (!image) {
+            releaseImage();
+        }
 
         // SurfaceView 在空闲态必须**藏起来**。这不是省资源，是修一个真故障：
         //
@@ -323,7 +605,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         //
         // 藏起来会触发 surfaceDestroyed → Surface 被销毁 → 视频层真正移除，
         // 露出下面的面板。
-        surfaceView.setVisibility(idle ? View.GONE : View.VISIBLE);
+        //
+        // 图片态同理：图片不经过视频层，那个 Surface 上什么都没有，
+        // 留着它只会露出一屏蓝底，把刚画上去的照片盖住。
+        surfaceView.setVisibility((idle || image) ? View.GONE : View.VISIBLE);
         applyTopBar(mode);
 
         String label = currentLabel();
@@ -336,6 +621,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
         if (!idle) {
             bindSurfaceIfReady();
+        }
+        if (image) {
+            // 图像内容只有服务知道地址（currentUri 就是 /media/<名字>）。
+            // 地址没变时 loadImage 会直接返回，不会重复下载。
+            loadImage(service.getCurrentUri());
         }
     }
 

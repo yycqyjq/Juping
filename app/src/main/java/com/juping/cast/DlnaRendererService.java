@@ -104,10 +104,20 @@ public class DlnaRendererService extends Service
      */
     private static final long NETWORK_SETTLE_MS = 3000L;
 
-    /** 内容类型的三个取值，见 {@link #kindOf} 与 {@link #audioOnly}。 */
+    /** 内容类型的四个取值，见 {@link #kindOf} 与 {@link #audioOnly}。 */
     private static final int KIND_UNKNOWN = 0;
     private static final int KIND_AUDIO = 1;
     private static final int KIND_VIDEO = 2;
+    /**
+     * 静态图片。
+     *
+     * <p><b>为什么单列一类，而不是并进 VIDEO</b>：图片根本不经过
+     * {@code MediaPlayer} —— 它解不了静态图，喂进去只会立刻报
+     * {@code error(1, -2147483648)}，电视上什么都不显示。图片必须由界面
+     * 用 {@code BitmapFactory} 解码后画在 ImageView 上。并进 VIDEO 的话，
+     * 界面会去等一个永远不会来的视频帧，结果就是**一块黑屏**。
+     */
+    private static final int KIND_IMAGE = 3;
 
     public class LocalBinder extends Binder {
         public DlnaRendererService getService() {
@@ -285,7 +295,7 @@ public class DlnaRendererService extends Service
      */
     private volatile boolean autoFront = false;
 
-    /** 从 DLNA 元数据里读到的内容类型：0=未知，1=音频，2=视频。 */
+    /** 从 DLNA 元数据里读到的内容类型：0=未知，1=音频，2=视频，3=图片。 */
     private volatile int kindFromMetadata = 0;
 
     @Override
@@ -657,15 +667,33 @@ public class DlnaRendererService extends Service
         // 还没 prepare，先按元数据猜一个；等 onPrepared 拿到真实视频尺寸再定论。
         // 这样从"收到投屏"到"画面出来"这段时间界面形态就是对的，不会先黑一下再跳。
         audioOnly = (kindFromMetadata == KIND_AUDIO);
-        boolean restarted = (player != null) && player.play(uri);
-        if (restarted) {
-            transportState = "TRANSITIONING";
+        if (kindFromMetadata == KIND_IMAGE) {
+            // 图片**不走 MediaPlayer** —— 它解不了静态图，喂进去只会立刻报错，
+            // 电视上什么都不显示（实测就是一块黑屏）。真正的画面由
+            // MainActivity 用 BitmapFactory 解码后画在 ImageView 上。
+            //
+            // 这里只负责两件事：把可能还在播的上一个片源停掉（否则图片会盖在
+            // 上一部片子的画面上），以及把传输状态对齐 —— 对控制点来说，
+            // 一张图"正在展示"与一段视频"正在播放"是同一种事（PLAYING），
+            // 报 STOPPED 会让它的界面显示成"已停止"。
+            if (player != null) {
+                player.stop();
+            }
+            // ⚠️ 这一句必须在 player.stop() **之后**：stop() 会同步回调
+            // onStateChanged("STOPPED") 把 transportState 打回 STOPPED，
+            // 写在前面就会被那次回调覆盖掉，控制点看到的是"收到地址却没播"。
+            transportState = "PLAYING";
         } else {
-            // 同一个地址又下发了一遍（控制点拖进度条时的常见行为）。
-            // 播放**没有**被打断，状态就不该假装成"正在切换"——
-            // 报 TRANSITIONING 会让顶部条闪一下，控制点也可能据此重画进度条，
-            // 而画面其实一秒都没断。
-            Log.i(TAG, "同一地址重复下发，播放未中断，状态保持不变");
+            boolean restarted = (player != null) && player.play(uri);
+            if (restarted) {
+                transportState = "TRANSITIONING";
+            } else {
+                // 同一个地址又下发了一遍（控制点拖进度条时的常见行为）。
+                // 播放**没有**被打断，状态就不该假装成"正在切换"——
+                // 报 TRANSITIONING 会让顶部条闪一下，控制点也可能据此重画进度条，
+                // 而画面其实一秒都没断。
+                Log.i(TAG, "同一地址重复下发，播放未中断，状态保持不变");
+            }
         }
         // 一收到地址就报一次：控制点那边「已收到」的反馈全靠它
         notifyEvent("AVTransport");
@@ -873,6 +901,12 @@ public class DlnaRendererService extends Service
         if (metadata.contains("object.item.videoItem")) {
             return KIND_VIDEO;
         }
+        // 图片要**排在视频之后**判：{@code object.item.imageItem.photo} 里
+        // 不含 "videoItem"，两者不会互相误伤；这里排在后面只是因为
+        // 视频/音频是主用途，先判更常见的。
+        if (metadata.contains("object.item.imageItem")) {
+            return KIND_IMAGE;
+        }
         return KIND_UNKNOWN;
     }
 
@@ -920,15 +954,24 @@ public class DlnaRendererService extends Service
      * 给本地文件拼一段最小 DIDL-Lite。
      *
      * <p><b>为什么必须自己拼</b>：{@link DidlLite} 只有读取方法、没有构造器。
-     * 而 {@code <upnp:class>} 这一项不能省 —— {@link #kindOf} 靠它分音频/视频，
+     * 而 {@code <upnp:class>} 这一项不能省 —— {@link #kindOf} 靠它分音频/视频/图片，
      * 少了它 mp3 会被判成 {@code KIND_UNKNOWN}，界面按视频形态渲染出**一块黑屏**，
      * 而声音其实正常（用户会以为投屏坏了）。
      */
     private static String didlFor(File file) {
         String name = file.getName();
         String title = escapeXml(name);
-        String upnpClass = isAudioName(name)
-                ? "object.item.audioItem.musicTrack" : "object.item.videoItem";
+        String upnpClass;
+        // 图片必须**先判**：它若掉进下面那个"其他一律当视频"的兜底分支，
+        // {@link #kindOf} 就会把 kindFromMetadata 判成 KIND_VIDEO，
+        // 界面于是走视频通道去等一个永远不来的视频帧 —— 又是黑屏。
+        if (isImageName(name)) {
+            upnpClass = "object.item.imageItem.photo";
+        } else if (isAudioName(name)) {
+            upnpClass = "object.item.audioItem.musicTrack";
+        } else {
+            upnpClass = "object.item.videoItem";
+        }
         return "<DIDL-Lite xmlns:dc=\"http://purl.org/dc/elements/1.1/\""
                 + " xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\""
                 + " xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\">"
@@ -939,6 +982,26 @@ public class DlnaRendererService extends Service
     }
 
     /**
+     * 按扩展名判是不是图片。
+     *
+     * <p>只认浏览器与相册最常产出的这几种。判错方向的代价不对称：
+     * 漏判成图片会退回"视频"通道（黑屏），误判成图片则一张真视频变成一张
+     * 显示不出来的图 —— 所以宁可只认确定的扩展名。
+     */
+    private static boolean isImageName(String name) {
+        String ext = extensionOf(name);
+        return "jpg".equals(ext) || "jpeg".equals(ext) || "png".equals(ext)
+                || "gif".equals(ext) || "bmp".equals(ext) || "webp".equals(ext);
+    }
+
+    /** 小写扩展名（不含点）；没有点则返回空串 */
+    private static String extensionOf(String name) {
+        String n = name.toLowerCase(java.util.Locale.ROOT);
+        int dot = n.lastIndexOf('.');
+        return dot < 0 ? "" : n.substring(dot + 1);
+    }
+
+    /**
      * 按扩展名判是不是音频。
      *
      * <p>判不出来一律当视频：视频是"有画面"的默认预期，猜错的代价也最小 ——
@@ -946,12 +1009,7 @@ public class DlnaRendererService extends Service
      * 界面会切到音乐形态、把画面藏起来，那才是真的丢了东西。
      */
     private static boolean isAudioName(String name) {
-        String n = name.toLowerCase(java.util.Locale.ROOT);
-        int dot = n.lastIndexOf('.');
-        if (dot < 0) {
-            return false;
-        }
-        String ext = n.substring(dot + 1);
+        String ext = extensionOf(name);
         return "mp3".equals(ext) || "m4a".equals(ext) || "aac".equals(ext)
                 || "wav".equals(ext) || "flac".equals(ext) || "ogg".equals(ext)
                 || "wma".equals(ext) || "ape".equals(ext);
@@ -1123,6 +1181,17 @@ public class DlnaRendererService extends Service
         return audioOnly;
     }
 
+    /**
+     * 当前投的是不是一张静态图。界面据此走 {@code BitmapFactory} 通道
+     * 而不是等 MediaPlayer 出画面。
+     *
+     * <p>刻意**不动** {@link #isAudioOnly()}：图片既不是音频也不是视频，
+     * 硬塞进那个二值里，总有一边要错。三态各问各的，判据才不会打架。
+     */
+    public boolean isImage() {
+        return kindFromMetadata == KIND_IMAGE;
+    }
+
     // ------------------------------------------- EventDispatcher.EventSource
 
     /**
@@ -1291,8 +1360,13 @@ public class DlnaRendererService extends Service
         return friendlyName;
     }
 
+    @Override
     public String getLocalIp() {
         // 优先用 SSDP **实际绑上的那张网卡**的地址。
+        //
+        // 三个用途共用这一个出处：界面上的地址、/status、以及设备描述里的
+        // presentationURL（批 2 起）。谁自己算一遍，都会在「第一张候选网卡
+        // joinGroup 失败、换到第二张」时分叉。
         //
         // 不能只返回 localIp：那是 onCreate 时按「候选列表第一张网卡」猜的，
         // 而 joinGroup 有可能换到第二张（第一张没有 IPv4、或是隧道接口）。

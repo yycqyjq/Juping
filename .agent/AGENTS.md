@@ -59,6 +59,10 @@ app/src/main/java/com/juping/cast/
 ├── NetUtil.java               网卡选择唯一出处
 ├── DidlLite.java              DIDL-Lite 元数据解析
 ├── MainActivity.java          界面：前台唤醒/播完延迟退后台（MTK 蓝屏规避）
+│                              空闲时画二维码（扫码进上传页，批 2）：按地址缓存、
+│                              换图 recycle 旧位图、生成失败整块 GONE
+├── QrRenderer.java            二维码位图绘制：QrCode → 逐格 int[] → 一次 setPixels
+│                              （替代上游 toImage()，Android 无 java.awt/ImageIO）
 ├── RenameReceiver.java        adb 改名广播入口（唯一 exported 指令面）
 ├── BootReceiver.java          开机自启
 ├── player/
@@ -80,6 +84,15 @@ app/src/main/java/com/juping/cast/
                                  穿不进 drwx------（真机证伪，见计划 §5.2.1）
                                ※ 这里的 WebEndpoints/WebResponse 接口定义在
                                  UpnpHttpServer 内（协议闸门编译白名单不含 web 包）
+app/src/main/java/io/nayuki/qrcodegen/            ← **唯一的第三方源码**
+├── QrCode.java · QrSegment.java · BitBuffer.java · DataTooLongException.java
+│                              Nayuki QR Code generator 1.8.0
+│                              （MIT；纯源码内嵌、无二进制，是「零依赖」铁律的
+│                                **明示例外**，见 §6。只用它的编码核心；
+│                                上游 1.7.0 起 DataTooLongException 是独立顶层类，
+│                                少搬它会编译不过。API 15 适配只有两处：
+│                                requireNonNull → 显式判空、UTF-8 取字节走 Charset。
+│                                绘制不用上游 toImage()，改由 QrRenderer 逐格画）
 tools/
 ├── build.sh              一键构建+八道闸门（apk/api/dex/protocol/policy/proxy/web/secrets）
 ├── lib.sh                各脚本共用的 JDK 定位（build.sh 与四个 run.sh 都 source 它）
@@ -93,8 +106,8 @@ tools/
 ├── check_gate_counts.py  五道闸门用例总数 ↔ README/AGENTS 文档 一致性
 ├── apk_info.py           APK 包名/minSdk 解析
 ├── make_icon.py          位图资源生成（纯标准库）
-├── protocol-test/        DLNA 协议一致性 237 项（桌面 JVM + 真实协议栈桩）
-├── policy-test/          播放策略 57 断言 + 265 源码级守卫
+├── protocol-test/        DLNA 协议一致性 239 项（桌面 JVM + 真实协议栈桩）
+├── policy-test/          播放策略 57 断言 + 305 源码级守卫
 ├── proxy-test/           MediaProxy 字节一致性 11 项
 └── web-test/             MultipartLite + sanitize 网页逻辑一致性（32 项）
 ```
@@ -108,15 +121,15 @@ tools/
 | verify_apk | 签名/minSdk | 每包 |
 | verify_api | 平台 API 引用逐个核对（目标 API 15/33） | 260+/272+ |
 | verify_dex | R8 后框架回调/Thread 子类/协议常量存活 | 全量 |
-| verify_protocol | DLNA 协议一致性（drive.py，期望 237/237） | 237 |
+| verify_protocol | DLNA 协议一致性（drive.py，期望 239/239） | 239 |
 | ↳ 内含 probe | 控制点自检（**33 或 34 双态**：组播回退分支） | 33/34 |
-| verify_policy | 播放策略 57 断言 + 265 源码级守卫 | 57+ |
+| verify_policy | 播放策略 57 断言 + 305 源码级守卫 | 57+ |
 | ↳ 内含计数 | 文档里的用例总数 ↔ 闸门期望值（`check_gate_counts.py`，覆盖协议/代理/网页/probe/策略） | 一致性 |
 | verify_proxy | MediaProxy 字节一致性（全量/Range/回拖/EOS/中途重连） | 11 |
 | verify_web | multipart 解析逐字节一致 / 名字编码 / 上传页零外链 | 32 |
 | verify_secrets | 密钥泄漏 | 零命中 |
 
-**总数守卫是特性**：协议 237、probe 33/34 双态（组播回退分支）、策略 57、网页逻辑一致性 32 项。
+**总数守卫是特性**：协议 239、probe 33/34 双态（组播回退分支）、策略 57、网页逻辑一致性 32 项。
 有意增删断言后必须同步 build.sh / run.sh 里的期望值。
 
 **计数单一事实来源**：策略的断言/守卫数，以及协议/proxy/web/probe 的用例总数，
@@ -218,6 +231,11 @@ adb -s 192.168.1.8:5555 logcat -v time > /tmp/tv_session.log 2>&1
 7. **真机验证 = 电视屏幕实际观察**：screencap 截不到视频层，位置数据
    用 GetPositionInfo 交叉验证；需要人眼看画面时明确请用户确认。
 8. **文档三处同步**：README（用户）、.agent/todo.md（状态）、本文件（Agent）。
+9. **零第三方依赖**（无 gradle dependency、无 aar/jar）。**唯一明示例外**：
+   `io/nayuki/qrcodegen/` 的 QR 编码核心（MIT，纯 Java 源码内嵌、无二进制）。
+   引入理由：二维码编码**不能自己写**（Reed-Solomon + 掩码 + 版本选择，
+   写错的表现是"扫不出来"，而人眼看不出来）；引入方式必须**源码级内嵌**，
+   不引任何构建期依赖。例外只有这一处，再引第三方要先登记在这里。
 
 ## 7. 当前状态指针
 

@@ -57,6 +57,10 @@ import zipfile
 # 免得新增一个实现却静默地不在核查范围内。
 FRAMEWORK_INTERFACES = {
     'Ljava/lang/Runnable;': ['run'],
+    # 内嵌的 Nayuki QR 库：BitBuffer implements Cloneable 并覆写了 clone()。
+    # 列进来是为了让「名字被改过」这件事照样被核到 —— 不列的话它只会被
+    # 当成「不在核查表内」报出来，闸门照样红。
+    'Ljava/lang/Cloneable;': ['clone'],
     'Ljava/util/concurrent/ThreadFactory;': ['newThread'],
     'Landroid/view/SurfaceHolder$Callback;': ['surfaceCreated', 'surfaceChanged',
                                               'surfaceDestroyed'],

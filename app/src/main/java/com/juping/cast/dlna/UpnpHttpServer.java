@@ -131,6 +131,21 @@ public class UpnpHttpServer extends Thread {
          * upnp-display 思路：渲染器的「显示屏」就是浏览器）。
          */
         String buildStatusJson();
+
+        /**
+         * 设备描述 {@code presentationURL} 用 —— 本机在局域网里的地址。
+         *
+         * <p>必须与 LOCATION **同源**：都取「组播实际绑上的那张网卡」的 IPv4
+         * （{@code DlnaRendererService.getLocalIp()} → {@code SsdpResponder#getBoundIp()}）。
+         * 两处各挑各的 —— 比如一边用候选列表第一张网卡、一边用真正绑上的那张 ——
+         * 就会出现「手机搜得到设备，点开设备页面却打不开」，和 LOCATION
+         * 那个坑是同一个（见 {@code NetUtil} 的类注释）。
+         *
+         * <p>为什么由服务层提供而不是 HTTP 层自己探测：网卡选择的唯一出处
+         * 在服务层。在这里再探测一次，等于把「组播绑哪张」和「告诉浏览器去
+         * 哪儿打开页面」拆成两次独立选择。
+         */
+        String getLocalIp();
     }
 
     /**
@@ -912,13 +927,10 @@ public class UpnpHttpServer extends Thread {
                 .append(serviceEntry("AVTransport"))
                 .append(serviceEntry("ConnectionManager"))
                 .append(serviceEntry("RenderingControl"))
-                .append("    </serviceList>\n")
-                // presentationURL：**刻意不声明**。它只有一个含义 ——
-                // "用浏览器打开这里看设备信息"。我们没有任何 Web 界面，
-                // 写 "/" 只会把 device.xml 本身喂给浏览器（一屏原始 XML）。
-                // schema 里它是可选的：不声明，控制点就不画那个按钮；
-                // 画一个点开是乱码的按钮，比没有按钮糟。
-                .append("    <dlna:X_DLNADOC xmlns:dlna=\"urn:schemas-dlna-org:device-1-0\">")
+                .append("    </serviceList>\n");
+        // presentationURL 必须排在 serviceList 之后、dlna 扩展之前（schema 顺序）。
+        appendPresentationUrl(sb);
+        sb.append("    <dlna:X_DLNADOC xmlns:dlna=\"urn:schemas-dlna-org:device-1-0\">")
                 .append(DLNA_DOC).append("</dlna:X_DLNADOC>\n")
                 .append("  </device>\n")
                 .append("</root>\n");
@@ -948,6 +960,34 @@ public class UpnpHttpServer extends Thread {
                 .append("        <url>").append(ICON_PATH).append("</url>\n")
                 .append("      </icon>\n")
                 .append("    </iconList>\n");
+    }
+
+    /**
+     * presentationURL：声明设备自带的 Web 界面 —— 就是那张「扫码传文件」的上传页。
+     *
+     * <p>规范里这个字段只有一个含义：「用浏览器打开这里看设备信息」。批 2 起我们
+     * **真的有** Web 界面了，所以按规范声明出来：控制点的设备列表里会多一个
+     * 「打开设备页面」按钮，点开就是上传页。
+     *
+     * <p>原来这里写的是「刻意不声明」，那时是对的 —— {@code "/"} 当时只会把
+     * device.xml 本身喂给浏览器（一屏原始 XML），画一个点开是乱码的按钮比没有按钮糟。
+     * 现在 {@code "/"} 真的是一张页面了，那条理由随之消失。
+     *
+     * <p><b>端口必须走 {@link #getPort()}</b>：端口有 fallback（49152 被厂家自带的
+     * DLNA 栈占了就往上移），写死首选端口的话，这个按钮会把浏览器指到一个没人
+     * 监听的端口上。主机走 {@link CommandHandler#getLocalIp()}，与 LOCATION 同源。
+     *
+     * <p>拿不到可用地址时**不声明**，同 {@link #appendIconList(StringBuilder)} 的纪律：
+     * 声明了控制点就会真的去打开它，而 {@code http://0.0.0.0/} 谁也打不开 ——
+     * 那比没有按钮糟。
+     */
+    private void appendPresentationUrl(StringBuilder sb) {
+        String ip = handler.getLocalIp();
+        if (ip == null || ip.length() == 0 || "0.0.0.0".equals(ip)) {
+            return;
+        }
+        sb.append("    <presentationURL>http://").append(escapeXml(ip))
+                .append(':').append(getPort()).append("/</presentationURL>\n");
     }
 
     /**
@@ -1244,20 +1284,29 @@ public class UpnpHttpServer extends Thread {
      * ConnectionManager 事件里的 {@code SinkProtocolInfo}。**必须是同一份字符串** ——
      * 各写一份，改一处忘一处，控制点就会看到"声明的"和"事件报的"不一致。
      *
-     * <p><b>为什么这里没有 image/*</b>：曾经声明过 {@code image/jpeg} 与
-     * {@code image/png}，但整套实现里根本没有图片这条路 —— {@code kindOf()}
-     * 只认 audioItem / videoItem，而 {@code MediaPlayer} 本身也不解图片。
-     * 声明了却做不到，控制点（相册、文件管理器）就会把图片推过来，
-     * 然后必然失败，用户看到的是"投屏坏了"。**这份清单是控制点判断
-     * "能不能推给我"的唯一依据，所以它必须与实现严格一致** ——
-     * 宁可让控制点一开始就说"这台设备不支持"，也不要收下再失败。
+     * <p><b>为什么现在有 image/*</b>：曾经声明过又被撤掉，当时整套实现里根本没有
+     * 图片这条路 —— {@code kindOf()} 只认 audioItem / videoItem，而
+     * {@code MediaPlayer} 本身也不解图片，声明了却做不到，控制点（相册、
+     * 文件管理器）就会把图片推过来然后必然失败。
+     *
+     * <p>现在图片这条路补齐了：{@code kindOf()} 认 {@code object.item.imageItem}，
+     * 界面用 {@code BitmapFactory} 解码后画在 ImageView 上，**不经过
+     * MediaPlayer**。清单必须与实现严格一致 —— 这是控制点判断"能不能推给我"
+     * 的唯一依据：宁可让它一开始就说"这台设备不支持"，也不要收下再失败；
+     * 反过来，做到了却不声明，控制点就不会把照片推过来。
+     *
+     * <p>只声明 jpeg / png 两种，不多声明 gif / webp：解码通道
+     * （{@code BitmapFactory}）虽然认得它们，但**控制点据此推流的概率极低**，
+     * 而清单每多一项，就是多一条"声明了却没人验证过"的路径。
      */
     public static final String SINK_PROTOCOL_INFO =
             "http-get:*:video/mp4:*,"
                     + "http-get:*:application/vnd.apple.mpegurl:*,"
                     + "http-get:*:application/x-mpegURL:*,"
                     + "http-get:*:audio/mpeg:*,"
-                    + "http-get:*:audio/mp4:*";
+                    + "http-get:*:audio/mp4:*,"
+                    + "http-get:*:image/jpeg:*,"
+                    + "http-get:*:image/png:*";
 
     /** 各 action 需要回什么参数 */
     private String responseArgs(String action) {

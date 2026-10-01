@@ -654,8 +654,14 @@ public final class WebCastEndpoints implements UpnpHttpServer.WebEndpoints {
             + "<h1>聚屏</h1>\n"
             + "<p id=\"space\">正在读取…</p>\n"
             + "<div class=\"box\">\n"
+            // 两个入口都留，但必须各有一句说明 —— 否则手机上会看到两个
+            // 长得一样的「选择文件」按钮，不知道点哪个（实测反馈）。
+            // 而目录选择在部分安卓浏览器上是**特性检测误判**：属性存在、
+            // 点开却选不了目录，所以入口留着、说明也必须留着。
+            + "  <p class=\"hint\" style=\"margin:0 0 8px\">选文件：可一次多选照片、视频或音乐</p>\n"
             + "  <input type=\"file\" id=\"f\" multiple>\n"
             + "  <div id=\"dirbox\" style=\"display:none\">\n"
+            + "    <p class=\"hint\" style=\"margin:16px 0 8px\">选文件夹：整个文件夹里的内容一起传</p>\n"
             + "    <input type=\"file\" id=\"d\" webkitdirectory directory multiple>\n"
             + "  </div>\n"
             + "  <p class=\"hint\" id=\"hint\"></p>\n"

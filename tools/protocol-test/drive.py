@@ -255,6 +255,11 @@ check('没声明 MKV（内存吃不住）', 'matroska' not in sink.lower(),
 # audio/mpeg 是 MP3 的合法 MIME，*mpegurl 是 HLS 的合法 MIME，都不是 MPEG-PS。
 check('没声明 MPEG-PS（video/mpeg）', 'video/mpeg:' not in sink.lower(),
       'Sink 里出现了 video/mpeg' if 'video/mpeg:' in sink.lower() else '')
+# 图片通道（kindOf 认 imageItem + 界面用 BitmapFactory 出画面）落地之后，
+# 这份清单必须把 image/* 加回来 —— 做到了却不声明，相册/文件管理器就
+# 不会把照片推过来，那条通道等于白做。
+check('声明了 image/jpeg（图片通道已实现）', 'image/jpeg' in sink,
+      'Sink=%s' % sink[:120])
 
 st, hd, body = soap_post('GetTransportInfo', SVC_AVT, '')
 state = find_xml_text(body, 'CurrentTransportState')
@@ -1506,12 +1511,28 @@ if dev_root is not None:
           'M-DMR' not in (doc or ''), '实际 %r' % doc,
           note='我们不是移动设备。领了那个标记，控制点会按移动端的规则来对待')
 
-    # --- 刻意不声明的两个字段：写上去就是撒谎 ---
-    check('13.1 没有声明 presentationURL（我们没有任何 Web 界面）',
-          txt1('presentationURL') is None,
-          '实际 %r' % txt1('presentationURL'),
-          note='写 "/" 只会把 device.xml 本身喂给浏览器。不声明时控制点就不画'
-               '那个按钮 —— 比画一个点开是乱码的按钮诚实')
+    # --- presentationURL：设备自带的 Web 界面（就是那张扫码上传页）---
+    #
+    # 这条断言原来写作「没有声明 presentationURL」，当时是对的：那会儿 "/"
+    # 只会把 device.xml 本身喂给浏览器，声明出来等于画一个点开是乱码的按钮。
+    # 批 2 起 "/" 真的是一张上传页了（浏览器带 Accept: text/html 才走它，
+    # 见 WebCastEndpoints.handle），那条前提消失，断言跟着事实走。
+    purl = (txt1('presentationURL') or '').strip()
+    pm = re.match(r'^https?://([^/]+)/?$', purl)
+    check('13.1 声明了 presentationURL，且是绝对 http 地址、路径为 /',
+          pm is not None, '实际 %r' % purl,
+          note='控制点据此在设备列表里画「打开设备页面」按钮，点开就是上传页')
+    # 主机端口必须与 LOCATION 完全一致。LOCATION 用的是「组播**实际绑上**的那张
+    # 网卡的 IPv4 + HTTP 真正在听的端口」（见 NetUtil / SsdpResponder）；
+    # presentationURL 若自己再算一遍，端口回退（49152 被厂家自带的 DLNA 栈
+    # 占了就往上移）之后就指向一个没人监听的端口 —— 现象正是
+    # 「手机搜得到设备、点开设备页面却打不开」。
+    lm = re.match(r'^https?://([^/]+)', loc or '')
+    check('13.1 presentationURL 的主机端口与 LOCATION 完全一致（地址单一真源）',
+          pm is not None and lm is not None and pm.group(1) == lm.group(1),
+          'presentationURL=%r，LOCATION=%r' % (purl, loc))
+
+    # --- 刻意不声明的字段：写上去就是撒谎 ---
     check('13.1 没有编造 UPC 码', txt1('UPC') is None,
           '实际 %r' % txt1('UPC'),
           note='UPC 是零售商品条码。我们不是商品，编一个假码没有任何好处，'
@@ -1777,11 +1798,13 @@ print('\n  13.5 协议清单与实现一致（声明了却做不到 = 对控制�
 
 _st, _hd, b = soap_post('GetProtocolInfo', SVC_CMS, '', control='ConnectionManager')
 sink2 = find_xml_text(b, 'Sink') or ''
-check('13.5 Sink 里没有 image/*（实现里根本没有图片这条路）',
-      'image/' not in sink2.lower(), 'Sink=%s' % sink2[:120],
-      note='声明了图片，控制点（相册、文件管理器）就会把图片推过来，然后必然失败，'
-           '用户看到的是"投屏坏了"。这份清单是控制点判断"能不能推给我"的'
-           '**唯一依据**')
+check('13.5 Sink 里声明了 image/*（图片通道已实现）',
+      'image/jpeg' in sink2.lower() and 'image/png' in sink2.lower(),
+      'Sink=%s' % sink2[:120],
+      note='这条原来是反过来的：当时实现里根本没有图片这条路，所以刻意不声明 —— '
+           '声明了却做不到，控制点（相册、文件管理器）就会把图片推过来然后必然失败。'
+           '现在图片通道（KIND_IMAGE + BitmapFactory）已经落地，清单必须加回来；'
+           '反过来，做到了却不声明，相册就不会把照片推过来，这条通道等于白做')
 
 cb_cm = FakeCallback()
 _st, _hd, _ = raw_request('SUBSCRIBE', '/upnp/event/ConnectionManager',
@@ -1794,7 +1817,7 @@ if cm_evs:
     except Exception:
         cm_sink = None
 check('13.5 事件里的 SinkProtocolInfo 与 GetProtocolInfo 是同一份',
-      cm_sink is not None and 'image/' not in cm_sink.lower() and cm_sink == sink2,
+      cm_sink is not None and cm_sink == sink2,
       '事件=%r\n         GetProtocolInfo=%r' % (cm_sink, sink2),
       note='两个出口各写一份的话，改一处忘一处，控制点会看到"声明的"和'
            '"事件报的"不一致')

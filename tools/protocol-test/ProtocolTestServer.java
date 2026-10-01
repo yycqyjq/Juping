@@ -162,6 +162,14 @@ public class ProtocolTestServer {
 
         final PrintWriter log = new PrintWriter(new FileWriter(callLog, false), true);
 
+        // 设备描述里 presentationURL 用哪个地址：靶机照真实服务那么取 ——
+        // 优先 SSDP **实际绑上的那张网卡**（DlnaRendererService.getLocalIp() 同源）。
+        // SSDP 起来得晚（它要拿 HTTP 的实际端口），而 presentationURL 是每次请求
+        // 现算的，所以用一个 holder 晚填：驱动去抓 device.xml 时它早就有值了。
+        // 这里若图省事写死一个 IP，drive.py 那条「presentationURL 与 LOCATION
+        // 主机端口一致」的断言就变成假绿 —— 它验的正是"两处同源"。
+        final SsdpResponder[] ssdpHolder = new SsdpResponder[1];
+
         UpnpHttpServer.CommandHandler handler = new UpnpHttpServer.CommandHandler() {
             private void rec(String... fields) {
                 StringBuilder sb = new StringBuilder();
@@ -221,6 +229,16 @@ public class ProtocolTestServer {
             public String buildStatusJson() {
                 return "{\"state\":\"" + transportState
                         + "\",\"currentUri\":\"" + currentUri + "\"}";
+            }
+
+            @Override
+            public String getLocalIp() {
+                SsdpResponder s = ssdpHolder[0];
+                if (s != null && s.getBoundIp() != null) {
+                    return s.getBoundIp();
+                }
+                // 还没绑上（正常跑不到这一步：驱动是等 READY 之后才开始抓描述的）
+                return "127.0.0.1";
             }
 
             @Override
@@ -382,6 +400,9 @@ public class ProtocolTestServer {
         SsdpResponder ssdp = new SsdpResponder(UUID, server.getPort(), "Android/4.0.4", ssdpPort,
                 TEST_VERSION);
         ssdp.start();
+        // 交给 handler 取地址用（见上面 ssdpHolder 的说明）。绑定是同步完成的，
+        // 所以这里一填，后面驱动拿到的 presentationURL 就是**绑上那张网卡**的地址。
+        ssdpHolder[0] = ssdp;
 
         // 等两个服务真的起来，再告诉驱动可以开始了
         long deadline = System.currentTimeMillis() + 5000;

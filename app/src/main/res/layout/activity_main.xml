@@ -78,6 +78,22 @@
             android:textSize="15sp" />
     </LinearLayout>
 
+    <!-- 图片层：投静态图时显示。
+         为什么单开一层、不复用 SurfaceView：SurfaceView 上的内容是 MediaPlayer
+         解码出来的，而它根本解不了静态图 —— 喂进去只会立刻报错、屏幕全黑。
+         所以图片由 BitmapFactory 解码后画在这层 ImageView 上。
+         背景必须**不透明**：图片常带透明通道（PNG、带蒙版的照片），
+         不铺一层底的话，透明区域会露出下面那层视频 Surface 的蓝色。
+         fitCenter 而不是 fitXY：电视上宁愿两侧留黑边，也不要把人脸拉变形。 -->
+    <ImageView
+        android:id="@+id/image"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@color/bg"
+        android:contentDescription="@string/image_desc"
+        android:scaleType="fitCenter"
+        android:visibility="gone" />
+
     <!-- 主面板：等待投屏时显示。
          这里的 background 必须**不透明**，和上面 music 层是同一个道理：
          它底下压着 SurfaceView，而停止播放之后那个 Surface 可能残留一层
@@ -127,31 +143,78 @@
                 android:textSize="15sp" />
         </LinearLayout>
 
-        <!-- 引导卡片 -->
+        <!-- 引导卡片：左边是文字引导，右边是二维码 ——
+             扫码这条路径比"在手机 App 里找投屏按钮"短得多：扫完就是上传页，
+             传完一键播。所以码要够大（10:1 规则：3~5 米外要 30cm 以上）。 -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="32dp"
-            android:orientation="vertical"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
             android:background="@drawable/bg_card"
             android:padding="24dp">
 
-            <TextView
-                android:layout_width="wrap_content"
+            <LinearLayout
+                android:layout_width="0dp"
                 android:layout_height="wrap_content"
-                android:text="@string/guide_title"
-                android:textColor="@color/accent"
-                android:textSize="20sp"
-                android:textStyle="bold" />
+                android:layout_weight="1"
+                android:orientation="vertical">
 
-            <TextView
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/guide_title"
+                    android:textColor="@color/accent"
+                    android:textSize="20sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:lineSpacingExtra="6dp"
+                    android:text="@string/guide_body"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="17sp" />
+            </LinearLayout>
+
+            <!-- 二维码整块（码 + 一行小字）。
+
+                 整块有个 id 是为了能**整块隐藏**：位图是异步/按需生成的，
+                 生成不出来时留一个空的白色方块在深色卡片上，看着像界面坏了。
+
+                 白底是必须的（@color/qr_bg，见那边的注释）；码四周还留了
+                 6dp 的 padding —— QrRenderer 里已经内建了 4 个模块的静区，
+                 这一圈白边是第二道保险：静区被卡片底色吃掉，码就扫不出来了。 -->
+            <LinearLayout
+                android:id="@+id/qr_box"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="12dp"
-                android:lineSpacingExtra="6dp"
-                android:text="@string/guide_body"
-                android:textColor="@color/text_secondary"
-                android:textSize="17sp" />
+                android:layout_marginLeft="28dp"
+                android:gravity="center_horizontal"
+                android:orientation="vertical"
+                android:visibility="gone">
+
+                <ImageView
+                    android:id="@+id/qr_image"
+                    android:layout_width="196dp"
+                    android:layout_height="196dp"
+                    android:background="@color/qr_bg"
+                    android:contentDescription="@string/qr_desc"
+                    android:padding="6dp"
+                    android:scaleType="fitCenter" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:gravity="center"
+                    android:lineSpacingExtra="2dp"
+                    android:text="@string/qr_hint"
+                    android:textColor="@color/text_hint"
+                    android:textSize="14sp" />
+            </LinearLayout>
         </LinearLayout>
 
         <!-- 设备信息卡片 -->

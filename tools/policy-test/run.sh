@@ -40,6 +40,7 @@ SVC="app/src/main/java/com/juping/cast/DlnaRendererService.java"
 ACT="app/src/main/java/com/juping/cast/MainActivity.java"
 LAYOUT="app/src/main/res/layout/activity_main.xml"
 COLORS="app/src/main/res/values/colors.xml"
+QR="app/src/main/java/com/juping/cast/QrRenderer.java"
 
 # ── 1. 编译（不需要 android.jar —— PlaybackPolicy 零 Android 依赖）──
 echo "── 编译播放策略（桌面 JVM，零 Android 依赖）──"
@@ -272,14 +273,15 @@ PY
 # 这几条守的是「静默回归」：把音乐层的背景改成透明、或者把它挪到 SurfaceView
 # 前面，代码照样编译、照样运行、日志里一个字都不多 —— 只是电视又变回一片黑。
 # 而「声音在放、画面全黑」恰恰是用户最容易误判成「投屏坏了」的现象。
-python3 - "$LAYOUT" "$COLORS" "$ACT" <<'PY' || RC=1
+python3 - "$LAYOUT" "$COLORS" "$ACT" "$QR" <<'PY' || RC=1
 import re, sys, pathlib
 import xml.etree.ElementTree as ET
 
-layout_path, colors_path, act_path = sys.argv[1], sys.argv[2], sys.argv[3]
+layout_path, colors_path, act_path, qr_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 layout_src = pathlib.Path(layout_path).read_text(encoding='utf-8')
 colors_src = pathlib.Path(colors_path).read_text(encoding='utf-8')
 act_src = pathlib.Path(act_path).read_text(encoding='utf-8')
+qr_src = pathlib.Path(qr_path).read_text(encoding='utf-8') if pathlib.Path(qr_path).exists() else ''
 failed = []
 
 def strip_comments(src):
@@ -314,6 +316,7 @@ def strip_comments(src):
     return ''.join(out)
 
 act_src = strip_comments(act_src)
+qr_src = strip_comments(qr_src)
 
 def report(name, ok, detail=''):
     print('  [%s] %s%s' % ('PASS' if ok else 'FAIL', name,
@@ -449,6 +452,81 @@ if rf:
 report('界面依据 service.isAudioOnly() 判形态',
        'isAudioOnly()' in act_src,
        '判据的权威来源在服务里（元数据 + 真实视频尺寸两个信号合并），界面不自己猜')
+
+# ⑱ 二维码（批 2）：电视端唯一的"入口"，错了用户就进不来
+# 这几条守的都是「静默回归」：编译过、运行不报错、日志干净，
+# 只是电视上那块二维码扫不出来 —— 而"扫不出来"没有人会报 bug，
+# 用户只会默默放弃、回去用数据线。
+report('布局里有二维码整块 @+id/qr_box', '@+id/qr_box' in by_id, str(order))
+report('布局里有二维码位图 @+id/qr_image', '@+id/qr_image' in by_id, '')
+
+# 底色必须纯白。二维码解码靠黑白对比，画在深色卡片上对比度直接没了 ——
+# 而"灰底 / 半透明底"在电视上看起来"也就是暗一点"，肉眼根本不会怀疑。
+qr_bg = by_id['@+id/qr_image'].get(AND + 'background') if '@+id/qr_image' in by_id else None
+report('二维码有背景色', bool(qr_bg), '实际：%r' % qr_bg)
+if qr_bg:
+    m = re.match(r'@color/(\w+)$', qr_bg)
+    c = re.search(r'<color name="%s">\s*#([0-9A-Fa-f]{6,8})\s*</color>' % m.group(1), colors_src) if m else None
+    report('二维码底色是纯白（黑块要靠它才有对比度）',
+           c is not None and c.group(1).upper() in ('FFFFFFFF', 'FFFFFF'),
+           '实际：%s = #%s —— 非纯白（尤其带 alpha）会让扫码成功率骤降，'
+           '而电视上看起来只是"暗了一点点"' % (qr_bg, c.group(1) if c else '?'))
+
+uq = body_of(act_src, 'private void updateQr(String url)')
+report('updateQr(String) 方法体已找到', uq is not None,
+       '锚点：private void updateQr(String url)')
+if uq:
+    # 0.6GB 内存的铁律：二维码是每 tick 都会路过的地方，地址没变就不能重画。
+    # 少了这个短路，每秒一张 196dp 的 ARGB_8888 位图，电视很快就卡。
+    report('地址没变就不重画（按 URL 缓存）',
+           'equals(qrPayload)' in uq,
+           '二维码每 tick 都会被路过。不按地址短路，'
+           '每秒重新生成一张全屏位图 —— 0.6GB 的机器撑不住')
+    report('换图时回收旧位图（不留给 GC 猜）',
+           'recycle()' in uq,
+           '电视内存是稀缺资源。不回收旧位图，反复换地址会把内存喂满')
+    report('生成失败时整块藏起来（不留空白方块）',
+           'setVisibility(' in uq and 'GONE' in uq,
+           '生成不出来时若仍显示一块空白方块，用户会一直对着它扫 —— '
+           '藏起来至少提示"这条路暂时不通"')
+
+report('MainActivity 在 idle 时把地址喂给二维码',
+       'updateQr(' in act_src and 'getLocalIp()' in act_src,
+       '二维码地址必须和服务报出来的本机地址同源（与 device.xml 的 '
+       'presentationURL 是同一对来源），否则"扫码打开的"和"控制点打开的"会分叉')
+
+# 图片层（批 3）：MediaPlayer 解不了静态图，所以图片有自己的一层。
+# 这几条守的是「照片投上去，电视全黑」——布局把这一层漏了 / 藏反了，
+# 代码全都照常编译运行，只是照片永远显示不出来。
+report('布局里有图片层 @+id/image', '@+id/image' in by_id,
+       '图片走的是 BitmapFactory + ImageView 这条独立通道，'
+       '少了这一层，解码出来的位图无处可画 —— 屏幕全黑')
+if '@+id/image' in by_id:
+    _iv = by_id['@+id/image']
+    report('图片层默认隐藏（不可见时不留黑块盖住面板）',
+           _iv.get(AND + 'visibility') == 'gone',
+           '实际：%r —— 默认可见的话，待机面板会被这一整层黑底压住' % _iv.get(AND + 'visibility'))
+    report('图片层有不透明背景（挡住下面那层视频 Surface 的蓝底）',
+           bool(_iv.get(AND + 'background')),
+           '实际：%r —— 照片常带透明通道（PNG），没有底色透明区会露出'
+           '视频层的蓝色，一片花' % _iv.get(AND + 'background'))
+
+# QrRenderer：Android 上没有 java.awt / ImageIO，位图必须逐格自己画。
+report('QrRenderer.java 存在', bool(qr_src), '锚点文件：%s' % qr_path)
+if qr_src:
+    report('QrRenderer 逐格读取模块（getModule）',
+           'getModule(' in qr_src,
+           '必须一个模块一个模块地取黑/白 —— 这是替代上游 toImage() 的核心，'
+           '少了它只能画出一个空方块')
+    report('QrRenderer 不依赖 java.awt / ImageIO（Android 上没有）',
+           'java.awt' not in qr_src and 'imageio' not in qr_src.lower()
+           and 'BufferedImage' not in qr_src,
+           '上游 toImage()/toSvgString() 靠 java.awt + javax.imageio，'
+           'Android 运行时里根本没有这两个包 —— 在桌面上编得过，装到电视上就崩')
+    report('QrRenderer 一次成图（用 setPixels，不逐点 setPixel）',
+           'setPixels(' in qr_src and 'setPixel(' not in qr_src,
+           '逐个 setPixel 在 0.6GB 的设备上慢得肉眼可见。攒成一整个 int[] '
+           '再一次性灌进去，是这台机器上唯一可接受的写法')
 
 sys.exit(1 if failed else 0)
 PY
@@ -627,6 +705,119 @@ if ce:
     report('clearError 同时清错误细节',
            re.search(r'lastError\s*=\s*""', ce) is not None,
            '只清分类不清洁细节的话，日志里会留着已经自愈的那条旧报错')
+
+# ---- 图片投屏（批 3）：静态图走的是**另一条通道**，四个环节缺一不可 ----
+#
+# 这一节守的是「投一张照片，电视全黑」这个现象。成因不是某个函数写错，
+# 而是**通道选错了**：MediaPlayer 解不了静态图，喂进去只会立刻报错。
+# 所以整条链必须是：①认出是图片 → ②不交给 MediaPlayer → ③界面用
+# BitmapFactory 出画面 → ④大图先降采样（不然 48MB 的位图直接 OOM）。
+# 这四步每一步都能"编译过、运行不报错"，只是照片显示不出来 —— 静默回归。
+#
+# act_src 在这个块里**没剥注释**（前面的锚点用的是原文本），而 MainActivity
+# 的注释里恰好就出现了 inSampleSize / BitmapFactory 这些词 —— 不剥的话，
+# 一个只看注释就能通过的守卫，等于没有。所以这里单独取一份剥过的。
+act_code = strip_comments(act_src)
+
+report('服务定义 KIND_IMAGE（图片是第四类内容，不并进视频）',
+       'KIND_IMAGE' in svc,
+       '并进 KIND_VIDEO 的话，界面会走视频通道去等一个永远不会来的视频帧 —— '
+       '结果就是一块黑屏')
+
+ko = body_of(svc, 'private static int kindOf(String metadata)')
+report('kindOf 方法体已找到', ko is not None,
+       '锚点：private static int kindOf(String metadata)')
+if ko:
+    report('kindOf 认 object.item.imageItem',
+           'imageItem' in ko,
+           '相册 / 文件管理器推照片时带的 upnp:class 就是 '
+           'object.item.imageItem.photo。不认它，照片会落到"未知"，'
+           '再被当成视频处理')
+
+df = body_of(svc, 'private static String didlFor(File file)')
+report('didlFor 方法体已找到', df is not None,
+       '锚点：private static String didlFor(File file)')
+if df:
+    report('didlFor 把图片判成 object.item.imageItem.photo',
+           'imageItem' in df,
+           '上传页投的是本地文件，走的就是 didlFor 拼元数据这条路。'
+           '少了图片这一档，照片会被拼成 videoItem，kindOf 再把它判成视频 —— '
+           '又是黑屏')
+
+report('isImageName 按扩展名认图片（含 jpg 与 png）',
+       'isImageName' in svc and re.search(r'"jpg"', svc) is not None
+       and re.search(r'"png"', svc) is not None,
+       '扩展名是 didlFor 分类的唯一依据；漏掉 jpg/png 等于最常见的照片都不认')
+
+su2 = body_of(svc, 'public void onSetUri(String uri, String metadata)')
+if su2:
+    report('图片态不走 MediaPlayer（有 KIND_IMAGE 分支且停掉了播放器）',
+           'KIND_IMAGE' in su2 and 'player.stop()' in su2,
+           'MediaPlayer 解不了静态图，喂进去只会立刻报 '
+           'error(1, -2147483648)；不停掉上一个片源，照片还会盖在'
+           '上一部片子的画面上')
+    report('图片态的传输状态报 PLAYING（不是 STOPPED）',
+           re.search(r'transportState\s*=\s*"PLAYING"', su2) is not None,
+           '对控制点来说"一张图正在展示"就是 PLAYING。报 STOPPED 会让'
+           '手机上的界面显示成"已停止"，用户以为投屏失败')
+
+ii = body_of(svc, 'public boolean isImage()')
+report('服务对外暴露 isImage()（界面据此选通道，不自己猜）',
+       ii is not None and 'KIND_IMAGE' in ii,
+       '判据的权威来源必须在服务里 —— 界面自己猜的话，'
+       '服务说音频、界面说图片，两边就打架')
+
+report('界面有 MODE_IMAGE（第四种形态）',
+       'MODE_IMAGE' in act_code,
+       '没有这一态，图片只能落进"视频"或"音频"，两种显示都是错的')
+
+cm = body_of(act_code, 'private int currentMode()')
+report('currentMode 方法体已找到（去注释后）', cm is not None,
+       '锚点：private int currentMode()')
+if cm:
+    report('currentMode 先判 isImage（图片优先于音频/视频）',
+           'isImage()' in cm,
+           '图片不是音频，落到那个二选一里只会被判成"视频" —— 又是黑屏')
+
+am2 = body_of(act_code, 'private void applyMode(int mode)')
+report('applyMode 方法体已找到（去注释后）', am2 is not None,
+       '锚点：private void applyMode(int mode)')
+if am2:
+    report('applyMode 里图片层按形态显隐',
+           'imageView.setVisibility(' in am2 and 'MODE_IMAGE' in am2,
+           '图片层不跟着形态显隐的话，放视频时它也压在最上面'
+           '（或反过来，照片被藏起来）—— 两层同时可见时表面看"正常"，'
+           '实际在互相盖')
+    report('applyMode 里图片态隐藏 SurfaceView',
+           re.search(r'boolean\s+image\s*=\s*\(mode\s*==\s*MODE_IMAGE\)', am2) is not None
+           and re.search(r'surfaceView\.setVisibility\([^;]*idle\s*\|\|\s*image', am2)
+           is not None,
+           '图片不经过视频层，那个 Surface 上什么都没有 —— 老 MTK 平台会'
+           '露出一屏蓝底，把刚画上去的照片盖住（和 idle 态是同一个坑）')
+
+ds = body_of(act_code, 'private Bitmap decodeScaled(String uri)')
+report('decodeScaled 方法体已找到（去注释后）', ds is not None,
+       '锚点：private Bitmap decodeScaled(String uri)')
+if ds:
+    report('图片解码先量尺寸再降采样（inJustDecodeBounds + inSampleSize）',
+           'inJustDecodeBounds' in ds and 'inSampleSize' in ds,
+           '手机随手一张照片 4000×3000，直接解码要 48MB —— 这台盒子必然 OOM，'
+           '崩的是整个应用。必须先只读尺寸、算出 inSampleSize 再真解码')
+
+li = body_of(act_code, 'private void loadImage(String uri)')
+report('loadImage 方法体已找到（去注释后）', li is not None,
+       '锚点：private void loadImage(String uri)')
+if li:
+    report('图片下载解码在后台线程（不占主线程）',
+           'new Thread' in li,
+           '地址是 http://…/media/<名字>，要真的联网取。放主线程上会抛 '
+           'NetworkOnMainThreadException；即使不抛，界面也会卡住')
+
+si = body_of(act_code, 'private void showImage(String uri, Bitmap bmp)')
+report('showImage 换图时回收旧位图',
+       si is not None and 'recycle()' in si,
+       'Bitmap 占的是 native 内存，GC 看不见它。换图不 recycle，'
+       '在 0.6GB 的盒子上几张照片就能把内存耗光')
 
 sys.exit(1 if failed else 0)
 PY
@@ -1390,13 +1581,14 @@ if am:
     # 只留这一条强判据，不再单列「调用了 setVisibility」——
     # 后者是前者的前提，删掉那一行会让两条同时变红，而"红了多条"
     # 说明判据有重叠，反而定位不出到底哪儿坏了。
-    report('SurfaceView 的可见性跟着 idle 走（空闲时藏起来）',
-           re.search(r'surfaceView\.setVisibility\(idle\s*\?\s*View\.GONE',
+    report('SurfaceView 的可见性跟着 idle / 图片态走（这两种形态都要藏起来）',
+           re.search(r'surfaceView\.setVisibility\(\(?[^?]*idle[^?]*\)?\s*\?\s*View\.GONE',
                      am) is not None,
            '不隐藏的话，停止播放后那个已经没有内容的 Surface 还压在面板底下 ——'
            '老平台上视频层空着时输出的是**蓝色**，'
            '用户看到的就是"断开投屏后电视蓝屏"；'
-           '写成恒 VISIBLE、或反过来（idle 时 VISIBLE），同样等于没修')
+           '写成恒 VISIBLE、或反过来（idle 时 VISIBLE），同样等于没修。'
+           '图片态同理：照片不经过视频层，那个 Surface 只会露出一屏蓝底')
 
 pm = re.search(r'<LinearLayout\s+android:id="@\+id/panel"[\s\S]{0,400}?>', layout)
 report('layout 里找得到 panel 节点', pm is not None, '锚点：@+id/panel')
@@ -1854,10 +2046,33 @@ if bd:
            '         缺了它，部分控制点（较新的国产投屏 SDK 尤其）根本不把'
            '设备列进投屏列表 —— 而 SSDP 那边看起来一切正常，'
            '最容易被当成"手机的问题"')
-    report('设备描述刻意不声明 presentationURL',
-           '<presentationURL>' not in bd,
-           '我们没有任何 Web 界面。写 "/" 只会把 device.xml 本身喂给浏览器 ——'
-           '不声明时控制点就不画那个按钮')
+    # presentationURL 从批 2 起**要**声明了：上传页在 "/"，控制点点那个按钮
+    # 就该落到上传页。但声明它有个硬前提 —— 地址必须是"本机",不能凭空捏。
+    # 所以这里查的不是"有没有声明"，而是"声明出来的地址是从哪来的"：
+    # 必须走 handler.getLocalIp()（和 LOCATION 同源），端口必须走 getPort()
+    # （端口单一真源）。谁自己再算一遍，就会在"第一张候选网卡 joinGroup
+    # 失败、换到第二张"时分叉 —— 那时二维码里的地址能打开、
+    # 控制点按钮打开的却打不开。
+    apu = body_of(http, 'private void appendPresentationUrl(StringBuilder sb)')
+    report('appendPresentationUrl 方法体已找到', apu is not None,
+           '锚点：private void appendPresentationUrl(StringBuilder sb)')
+    if apu:
+        report('presentationURL 的地址取自 handler.getLocalIp()（与 LOCATION 同源）',
+               'handler.getLocalIp()' in apu,
+               '自己算出本机地址 = 第二处真源。SSDP 换网卡时它和 LOCATION 就分叉了')
+        report('presentationURL 的端口取自 getPort()（端口单一真源）',
+               'getPort()' in apu and '49152' not in apu,
+               '自己拼端口号（或写死 49152）= 第二处真源。'
+               'HTTP 端口会因占用而回退，写死的那份必然在回退时是错的')
+        report('拿不到有效 IP 时不声明 presentationURL',
+               re.search(r'0\.0\.0\.0', apu) is not None and 'return' in apu,
+               '空串 / 0.0.0.0 时若照写，device.xml 里就会出现'
+               'http://0.0.0.0:49152/ 这种地址 —— 控制点照着点必然打不开。'
+               '给不出就别声明（和 iconList 同一条纪律）')
+    report('buildDeviceDescription 真的调用了 appendPresentationUrl',
+           'appendPresentationUrl(sb)' in bd,
+           '方法写好了不调用 = 白写。这条专门防"改一半"：'
+           '新方法加进去、调用点忘了接')
 
 # ---- (2) 图标：声明了就必须给得出 ----
 ail = body_of(http, 'private void appendIconList(StringBuilder sb)')
@@ -1932,11 +2147,14 @@ if ra:
            '<CurrentMute>0</CurrentMute>' not in ra and 'handler.getMute()' in ra,
            '写死的话，控制点按完静音回读一次看到"没静音"，会把开关又画回去 ——'
            '和已经修过的 GetVolume 恒回 100 是同一个 bug')
-report('SINK_PROTOCOL_INFO 不声明 image/*',
-       'image/' not in http.split('SINK_PROTOCOL_INFO =')[1].split(';')[0],
-       '实现里根本没有图片这条路（kindOf 只认 audioItem / videoItem）。'
-       '这份清单是控制点判断"能不能推给我"的**唯一依据**，声明了却做不到，'
-       '控制点会把图片推过来然后必然失败')
+report('SINK_PROTOCOL_INFO 声明了 image/*（图片通道已落地）',
+       'image/jpeg' in http.split('SINK_PROTOCOL_INFO =')[1].split(';')[0]
+       and 'image/png' in http.split('SINK_PROTOCOL_INFO =')[1].split(';')[0],
+       '这条原来是反过来的：当时实现里根本没有图片这条路（kindOf 只认 '
+       'audioItem / videoItem），所以**刻意不声明** image/*。现在图片通道'
+       '（KIND_IMAGE + BitmapFactory）已经落地，清单就必须加回来 —— '
+       '这份清单是控制点判断"能不能推给我"的**唯一依据**：做到了却不声明，'
+       '相册/文件管理器就不会把照片推过来，那条通道等于白做')
 
 # ---- (5) SSDP：M-SEARCH 的 MX 随机延迟 ----
 hm = body_of(ssdp, 'private void handleMessage(String msg, DatagramPacket packet)')
