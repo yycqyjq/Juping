@@ -56,10 +56,14 @@ Juping/
 │   │   │   ├── SsdpResponder.java   组播监听 + 设备回应
 │   │   │   ├── EventDispatcher.java GENA 事件订阅与 NOTIFY 推送（自带单线程池保 SEQ 有序）
 │   │   │   └── UpnpHttpServer.java  HTTP 服务 + SOAP 控制解析 + SUBSCRIBE 路由
-│   │   └── player/
-│   │       ├── PlaybackPolicy.java         重连策略：纯逻辑，零 Android 依赖
-│   │       ├── MediaPlayerController.java  播放 + 看门狗 + 指数退避重连 + 音量状态
-│   │       └── MediaProxy.java             本地预取缓冲代理（默认关，见已知边界）
+│   │   ├── player/
+│   │   │   ├── PlaybackPolicy.java         重连策略：纯逻辑，零 Android 依赖
+│   │   │   ├── MediaPlayerController.java  播放 + 看门狗 + 指数退避重连 + 音量状态
+│   │   │   └── MediaProxy.java             本地预取缓冲代理（默认关，见已知边界）
+│   │   └── web/                     扫码网页传文件（批 0，见 .agent/web-cast-plan.md）
+│   │       ├── MultipartLite.java   流式 multipart 解析：纯逻辑，零 Android 依赖
+│   │       ├── LocalStore.java      上传落盘（内部存储）+ 剩余空间 + U 盘挂载点探测 + 防穿越
+│   │       └── WebCastEndpoints.java GET / 页 · POST /upload · POST /cast · GET /files · GET /media
 │   └── res/                         布局、配色、字符串、图标、banner
 └── tools/
     ├── build.sh              一键构建 + 出包前核验
@@ -1375,6 +1379,24 @@ bash 在 **UTF-8 locale** 下会把多字节字符的字节一起吞进变量名
 > 会自动**上移**到相邻端口，此时界面与 `/status` 里 `httpPort` 显示的是**实际**
 > 监听端口 —— 照着显示的那个地址访问即可。回退也会同步到 LOCATION，
 > 手机拿到的描述地址永远指向真正在听的端口。
+
+**扫码网页传文件（批 0，见 `.agent/web-cast-plan.md`）**：同一个 HTTP 服务还挂了一组
+网页端点 —— 浏览器打开 `http://<电视IP>:端口/`（带 `Accept: text/html`）就是上传页
+（不带该头时 `/` 仍回 `device.xml`，兼容老控制点）。相关路由：
+
+| 路由 | 作用 |
+| --- | --- |
+| `GET /` | 上传页（仅当 `Accept` 含 `text/html`；否则 device.xml） |
+| `POST /upload` | multipart 流式落盘 → `getFilesDir()/uploads`；空间预检 `411 → 413 → 507` |
+| `POST /cast` | 播放已上传的文件（复用既有渲染器） |
+| `GET /files` | 已上传文件列表 + 剩余空间（JSON） |
+| `GET /media/<名字>` | 提供媒体流（支持 `Range`/`HEAD`）—— 播放**实际走这里**，不用 `file://` |
+| `GET /status` | 诊断 JSON（含新增的 `storage` 段：上传目录 / 可用空间 / U 盘挂载点） |
+
+> **为什么不 `file://`**：真正开文件的是另一个进程 `mediaserver`（uid `media`），
+> 它穿不进应用私有目录（`drwx------`）—— 真机实测直接 `error (1, -2147483648)`。
+> 改由盒子自己的 HTTP 服务供流后，顺带修好了老芯片「视频被判成纯音频」的老毛病
+> （`getVideoWidth()` 恒 0，只能靠 `Content-Type` 探测）。详见方案 §5.2.1。
 
 电视上直接能看到诊断信息，不用连电脑：
 

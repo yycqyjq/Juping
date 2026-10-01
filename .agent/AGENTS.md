@@ -60,12 +60,23 @@ app/src/main/java/com/juping/cast/
 ├── MainActivity.java          界面：前台唤醒/播完延迟退后台（MTK 蓝屏规避）
 ├── RenameReceiver.java        adb 改名广播入口（唯一 exported 指令面）
 ├── BootReceiver.java          开机自启
-└── player/
-    ├── MediaPlayerController.java  播放+看门狗+重连+位置外推+prepare 卡死
-    │                               重建+nativePlayerDead 守卫（见 §6）
-    ├── MediaProxy.java             本地预取缓冲代理（PROXY_ENABLED 默认关：
-    │                               海信 CmpbPlayer 黑盒，详见 todo.md）
-    └── PlaybackPolicy.java         纯逻辑策略/阈值常量（桌面可测）
+├── player/
+│   ├── MediaPlayerController.java  播放+看门狗+重连+位置外推+prepare 卡死
+│   │                               重建+nativePlayerDead 守卫（见 §6）
+│   ├── MediaProxy.java             本地预取缓冲代理（PROXY_ENABLED 默认关：
+│   │                               海信 CmpbPlayer 黑盒，详见 todo.md）
+│   └── PlaybackPolicy.java         纯逻辑策略/阈值常量（桌面可测）
+└── web/                       扫码网页传文件（批 0；方案 .agent/web-cast-plan.md）
+    ├── MultipartLite.java     流式 multipart 解析（纯逻辑、零 Android 依赖）
+    ├── LocalStore.java        落盘根=getFilesDir()/uploads（**内部优先**，真机
+    │                          实测「外部存储=U 盘」已证伪原「外部优先」）；
+    │                          剩余空间；/proc/mounts 探 U 盘挂载点；防穿越
+    └── WebCastEndpoints.java  GET / 页 · POST /upload(空间预检 411/413/507) ·
+                               POST /cast · GET /files · GET /media(HTTP+Range+HEAD)
+                               ※ 媒体**不走 file://**：mediaserver 是另一进程、
+                                 穿不进 drwx------（真机证伪，见计划 §5.2.1）
+                               ※ 这里的 WebEndpoints/WebResponse 接口定义在
+                                 UpnpHttpServer 内（协议闸门编译白名单不含 web 包）
 tools/
 ├── build.sh              一键构建+六道闸门（apk/api/dex/protocol/policy/proxy/secrets）
 ├── lib.sh                各脚本共用的 JDK 定位（build.sh 与三个 run.sh 都 source 它）

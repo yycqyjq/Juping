@@ -4,6 +4,8 @@ import android.util.Log;
 
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -131,6 +133,67 @@ public class UpnpHttpServer extends Thread {
         String buildStatusJson();
     }
 
+    /**
+     * 网页端点（上传页 / 上传 / 文件列表 / 投送）。
+     *
+     * <p>定义成接口、而不是直接引用 {@code com.juping.cast.web} 里的实现，是为了让
+     * **协议闸门不必把整个 web 包编进来**：那套测试只补了一个 {@code android.util.Log}
+     * 替身就能编 dlna 包（见 tools/protocol-test/run.sh 的说明），而 web 包要 Context、
+     * 要文件系统。协议闸门只管 DLNA，不该被上传功能牵连 —— 一旦牵连，
+     * 那道闸门就再也不是"零 Android 依赖"了。
+     */
+    public interface WebEndpoints {
+        /**
+         * @return 响应；返回 {@code null} 表示「这条路径不是我管的」，交回 DLNA 既有逻辑
+         */
+        WebResponse handle(String method, String path, String accept, String contentType,
+                           String range, int contentLength, InputStream in);
+    }
+
+    /**
+     * 网页端点的响应。**只描述"回什么"，不负责怎么写出** —— 响应头里那句
+     * {@code Server: … Juping/<版本>} 的版本号是单一事实来源（{@link #serverProduct()}），
+     * 在别处再写一份就会在升版本时漏改，同一个设备在不同路径上报两个版本号。
+     */
+    public static final class WebResponse {
+        public final String status;
+        public final String contentType;
+        /** 文本响应体（HTML / JSON）。文件响应时为 null */
+        public final String body;
+
+        /**
+         * 文件响应。非 null 时忽略 {@link #body}，从文件里按偏移流式写出。
+         *
+         * <p><b>为什么不能拿 {@link #body} 装媒体</b>：它是 String，
+         * 写出去时按 UTF-8 编码 —— 二进制经过这一趟必然损坏（非法字节序列
+         * 会被替换成 U+FFFD）。而上传的视频必须一个字节不差地喂给播放器。
+         */
+        public final File file;
+        /** 文件响应的起始偏移（0 = 从头） */
+        public final long offset;
+        /** 文件响应的字节数 */
+        public final long length;
+
+        public WebResponse(String status, String contentType, String body) {
+            this(status, contentType, body, null, 0, 0);
+        }
+
+        public WebResponse(String status, String contentType, File file,
+                           long offset, long length) {
+            this(status, contentType, null, file, offset, length);
+        }
+
+        private WebResponse(String status, String contentType, String body, File file,
+                            long offset, long length) {
+            this.status = status;
+            this.contentType = contentType;
+            this.body = body;
+            this.file = file;
+            this.offset = offset;
+            this.length = length;
+        }
+    }
+
     private final int port;
     private final String uuid;
     private final String friendlyName;
@@ -145,6 +208,12 @@ public class UpnpHttpServer extends Thread {
      */
     private final String versionName;
     private final CommandHandler handler;
+
+    /**
+     * 网页端点。**可以为 null** —— 协议闸门与桌面测试不关心上传功能，
+     * 传 null 就是纯粹的历史行为（DLNA 一条不少）。
+     */
+    private final WebEndpoints web;
 
     /** GENA 事件分发。订阅状态、SEQ、超时都在这里面。 */
     private final EventDispatcher events;
@@ -233,7 +302,8 @@ public class UpnpHttpServer extends Thread {
     private static final int PORT_BIND_TRIES = 20;
 
     public UpnpHttpServer(int port, String uuid, String friendlyName, String versionName,
-                          CommandHandler handler, EventDispatcher.EventSource eventSource) {
+                          CommandHandler handler, EventDispatcher.EventSource eventSource,
+                          WebEndpoints web) {
         super("upnp-http");
         setDaemon(true);
         this.port = port;
@@ -241,6 +311,7 @@ public class UpnpHttpServer extends Thread {
         this.friendlyName = friendlyName;
         this.versionName = versionName;
         this.handler = handler;
+        this.web = web;
         this.events = new EventDispatcher(uuid, eventSource);
     }
 
@@ -471,6 +542,11 @@ public class UpnpHttpServer extends Thread {
             String ntHeader = null;         // 新订阅必带，值应为 upnp:event
             String sidHeader = null;        // 续订 / 退订必带
             String timeoutHeader = null;    // Second-1800 或 Second-infinite
+            // 网页端点要用的三个头：Accept 用来把 "/" 分给浏览器而不是 device.xml，
+            // Content-Type 用来取 multipart 的 boundary，Range 用来支持媒体拖拽。
+            String acceptHeader = null;
+            String contentTypeHeader = null;
+            String rangeHeader = null;
             for (int i = 1; i < headLines.length; i++) {
                 String line = headLines[i];
                 if (line.length() == 0) {
@@ -482,7 +558,7 @@ public class UpnpHttpServer extends Thread {
                 // SOAP 控制命令全部静默失败，而日志里看起来一切正常。
                 String lower = line.toLowerCase(java.util.Locale.ROOT);
                 if (lower.startsWith("content-length:")) {
-                    contentLength = parseInt(line.substring(15).trim(), 0);
+                    contentLength = parseContentLength(line.substring(15).trim());
                 } else if (lower.startsWith("soapaction:")) {
                     soapAction = line.substring(11).trim().replace("\"", "");
                 } else if (lower.startsWith("callback:")) {
@@ -493,6 +569,39 @@ public class UpnpHttpServer extends Thread {
                     sidHeader = line.substring(4).trim();
                 } else if (lower.startsWith("timeout:")) {
                     timeoutHeader = line.substring(8).trim();
+                } else if (lower.startsWith("accept:")) {
+                    acceptHeader = line.substring(7).trim();
+                } else if (lower.startsWith("content-type:")) {
+                    contentTypeHeader = line.substring(13).trim();
+                } else if (lower.startsWith("range:")) {
+                    rangeHeader = line.substring(6).trim();
+                }
+            }
+
+            // ---- 网页端点先分流，再走 DLNA ----
+            //
+            // 位置是硬要求，必须在下面 MAX_BODY_BYTES 那道上限检查**之前**：
+            // MAX_BODY_BYTES 是 256KB（给 SOAP / GENA 用的），而网页上传的 body
+            // 是 GB 级的 —— 顺序颠倒，每一个上传都会被 413 挡掉。
+            // 更不能让它走到下面那条一次性分配整个 body 的路径上（0.6GB 内存的盒子当场 OOM）。
+            // 同一纪律的另一半见 tools/policy-test/run.sh 里 handleConnection 的顺序断言。
+            if (web != null) {
+                WebResponse wr = web.handle(method, path, acceptHeader, contentTypeHeader,
+                        rangeHeader, contentLength, in);
+                if (wr != null) {
+                    OutputStream webOut = socket.getOutputStream();
+                    // HEAD 与 GET 必须"除了没有 body 之外完全一致"（RFC 7231 §4.3.2）——
+                    // 头里的 Content-Length / Content-Type 照报，只是不写 body。
+                    // 上传的媒体要靠这一条：播放器探测 Content-Type 时先发 HEAD，
+                    // 回错了它就把视频当音频（这台 MTK 盒子 getVideoWidth() 恒为 0）。
+                    boolean noBody = "HEAD".equals(method);
+                    if (wr.file != null) {
+                        writeMedia(webOut, wr, noBody);
+                    } else {
+                        writeSimple(webOut, wr.status, wr.contentType, wr.body, noBody);
+                    }
+                    webOut.flush();
+                    return;
                 }
             }
 
@@ -1428,7 +1537,15 @@ public class UpnpHttpServer extends Thread {
 
     private void writeSimple(OutputStream out, String status, String contentType, String body)
             throws IOException {
-        byte[] payload = body.getBytes("UTF-8");
+        writeSimple(out, status, contentType, body, false);
+    }
+
+    /**
+     * @param noBody HEAD 请求：头照报（Content-Length 与 GET 一致），只是不写 body
+     */
+    private void writeSimple(OutputStream out, String status, String contentType, String body,
+                             boolean noBody) throws IOException {
+        byte[] payload = (body == null) ? new byte[0] : body.getBytes("UTF-8");
         StringBuilder sb = new StringBuilder();
         sb.append("HTTP/1.1 ").append(status).append("\r\n");
         sb.append("Content-Type: ").append(contentType).append("\r\n");
@@ -1437,7 +1554,84 @@ public class UpnpHttpServer extends Thread {
         sb.append("Server: Android UPnP/1.0 " + serverProduct() + "\r\n");
         sb.append("\r\n");
         out.write(sb.toString().getBytes("UTF-8"));
-        out.write(payload);
+        if (!noBody) {
+            out.write(payload);
+        }
+    }
+
+    /**
+     * 把本地文件按 Range 流式写出去（网页上传的东西投屏时取的就是这条路径）。
+     *
+     * <p><b>为什么播放必须走 HTTP，而不是 {@code file://}</b>：真机实测（192.168.1.8，
+     * 2026-10-01）{@code /data/data/<包名>/files/uploads} 是 {@code drwx------}，
+     * 而真正去 open 这个文件的是**另一个进程** mediaserver（uid media）——
+     * 它既不是我们的 uid、也没有目录的通行位，只会拿到一句
+     * {@code error (1, -2147483648)}，电视上什么都不放。
+     * 改由我们自己的进程以 HTTP 提供，权限问题就不存在了。
+     *
+     * <p>顺带解决第二件事：Content-Type 探测（见
+     * {@code MediaPlayerController#scheduleContentTypeProbe}）需要一个能响应 HEAD
+     * 的 **http** 地址。这台 MTK 5880 上 {@code getVideoWidth()} 恒返回 0，
+     * 少了这一步，上传的视频会被判成纯音频 —— 画面正常放、界面却显示音乐卡片。
+     *
+     * <p>Range 不是可选功能：MP4 的拖拽与续播依赖按字节寻址，
+     * 没有它控制点一拖进度条就会从头重放。
+     */
+    private void writeMedia(OutputStream out, WebResponse wr, boolean noBody) throws IOException {
+        long total = wr.file.length();
+        long start = (wr.offset < 0) ? 0 : wr.offset;
+        if (start > total) {
+            start = total;
+        }
+        long len = (wr.length < 0) ? total - start : wr.length;
+        if (start + len > total) {
+            len = total - start;
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("HTTP/1.1 ").append(wr.status).append("\r\n");
+        sb.append("Content-Type: ").append(wr.contentType).append("\r\n");
+        sb.append("Content-Length: ").append(len).append("\r\n");
+        // 必须声明：不声明的话播放器不知道能按字节取，拖进度条就只能重下。
+        sb.append("Accept-Ranges: bytes\r\n");
+        if (start > 0 || len < total) {
+            sb.append("Content-Range: bytes ").append(start).append('-')
+              .append(start + Math.max(len, 1) - 1).append('/').append(total).append("\r\n");
+        }
+        sb.append("Connection: close\r\n");
+        sb.append("Server: Android UPnP/1.0 " + serverProduct() + "\r\n");
+        sb.append("\r\n");
+        out.write(sb.toString().getBytes("UTF-8"));
+        if (noBody || len == 0) {
+            return;
+        }
+        FileInputStream fis = new FileInputStream(wr.file);
+        try {
+            long skipped = 0;
+            while (skipped < start) {
+                // FileInputStream.skip 允许少跳（返回 0 也不代表到末尾），必须循环。
+                long n = fis.skip(start - skipped);
+                if (n <= 0) {
+                    break;
+                }
+                skipped += n;
+            }
+            byte[] buf = new byte[64 * 1024];
+            long remaining = len;
+            while (remaining > 0) {
+                int want = (int) Math.min((long) buf.length, remaining);
+                int n = fis.read(buf, 0, want);
+                if (n <= 0) {
+                    break;
+                }
+                out.write(buf, 0, n);
+                remaining -= n;
+            }
+        } finally {
+            try {
+                fis.close();
+            } catch (IOException ignored) {
+            }
+        }
     }
 
     // ------------------------------------------------------------ 小工具
@@ -1457,6 +1651,28 @@ public class UpnpHttpServer extends Thread {
             return Integer.parseInt(s.trim());
         } catch (Exception e) {
             return def;
+        }
+    }
+
+    /**
+     * 解析 {@code Content-Length}。
+     *
+     * <p><b>超出 int 时钳到 Integer.MAX_VALUE，不能当"解析失败 = 0"</b>：
+     * 真机实测（192.168.1.8，2026-10-01）一个声明 {@code Content-Length: 2200000000}
+     * 的请求被当成 0，于是回给客户端的是「411 必须带 Content-Length」——
+     * 而它明明带了。这是守卫在**谎报**：客户端会照着自己的理解去改请求，
+     * 改对不了，因为真正的原因（太大）它一个字都没被告知。
+     * 钳住之后走到下面那道上限检查，得到的就是正确的 413。
+     */
+    private static int parseContentLength(String s) {
+        try {
+            long n = Long.parseLong(s.trim());
+            if (n > Integer.MAX_VALUE) {
+                return Integer.MAX_VALUE;
+            }
+            return (int) n;
+        } catch (Exception e) {
+            return 0;
         }
     }
 

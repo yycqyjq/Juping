@@ -360,7 +360,8 @@ public class ProtocolTestServer {
         // modelNumber 与 SERVER 头就是这个值 —— 这能证明「版本号真的从
         // 构造函数贯通到了协议层」，而不是两处碰巧都写着同一个常量。
         UpnpHttpServer server = new UpnpHttpServer(port, UUID, "聚屏-TESTBOX", TEST_VERSION,
-                handler, source);
+                handler, source,
+                null);   // 网页端点传 null —— 这里只验 DLNA，上传功能不归这套靶机管
         SERVER = server;
 
         // 给一份真图标，让驱动能验"声明了就必须给得出"这条纪律：
