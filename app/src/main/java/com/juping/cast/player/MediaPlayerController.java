@@ -1083,11 +1083,21 @@ public class MediaPlayerController {
      */
     private void applyVolume() {
         if (player == null || playerReleased || nativePlayerDead) {
+            // 批 0 取证：「音量调不动」的判据 ② —— 若这里提前 return，
+            // 说明音量只是被记下来了、根本没下发到播放器。把三个闸门各自的值
+            // 一起打出来，就能区分是哪一道挡住的（player 为 null / 已 release /
+            // native 已死），不用再猜。
+            Log.i(TAG, "取证 音量未下发（提前 return）：player=" + (player != null)
+                    + " released=" + playerReleased + " dead=" + nativePlayerDead
+                    + " 目标=" + Math.round(volume * 100f));
             return;
         }
         try {
             float v = muted ? 0f : volume;
             player.setVolume(v, v);
+            // 批 0 取证：确确实实下发到了播放器实例。配合上面那条，
+            // 就能把「控制点说了 / 我们记了 / 播放器收到了」三层分开看。
+            Log.i(TAG, "取证 音量已下发: " + v + "（muted=" + muted + "）");
         } catch (Exception e) {
             Log.w(TAG, "应用音量失败", e);
         }

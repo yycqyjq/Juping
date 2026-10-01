@@ -1143,9 +1143,15 @@ public class DlnaRendererService extends Service
 
     @Override
     public void onSetVolume(int volume0to100) {
+        // 批 0 取证：「音量调不动」的判据 ①/② 之间的那一环 ——
+        // 控制点说设成 N，我们收没收到、有没有 player 可下发、回读又是多少。
+        // 三行连起来看，就能定位到底是「没收到」「没下发」还是「下发了但听不出来」。
+        Log.i(TAG, "取证 收到音量: " + volume0to100 + "，可下发=" + (player != null)
+                + "，下发前回读=" + getVolume0to100());
         if (player != null) {
             player.setVolume(Math.max(0f, Math.min(1f, volume0to100 / 100f)));
         }
+        Log.i(TAG, "取证 音量下发后回读=" + getVolume0to100());
         // 音量事件：控制点上同时可能有好几个遥控器（手机、平板），
         // 不推的话另一个界面上的音量条会一直停在旧值。
         notifyEvent("RenderingControl");

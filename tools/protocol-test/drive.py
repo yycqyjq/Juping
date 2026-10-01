@@ -1383,6 +1383,36 @@ check('被拒之后服务照常工作（没有被打死）', _st.startswith('HTT
 _st, _, _ = soap_post('GetTransportInfo', SVC_AVT, '')
 check('反面对照：正常大小的 body 照常受理', _st.startswith('HTTP/1.1 200'), _st)
 
+# --- ①b body 读不满时必须回一条响应（而不是静默关连接）---
+# 「芒果 TV 一直连接中」的根因候选之一就在这条路径上：控制点声明了
+# Content-Length 却少发 / 不发 body，原来的实现读完就一声不响地把连接关掉 ——
+# 控制点既等不到成功也等不到失败，界面就一直停在「连接中」。
+# 判据见 .agent/mangotv-compat-plan.md §7 的 B。
+# 手法：声明 100 字节、只发 5 字节，然后 shutdown(WR) 半关，让服务端读到 EOF
+# （不半关的话服务端会阻塞到自己的 10 秒超时，那时它是走异常分支、发不出 400）。
+_short = socket.create_connection((HOST, PORT), timeout=8)
+_short_resp = b''
+try:
+    _short.sendall(('POST /upnp/control/AVTransport HTTP/1.1\r\n'
+                    'Host: %s:%d\r\n'
+                    'SOAPAction: "urn:x#y"\r\n'
+                    'Content-Length: 100\r\n\r\n' % (HOST, PORT)).encode())
+    _short.sendall(b'12345')
+    _short.shutdown(socket.SHUT_WR)
+    _short.settimeout(8)
+    _short_resp = _short.recv(4096)
+except Exception:
+    _short_resp = b''
+finally:
+    try:
+        _short.close()
+    except Exception:
+        pass
+check('body 读不满时回一条响应（400），不静默关连接',
+      b'400' in _short_resp,
+      _short_resp.split(b'\r\n')[0].decode('iso-8859-1', 'replace')
+      or '(无响应，连接被直接关掉)')
+
 # --- ② 并发连接上限 ---
 # 开一批连接但**一个字都不发**：服务端每条都会占住一个线程（阻塞在 read 上）。
 # 无上限的话，一个端口扫描就能把 1MB/线程的栈吃光。

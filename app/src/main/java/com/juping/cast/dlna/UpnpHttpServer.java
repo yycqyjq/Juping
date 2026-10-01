@@ -562,6 +562,13 @@ public class UpnpHttpServer extends Thread {
             String acceptHeader = null;
             String contentTypeHeader = null;
             String rangeHeader = null;
+            // ---- 三类「取证头」：只收集，不改变任何处理逻辑 ----
+            // 芒果 TV 投屏卡在「连接中」的归因全靠这几个：Expect 决定客户端会不会
+            // 等 100-continue（G1）、Transfer-Encoding 决定它是不是 chunked（G2）、
+            // User-Agent 决定到底是不是它。
+            String uaHeader = null;
+            String expectHeader = null;
+            String transferEncodingHeader = null;
             for (int i = 1; i < headLines.length; i++) {
                 String line = headLines[i];
                 if (line.length() == 0) {
@@ -590,6 +597,29 @@ public class UpnpHttpServer extends Thread {
                     contentTypeHeader = line.substring(13).trim();
                 } else if (lower.startsWith("range:")) {
                     rangeHeader = line.substring(6).trim();
+                } else if (lower.startsWith("user-agent:")) {
+                    uaHeader = line.substring(11).trim();
+                } else if (lower.startsWith("expect:")) {
+                    expectHeader = line.substring(7).trim();
+                } else if (lower.startsWith("transfer-encoding:")) {
+                    transferEncodingHeader = line.substring(18).trim();
+                }
+            }
+
+            // ---- 批 0 取证：请求头摘要 ----
+            // INFO 只记「异常形态」—— POST 控制面、或带 Expect / Transfer-Encoding 的
+            // 那次请求。其余（高频轮询 GET / SUBSCRIBE）走 DEBUG，否则会把日志刷爆。
+            // 判据见 .agent/mangotv-compat-plan.md §7 的 A/B/C/D/E 五条。
+            {
+                String headSummary = method + " " + path + " len=" + contentLength
+                        + " ua=" + uaHeader
+                        + " expect=" + expectHeader
+                        + " te=" + transferEncodingHeader;
+                if ("POST".equals(method) || expectHeader != null
+                        || transferEncodingHeader != null) {
+                    Log.i(TAG, "取证 请求头: " + headSummary);
+                } else {
+                    Log.d(TAG, "取证 请求头: " + headSummary);
                 }
             }
 
@@ -649,8 +679,24 @@ public class UpnpHttpServer extends Thread {
                 }
                 read += n;
             }
+            // body 读不满（客户端声明了 N 字节却少发/不发）时，**仍然回一条响应**。
+            // 原来这里一声不响地往下走，body 是截断的、控制点那头只看到连接被关，
+            // 表现就是「一直连接中」（它既拿不到成功也拿不到失败）。回 400 并记下
+            // 期望/实收字节数 —— 这正是判据 B「body 是空的」要看的证据。
+            if (read < contentLength) {
+                Log.w(TAG, "取证 body 读不满：期望 " + contentLength + " 字节，实收 " + read
+                        + " 字节，回 400（不静默关连接）");
+                OutputStream shortOut = socket.getOutputStream();
+                writeSimple(shortOut, "400 Bad Request", "text/plain", "");
+                shortOut.flush();
+                return;
+            }
             // body 才是可能含非 ASCII 的部分，按 UTF-8 解
             String body = new String(bodyBytes, 0, read, "UTF-8");
+            // 原始 body 摘要（DEBUG，截断前 200 字符）。判据 B/C 要看「body 是空的」
+            // 还是「动作元素前缀不是 u:」—— 只在 DEBUG 级，高频轮询不会刷屏。
+            Log.d(TAG, "取证 body(" + read + "/" + contentLength + "): "
+                    + (body.length() > 200 ? body.substring(0, 200) + "…" : body));
 
             OutputStream out = socket.getOutputStream();
             String initialSid = null;
@@ -818,6 +864,9 @@ public class UpnpHttpServer extends Thread {
         if (withBody && r.payload.length > 0) {
             out.write(r.payload);
         }
+        // 批 0 取证：判据 D（G5 播放线程被拖后）靠「收到 SetAVTransportURI」与
+        // 「已回 200」两条日志的时间差算间隔。
+        Log.d(TAG, "取证 已回 " + (r.found ? "200 OK" : "404 Not Found"));
     }
 
     // ------------------------------------------------------------- 设备图标
@@ -1169,6 +1218,14 @@ public class UpnpHttpServer extends Thread {
 
         try {
             Map<String, String> args = extractArguments(body);
+
+            // 批 0 取证：把 RenderingControl 的入参原样记下来。
+            // 「音量调不动」的判据 ①（控制点到底发没发）就靠这一行 ——
+            // 它发的若走 dB 通道（SetVolumeDB），会先在 isKnownAction 被挡下、
+            // 记成「不支持的 action，回 401 Fault: SetVolumeDB」，两行一起看即可定位。
+            if ("RenderingControl".equals(service)) {
+                Log.i(TAG, "取证 音量指令: " + action + " " + args);
+            }
 
             // ---- 「语法合法、但我们做不到」的指令必须如实回 701 ----
             // Next / Previous 在 AVTransport:1 里是**必选** action（规范要求它们存在），
@@ -1606,6 +1663,10 @@ public class UpnpHttpServer extends Thread {
         if (!noBody) {
             out.write(payload);
         }
+        // 批 0 取证：一行「已回 <状态码>」。判据 D 靠它算「收到指令」到「响应写出」
+        // 的间隔；判据 A/B（客户端发了 Expect/chunked，我们没接住）靠它确认
+        // 到底有没有回过东西。
+        Log.d(TAG, "取证 已回 " + status);
     }
 
     /**
