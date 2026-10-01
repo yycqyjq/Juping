@@ -247,7 +247,7 @@ public class UpnpHttpServer extends Thread {
         return System.currentTimeMillis() - lastControlAt;
     }
 
-    /** 当前存活的（未过期）事件订阅数（Auto-Stop 判据用） */
+    /** 当前投递得通的（未过期且回调可达）事件订阅数（Auto-Stop 判据用） */
     public int aliveSubscriberCount() {
         return events.aliveSubscriberCount();
     }

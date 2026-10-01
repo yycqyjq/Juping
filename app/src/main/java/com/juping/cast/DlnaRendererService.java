@@ -288,6 +288,22 @@ public class DlnaRendererService extends Service
     private volatile boolean audioOnly = false;
 
     /**
+     * 元数据判成视频、但画面**根本没解出来** —— 电视上是一片纯黑，声音正常。
+     *
+     * <p>为什么非要单独记一笔：厂商把「画面编码不支持」当 **info** 事件发（不中断
+     * 播放、不走 onError），应用无从感知，{@link #audioOnly} 也照样是 false
+     * （形态确实是视频）。结果就是用户对着黑屏，连「是不是坏了」都判断不了。
+     * 置位之后界面在顶部状态条上把原因写出来 —— 那地方本来就是留给
+     * 「黑屏时唯一能看到的线索」的。
+     *
+     * <p>置位点在 {@link #onVideoCodecUnsupported}（厂商 info 事件驱动），
+     * 复位点在 {@link #onSetUri} / {@link #onSourceChanged}（换片）。根因、
+     * 以及「为什么不能用 getVideoWidth() 判断」的实测对照表见
+     * {@link PlaybackPolicy#INFO_VIDEO_CODEC_NOT_SUPPORT}。
+     */
+    private volatile boolean videoMissing = false;
+
+    /**
      * 界面是否由「投屏到达」自动唤起且尚未消费。
      * 置位在 {@link #bringPlayerToFront()}，消费在 MainActivity 的
      * 「播放→空闲」变迁（退回后台）。volatile：写在前台唤起路径，
@@ -656,7 +672,7 @@ public class DlnaRendererService extends Service
             startedAtMs = System.currentTimeMillis();
         }
         clearError();
-        kindFromMetadata = kindOf(metadata);
+        kindFromMetadata = kindOfAny(uri, metadata);
         // 元数据原样留着（协议回读要用），另外解析一份标题给界面。
         // 解析失败不抛异常 —— DidlLite 取不到就返回空串，界面回退到文件名。
         currentMetadata = metadata == null ? "" : metadata;
@@ -667,6 +683,9 @@ public class DlnaRendererService extends Service
         // 还没 prepare，先按元数据猜一个；等 onPrepared 拿到真实视频尺寸再定论。
         // 这样从"收到投屏"到"画面出来"这段时间界面形态就是对的，不会先黑一下再跳。
         audioOnly = (kindFromMetadata == KIND_AUDIO);
+        // 上一部片子可能正挂着「画面没出来」的结论，换片必须先撤掉：
+        // 否则新片源一上来就顶着上一部的黑屏告警，等于谎报军情。
+        videoMissing = false;
         if (kindFromMetadata == KIND_IMAGE) {
             // 图片**不走 MediaPlayer** —— 它解不了静态图，喂进去只会立刻报错，
             // 电视上什么都不显示（实测就是一块黑屏）。真正的画面由
@@ -910,6 +929,56 @@ public class DlnaRendererService extends Service
         return KIND_UNKNOWN;
     }
 
+    /**
+     * 形态判定：先问元数据，元数据答不上来再问地址尾巴上的扩展名。
+     *
+     * <p><b>为什么必须有第二个信号（真机踩到的）</b>：控制点只给了 {@code dc:title}、
+     * 没给 {@code upnp:class}，媒体服务器又把 Content-Type 报成
+     * {@code application/octet-stream}，而这台盒子的 {@code getVideoWidth()} 恒返回 0 ——
+     * 三路信号全哑，一个 6 秒的**真视频**被判成「纯音频」，电视上弹出音乐卡片
+     * 把画面整个盖住。用户看到的就是「投上去了但没有画面」。
+     *
+     * <p>扩展名是第四路信号，而且它几乎总在：控制点推的地址大多以真实文件名结尾。
+     */
+    private static int kindOfAny(String uri, String metadata) {
+        int kind = kindOf(metadata);
+        if (kind != KIND_UNKNOWN) {
+            return kind;
+        }
+        int byExtension = kindOfUrl(uri);
+        if (byExtension != KIND_UNKNOWN) {
+            // 取证：形态是靠扩展名定的，而不是靠元数据 —— 下次再出"形态不对"，
+            // 有没有这一行决定了能否一眼看出是哪路信号失效。
+            Log.i(TAG, "元数据没判出形态（无 upnp:class？），改按地址扩展名 ."
+                    + extensionOf(uri) + " 定形态");
+        }
+        return byExtension;
+    }
+
+    /**
+     * 按地址（URL 或文件名）的扩展名判形态；判不出来返回 {@link #KIND_UNKNOWN}。
+     *
+     * <p><b>只认确定的那几个</b>。拿不准的一律不猜，比如 {@code .m3u8}（HLS 既可能
+     * 是视频、也可能是纯音频网络电台）—— 猜错方向的代价不对称：音频被判成视频，
+     * 画面黑着但声音在放；视频被判成音频，音乐卡片把画面整个盖住，用户根本看不到东西。
+     * 所以宁可留给 {@code onPrepared} 与 Content-Type 探测去定论。
+     */
+    private static int kindOfUrl(String uri) {
+        if (uri == null || uri.length() == 0) {
+            return KIND_UNKNOWN;
+        }
+        if (isImageName(uri)) {
+            return KIND_IMAGE;
+        }
+        if (isAudioName(uri)) {
+            return KIND_AUDIO;
+        }
+        if (isVideoName(uri)) {
+            return KIND_VIDEO;
+        }
+        return KIND_UNKNOWN;
+    }
+
     @Override
     public void onPlay() {
         if (player != null) {
@@ -994,11 +1063,59 @@ public class DlnaRendererService extends Service
                 || "gif".equals(ext) || "bmp".equals(ext) || "webp".equals(ext);
     }
 
-    /** 小写扩展名（不含点）；没有点则返回空串 */
+    /**
+     * 小写扩展名（不含点）；没有点则返回空串。
+     *
+     * <p><b>既能吃文件名，也能吃 URL</b>：URL 上的查询串/锚点会污染扩展名
+     * （{@code …/a.mp4?token=xx} 直接取最后一个点的后半段会得到 {@code mp4?token=xx}），
+     * 所以先把它们切掉。
+     *
+     * <p>还要挡住「路径里有句点却没有扩展名」的情况：{@code http://h/1.2/video}
+     * 取出来的是 {@code 2/video}，{@code http://h/video.2019} 取出来的是 {@code 2019} ——
+     * 都不是扩展名。只认纯字母数字、不超过 5 位的尾巴，其余一律当"没有扩展名"。
+     */
     private static String extensionOf(String name) {
         String n = name.toLowerCase(java.util.Locale.ROOT);
+        int cut = n.indexOf('?');
+        if (cut >= 0) {
+            n = n.substring(0, cut);
+        }
+        cut = n.indexOf('#');
+        if (cut >= 0) {
+            n = n.substring(0, cut);
+        }
         int dot = n.lastIndexOf('.');
-        return dot < 0 ? "" : n.substring(dot + 1);
+        if (dot < 0) {
+            return "";
+        }
+        String ext = n.substring(dot + 1);
+        if (ext.length() == 0 || ext.length() > 5) {
+            return "";
+        }
+        for (int i = 0; i < ext.length(); i++) {
+            char c = ext.charAt(i);
+            if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) {
+                return "";
+            }
+        }
+        return ext;
+    }
+
+    /**
+     * 按扩展名判是不是视频。
+     *
+     * <p>列进来的都是明确"有画面"的容器。{@code m3u8}（HLS）**刻意不收** ——
+     * 它既可能是视频、也可能是纯音频网络电台，见 {@link #kindOfUrl} 里那条
+     * "拿不准就不猜"的说明。
+     */
+    private static boolean isVideoName(String name) {
+        String ext = extensionOf(name);
+        return "mp4".equals(ext) || "m4v".equals(ext) || "mkv".equals(ext)
+                || "avi".equals(ext) || "mov".equals(ext) || "webm".equals(ext)
+                || "flv".equals(ext) || "ts".equals(ext) || "m2ts".equals(ext)
+                || "wmv".equals(ext) || "mpg".equals(ext) || "mpeg".equals(ext)
+                || "3gp".equals(ext) || "rmvb".equals(ext) || "asf".equals(ext)
+                || "ogv".equals(ext) || "vob".equals(ext) || "mts".equals(ext);
     }
 
     /**
@@ -1135,8 +1252,9 @@ public class DlnaRendererService extends Service
         currentUri = uri;
         currentMetadata = metadata == null ? "" : metadata;
         currentTitle = DidlLite.title(currentMetadata);
-        kindFromMetadata = kindOf(currentMetadata);
+        kindFromMetadata = kindOfAny(uri, currentMetadata);
         audioOnly = (kindFromMetadata == KIND_AUDIO);
+        videoMissing = false;
         Log.i(TAG, "自动续播已切换片源: " + currentUri);
         notifyEvent("AVTransport");
     }
@@ -1185,6 +1303,22 @@ public class DlnaRendererService extends Service
     /** 当前是不是纯音频流。界面据此决定显示音乐卡片还是视频画面。 */
     public boolean isAudioOnly() {
         return audioOnly;
+    }
+
+    /**
+     * 「形态是视频，画面却没出来」—— 要投的是视频，播放器却**根本没解出画面**。
+     *
+     * <p>界面据此在顶部状态条上写原因。不写的话，用户看到的是一块**没有任何解释的
+     * 纯黑**：声音在放、进度在走、圆点还是绿的，他没法判断是盒子坏了、网卡了、
+     * 还是这段视频本身放不了。真机实证见
+     * {@link PlaybackPolicy#INFO_VIDEO_CODEC_NOT_SUPPORT}。
+     *
+     * <p>刻意**不动** {@link #isAudioOnly()}：形态判定是对的（确实是视频），
+     * 出问题的是画面。把 audioOnly 翻成 true 会弹出一张「音乐投屏」卡片 ——
+     * 那是在替用户改口供，比黑屏更难解释。
+     */
+    public boolean isVideoMissing() {
+        return videoMissing;
     }
 
     /**
@@ -1359,7 +1493,39 @@ public class DlnaRendererService extends Service
         }
         Log.i(TAG, "已就绪，时长 " + durationMs + "ms，"
                 + (audioOnly ? "纯音频（音乐投屏）" : "含视频画面"));
+        // 「画面到底出不出来」不在这里判断 —— 这台盒子上 getVideoWidth() 恒为 0，
+        // 判断不了。改由厂商的 info 事件告知，见 onVideoCodecUnsupported()。
         // 时长/片源到这一步才真正确定，补一次事件让控制点的进度条能算比例
+        notifyEvent("AVTransport");
+    }
+
+    /**
+     * 厂商说这段视频的**画面**编码解不了 —— 电视上会是**一片纯黑、声音正常**。
+     *
+     * <p>为什么不看 {@code getVideoWidth()}：真机对照实测（同一个盒子，HEVC 与
+     * H.264 各跑 2~3 遍）显示它两边**恒为 0** —— 画面走的是厂商硬件图层，框架
+     * 压根不知道尺寸。拿它当判据会把正常视频一起冤枉成"编码不支持"（第一版
+     * 修复正是这么写的，被反面控制抓出来了）。唯一能区分两者的信号就是厂商这个
+     * info 事件，证据表见 {@link PlaybackPolicy#INFO_VIDEO_CODEC_NOT_SUPPORT}。
+     *
+     * <p>只在**元数据判成视频**时才采纳：音频流若也有编码不支持，厂商发的是同
+     * 一个码，这时说"画面编码不支持"就成了谎报 —— 用户听到的是没声音，不是黑屏。
+     *
+     * <p>不改 {@link #audioOnly}：形态确实是视频，改它会让界面弹出「音乐投屏」
+     * 卡片，等于替用户改口供（他明明投的是视频）。另记一笔 {@link #videoMissing}，
+     * 界面据此在黑屏上把原因写出来。
+     */
+    @Override
+    public void onVideoCodecUnsupported(String detail) {
+        if (kindFromMetadata != KIND_VIDEO) {
+            return;
+        }
+        if (videoMissing) {
+            return;
+        }
+        videoMissing = true;
+        Log.w(TAG, "这段视频的画面编码这台电视解不了（声音正常在放，电视上是纯黑）。"
+                + "已在顶部状态条上说明。详情: " + detail);
         notifyEvent("AVTransport");
     }
 
@@ -1533,8 +1699,10 @@ public class DlnaRendererService extends Service
      *
      * <p>判据（全部满足才停）：<br>
      * ① 正在播放；<br>
-     * ② 存活订阅数为 0 —— 订阅由控制点周期续订，续订停止 = 控制点真的走了
-     *    （阈值授予 300s 起，所以本检查的响应下限是订阅超时，不是 30 秒）；<br>
+     * ② 投递得通的订阅数为 0 —— 订阅由控制点周期续订，续订停止 = 控制点真的走了
+     *    （阈值授予 300s 起，所以本检查的响应下限是订阅超时，不是 30 秒）；
+     *    回调连接连续被拒的订阅**不算**：它已经收不到任何事件了，算它活着
+     *    会让电视守着一条死订阅永远不停；<br>
      * ③ 本轮播放期间曾有订阅者 —— 从未订阅过的控制点（纯投放型）不受
      *    此机制影响，绝不误停；<br>
      * ④ 距最后一次控制指令超过 {@link PlaybackPolicy#AUTO_STOP_AFTER_MS}。
@@ -1558,7 +1726,10 @@ public class DlnaRendererService extends Service
         }
         Log.w(TAG, "控制点已离开（无订阅者，最后指令 " + (idleMs / 1000)
                 + "s 前），自动停止投屏");
-        player.stop();
+        // 必须走 onStop() 而不是 player.stop()：后者只把播放器停下来，
+        // currentUri 还挂着 —— MainActivity.isPlaying() 在时长归零后会退化成
+        // 「有没有 URI」来判断，于是电视停在音乐界面、冻在结束位置，永远不回空闲。
+        onStop();
     }
 
     private void checkThreadsAlive() {

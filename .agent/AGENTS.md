@@ -107,7 +107,7 @@ tools/
 ├── apk_info.py           APK 包名/minSdk 解析
 ├── make_icon.py          位图资源生成（纯标准库）
 ├── protocol-test/        DLNA 协议一致性 245 项（桌面 JVM + 真实协议栈桩）
-├── policy-test/          播放策略 57 断言 + 306 源码级守卫
+├── policy-test/          播放策略 78 断言 + 364 源码级守卫
 ├── proxy-test/           MediaProxy 字节一致性 11 项
 └── web-test/             MultipartLite + sanitize 网页逻辑一致性（32 项）
 ```
@@ -123,13 +123,13 @@ tools/
 | verify_dex | R8 后框架回调/Thread 子类/协议常量存活 | 全量 |
 | verify_protocol | DLNA 协议一致性（drive.py，期望 245/245） | 245 |
 | ↳ 内含 probe | 控制点自检（**33 或 34 双态**：组播回退分支） | 33/34 |
-| verify_policy | 播放策略 57 断言 + 306 源码级守卫 | 57+ |
+| verify_policy | 播放策略 78 断言 + 364 源码级守卫 | 78+ |
 | ↳ 内含计数 | 文档里的用例总数 ↔ 闸门期望值（`check_gate_counts.py`，覆盖协议/代理/网页/probe/策略） | 一致性 |
 | verify_proxy | MediaProxy 字节一致性（全量/Range/回拖/EOS/中途重连） | 11 |
 | verify_web | multipart 解析逐字节一致 / 名字编码 / 上传页零外链 | 32 |
 | verify_secrets | 密钥泄漏 | 零命中 |
 
-**总数守卫是特性**：协议 245、probe 33/34 双态（组播回退分支）、策略 57、网页逻辑一致性 32 项。
+**总数守卫是特性**：协议 245、probe 33/34 双态（组播回退分支）、策略 78、网页逻辑一致性 32 项。
 有意增删断言后必须同步 build.sh / run.sh 里的期望值。
 
 **计数单一事实来源**：策略的断言/守卫数，以及协议/proxy/web/probe 的用例总数，
@@ -239,7 +239,16 @@ adb -s 192.168.1.8:5555 logcat -v time > /tmp/tv_session.log 2>&1
 
 ## 7. 当前状态指针
 
-- 版本 0.1.7（versionCode 8），全部推送 GitHub（main）。
+- 版本 0.1.13（versionCode 14），全部推送 GitHub（main）。
+- **发版规则（用户定的，每次打包都要遵守）**：改 `app/build.gradle` 的
+  `versionName`，界面「版本」那一行读的就是它（不写死字面量）。
+  **小更新**（修 bug、小改进）→ 改最后一位（0.1.12 → 0.1.13）；
+  **中等更新**（新能力、行为变更）→ 改中间那位、末位归零（0.1.13 → 0.2.0）。
+  `versionCode` 每次递增 1（只给系统比新旧用，**界面上不显示**）。
+- **结束投屏只有一个入口：遥控器返回键**（`MainActivity.onKeyDown` → `service.onStop()`）。
+  用户明确否掉了「播完 N 秒无控制指令就自动收尾」那种替用户猜意图的做法 ——
+  别再往服务里加「自动回空闲」的判据。Auto-Stop（`checkAutoStop`）是另一回事：
+  它管的是「还在播、控制点却真的走了」，判据是订阅者数，且从不过问 STOPPED 态。
 - 未完成/观察项清单：`.agent/todo.md` §五（真机发现）、§六（生态调研 P1/P2）。
 - 代理（MediaProxy）默认关：CmpbPlayer 黑盒两症状未定根因，开
   `PlaybackPolicy.PROXY_ENABLED=true` 可继续迭代。

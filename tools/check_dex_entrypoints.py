@@ -69,6 +69,10 @@ FRAMEWORK_INTERFACES = {
     'Landroid/media/MediaPlayer$OnPreparedListener;': ['onPrepared'],
     'Landroid/media/MediaPlayer$OnCompletionListener;': ['onCompletion'],
     'Landroid/media/MediaPlayer$OnErrorListener;': ['onError'],
+    # 「画面编码解不了」全靠厂商这个 info 事件告知（这台盒子上 getVideoWidth()
+    # 恒为 0，判断不了画面出没出来）。证据表见
+    # PlaybackPolicy.INFO_VIDEO_CODEC_NOT_SUPPORT。
+    'Landroid/media/MediaPlayer$OnInfoListener;': ['onInfo'],
     'Landroid/media/MediaPlayer$OnSeekCompleteListener;': ['onSeekComplete'],
     'Landroid/media/MediaPlayer$OnBufferingUpdateListener;': ['onBufferingUpdate'],
     'Landroid/media/MediaPlayer$OnVideoSizeChangedListener;': ['onVideoSizeChanged'],

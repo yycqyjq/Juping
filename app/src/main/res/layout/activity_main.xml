@@ -314,6 +314,32 @@
                     android:textSize="18sp" />
             </LinearLayout>
 
+            <!-- 版本号：排障第一个要问的就是「盒子上到底是哪一版」。
+                 内容来自 BuildConfig（build.gradle 的 versionName/versionCode），
+                 不写死字面量 —— 写死就会出现「APK 是 0.1.9、界面还写着 0.1.8」
+                 这种骗人的情况。 -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="96dp"
+                    android:layout_height="wrap_content"
+                    android:text="@string/label_version"
+                    android:textColor="@color/text_hint"
+                    android:textSize="16sp" />
+
+                <TextView
+                    android:id="@+id/info_version"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="16sp" />
+            </LinearLayout>
+
             <LinearLayout
                 android:id="@+id/row_source"
                 android:layout_width="match_parent"

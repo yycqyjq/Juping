@@ -7,10 +7,11 @@
     <string name="label_address">地址</string>
     <string name="label_network">网络</string>
     <string name="label_state">状态</string>
+    <string name="label_version">版本</string>
     <string name="label_source">片源</string>
 
     <string name="guide_title">在手机上开始投屏</string>
-    <string name="guide_body">打开手机 App 的投屏功能（腾讯视频 / 网易云音乐等已实测可用），\n选择下面这个名字</string>
+    <string name="guide_body">打开手机 App 的投屏功能\n选择下面这个名字</string>
 
     <!-- 二维码那一块。文案只说"手机扫码"，因为码旁边就是地址 ——
          扫不出来的话照着上面那行地址手输也一样。 -->
@@ -29,6 +30,9 @@
          放进资源而不是在代码里拼字符串，是因为拼接出来的文本无法翻译，
          也无法适配从右到左的语言。 -->
     <string name="fmt_address">%1$s:%2$d</string>
+    <!-- 版本号，取构建产物里的 versionName（不写死字面量）。
+         versionCode 是给系统比较新旧用的整数，界面上不必出现 —— 用户看的是"版本 0.1.11"。 -->
+    <string name="fmt_version">%1$s</string>
     <string name="fmt_progress">%1$s / %2$s</string>
     <string name="fmt_state_error">出错：%1$s</string>
 
@@ -61,4 +65,12 @@
     <string name="music_title">音乐投屏</string>
     <string name="music_live">正在播放</string>
     <string name="music_hint">声音正在播放 · 这个片源没有画面</string>
+
+    <!-- 画面解不出来时顶部状态条上的说明。
+         用户面对的是**一片纯黑**（声音在放、进度在走、圆点还是绿的），这条是
+         唯一能告诉他"不是坏了，是这台电视解不了该画面编码"的东西。真机实证见
+         PlaybackPolicy.INFO_VIDEO_CODEC_NOT_SUPPORT。
+         必须给一个可执行的动作（改用 H.264），只说"不支持"等于没说 ——
+         用户不会知道下一步该干什么。 -->
+    <string name="hint_video_unsupported">画面编码不支持（声音正常）· 建议改用 H.264 投屏</string>
 </resources>

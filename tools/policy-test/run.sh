@@ -1025,6 +1025,14 @@ report('Auto-Stop 判据：播放中 + 无订阅者 + 曾有订阅者 + 指令�
 report('Auto-Stop 挂在服务自检看门狗里',
        'checkAutoStop();' in svc,
        '服务已有 30 秒自检节拍，复用它而不是另起线程')
+# ---- ⑯ 收尾必须回空闲：onStop() 清片源，不能只 player.stop() ----
+# 真机现象（用户报）：音乐投屏没有"关闭"的地方 —— 一首歌播完，电视就停在
+# 音乐界面、冻在结束位置不动。根因是收尾只停了播放器、没清 currentUri，
+# MainActivity.isPlaying() 时长归零后退化成「有没有 URI」，于是永远非空闲。
+_auto = body_of(strip_comments(svc), 'private void checkAutoStop()')
+report('Auto-Stop 收尾走 onStop()（清片源回空闲）',
+       _auto is not None and 'onStop();' in _auto and 'player.stop()' not in _auto,
+       '只 player.stop() 的话 currentUri 还挂着，电视停在音乐界面不回引导页')
 report('/status 诊断页（浏览器可达，排障不需要 adb）',
        '/status' in http and 'buildStatusJson' in http and 'buildStatusJson' in svc,
        'gmrender 生态的 upnp-display 用小屏显示状态 —— 我们的「显示屏」'
@@ -1122,6 +1130,18 @@ if gp:
     report('外推结果钳到时长（不越过片尾）',
            'est > dur' in gp,
            '外推是估出来的：越过时长的进度条会把「还剩多少」算成负数')
+    report('seek 在飞期间不采位置水位线（防旧位置顶掉 seekTo 对齐的水位线）',
+           re.search(r'boolean\s+seekInFlight\s*=[^;]*pendingSeekLanded', gp) is not None
+           and re.search(r'!\s*seekInFlight\s*&&\s*raw\s*>\s*hiRaw', gp) is not None,
+           'seekTo 对齐了水位线，但往回拖时 player 还停在旧位置、旧位置比目标大：'
+           '不挡住的话下一次轮询（网易云 15 次/秒）就把水位线顶回旧位置，'
+           '落地后的位置低于水位线，外推便拿旧位置当基准 —— '
+           '手机进度条卡 2 秒再跳回原处，看起来就是"拖了没生效"')
+    report('seek 在飞期间也不采「假 EOS」水位线 maxPlayedMs',
+           re.search(r'!\s*seekInFlight\s*&&\s*raw\s*>\s*maxPlayedMs', gp) is not None,
+           '厂商播放器在 seekTo 之后的几十毫秒里会报出≈(时长-1 秒)的位置：采进去'
+           '会让紧随其后的假 EOS 看起来"离片尾只差 1 秒"→ 判成真播完 → 报 STOPPED'
+           '（真机第一首：Seek 200000ms 后 167ms 来 EOS，263000ms/264000ms）')
 if gp:
     report('getPosition 在 seek 待决期间返回目标值（乐观值）',
            re.search(r'return\s+\(int\)\s*pending', gp) is not None,
@@ -1140,6 +1160,36 @@ if cs:
     report('checkStall 在 seek 待决期间跳过（否则慢 seek 会被判成卡死）',
            'pendingSeekMs' in cs,
            'seek 未落地时位置本来就不动 —— 看门狗会重连，而重连把播放拉回开头')
+    # ---- 「起播了，但一直没出声」 ----
+    # 厂商栈偶发「prepare 成功、状态报 PLAYING，音频却根本没推出去」：
+    # 位置从起播那一刻起恒为 0。真机（秋殇 mp3）位置冻在 0ms 整整 25 秒才被
+    # 20s 的通用卡死阈值捞到 —— 用户听到的就是「切到下一首了但没播放」。
+    report('checkStall 用 isNotStarted 早捞「起播了但没出声」',
+           re.search(r'isNotStarted\(', cs) is not None,
+           '只靠通用卡死阈值（点播 20s + 轮询 5s）要等 25 秒才重连，'
+           '那 25 秒就是白静音 —— 这段等待本身就是用户报的现象')
+    report('「没起播」判据用起播时刻 playStartedAtMs（不是会动的 lastProgressAt）',
+           'playStartedAtMs' in cs,
+           'lastProgressAt 会被位置前进反复刷新；位置恒 0 时拿它当基准会把这段静止'
+           '重新算短，判据被拖回通用阈值 —— 这个 bug 会安静地回来，日志也不会报错')
+    res = body_of(ctrl, 'public synchronized void resume()')
+    report('onPrepared 与 resume 都刷新起播时刻',
+           'playStartedAtMs' in prep and res is not None and 'playStartedAtMs' in res,
+           'onPrepared 不刷 → 换片 / 重连后没有基准；resume 不刷 → '
+           '「暂停很久再取消暂停」会被当成起播超时而误重建')
+    # 判据本身（纯逻辑层）的两条前提，各守一个方向：
+    ins = body_of(pol_src, 'public static boolean isNotStarted(')
+    report('PlaybackPolicy.isNotStarted 方法体已找到', ins is not None,
+           '锚点：public static boolean isNotStarted(')
+    if ins:
+        report('位置动过（≥1ms）就不算「没起播」——交给卡死阈值',
+               re.search(r'positionMs\s*>\s*0', ins) is not None,
+               '位置动过说明音频通道是通的，那是"卡死"不是"没起来"；'
+               '混为一谈会把正常缓冲误杀成重建')
+        report('直播被排除在「没起播」之外',
+               'isLiveStream' in ins,
+               '直播的位置本来就可能长时间是 0（还没拿到首个时间戳）——'
+               '不排除的话，正常直播会被反复重建，从"不播"变成"不停重启"')
 
 for label, marker in [('stop()', 'public synchronized void stop()'),
                       ('releasePlayer()', 'private void releasePlayer()')]:
@@ -1176,6 +1226,96 @@ if ib:
            and re.search(r'return\s+true\s*;', ib) is None,
            'HTTP 服务死掉时 SSDP 可能还活着 —— 界面会显示"已就绪"，'
            '而手机搜得到设备却投不上去。isBound 恒 true 就是谎报军情本身')
+
+# ---- 「假 EOS」判据 ----
+# 厂商栈（海信 Vision-TV / MTK CmpbPlayer）会把「释放旧播放器资源」与
+# 「切换输入源」规范化成一次 EOS（日志原文
+# "This is adt event,the Normal event type is EOS!!!"），框架据此回调 onCompletion。
+# 真机实测 8 次，每次都在起播 1 秒内紧跟一个 STOPPED；最典型的表现是
+# 「投完视频再投音频，首次 Set 直接变 STOPPED」—— 手机显示投上了、电视已经停了。
+#
+# 这一组守卫守的是「判据还在、接线还没断」：把判据删掉、把重连换成直接报停、
+# 或把判据挪到 notifyState("STOPPED") 之后，编译运行全都正常，
+# 只是「首次 Set 即 STOPPED」悄悄回来。
+oc = body_of(ctrl, 'new MediaPlayer.OnCompletionListener()')
+report('OnCompletionListener 匿名类体已找到', oc is not None,
+       '锚点：new MediaPlayer.OnCompletionListener()')
+if oc:
+    report('onCompletion 校验过期实例（mp != player）',
+           re.search(r'mp\s*!=\s*player', oc) is not None,
+           '重连 / 换片 / 续播都会重建实例，老实例的回调可能在新实例开工之后才到 —— '
+           '照单全收会把刚起来的播放报成 STOPPED')
+    report('onCompletion 用 isSpuriousCompletion 判「假 EOS」',
+           'isSpuriousCompletion(' in oc,
+           '不判的话，厂商层的一次"切输入源"就被我们如实报成了"播完了"')
+    report('假 EOS 分支走 scheduleRetry（重建播放器，而不是报停）',
+           re.search(r'isSpuriousCompletion\([\s\S]*?scheduleRetry\(', oc) is not None,
+           '只记日志不重连的话，电视侧依然停着、手机侧以为在播 —— 等于没修')
+    sp = oc.find('isSpuriousCompletion(')
+    ns = oc.find('notifyState("STOPPED")')
+    report('假 EOS 判据排在 notifyState("STOPPED") 之前',
+           sp >= 0 and ns >= 0 and sp < ns,
+           '排到后面就是先报停再补救 —— 控制点已经收到 STOPPED 了，'
+           '状态机的歪斜补不回来')
+    report('假 EOS 重建前把待决的 seek 存下来',
+           'seekAfterRebuildMs = pendingSeekMs' in oc,
+           '重建必经 releasePlayer()，而那里会清掉 pendingSeekMs —— '
+           '真机第一首「拖了完全没反应」就是被一次 seek 后 113ms 的假 EOS 吃掉的；'
+           '后面几首偶尔不触发假 EOS，于是"切到后面几首又可以了"')
+    report('onPrepared 补发 seek 时把「重建暂存」也算上',
+           'seekAfterRebuildMs' in prep and 'replayMs' in prep,
+           '只认 pendingSeekMs 的话，假 EOS 重建出来的那份拷贝永远不会被补发，'
+           '存下来等于白存')
+    report('换片源与 Stop 都要作废「重建暂存」的 seek',
+           'seekAfterRebuildMs = -1L' in body_of(ctrl, 'public synchronized boolean play(String url)')
+           and 'seekAfterRebuildMs = -1L' in stop_body,
+           '它刻意扛过 releasePlayer（重建要走那条路），所以只能在这两处显式清 —— '
+           '否则新片子 prepare 完会拿着上一部片子的进度去 seek')
+    report('假 EOS 判据带 !userPaused 守卫',
+           re.search(r'if\s*\(\s*!userPaused[\s\S]*?isSpuriousCompletion', oc) is not None,
+           '用户主动暂停后控制点可能补一条 completion —— 那不是假 EOS，照实报停才对')
+    # ---- 「重建后补发 seek」必须有次数上限 ----
+    # 厂商栈对个别文件直接拒绝 seek（真机：秋殇 mp3 → Failed / MTK ret -6），
+    # 补发过去照样失败、照样来假 EOS。没有上限就是无限重建（真机连续 51 轮）。
+    report('假 EOS 重建的 seek 补发受 canReplaySeekAfterRebuild 上限约束',
+           'canReplaySeekAfterRebuild(' in oc,
+           '少了这道闸，厂商拒绝的 seek 会把播放拖进「重建 → 补发 → 又失败 → 又重建」'
+           '的死循环 —— 盒子既不播、又一直谎报"已到某个位置"')
+    report('补发超限时丢掉待决 seek（不再谎报位置）',
+           re.search(r'canReplaySeekAfterRebuild\([\s\S]*?else\b[\s\S]*?pendingSeekMs\s*=\s*-1',
+                     oc) is not None,
+           '只停止补发、不清 pendingSeekMs 的话，位置会被永久报成那个到不了的目标点，'
+           '控制点的进度条冻死在那儿')
+    seek_body = body_of(ctrl, 'public synchronized void seekTo(int ms)')
+    report('seekTo 每次新拖拽都重置补发计数',
+           seek_body is not None and 'seekReplayCount = 0' in seek_body,
+           '不清的话，一次失败的 seek 会让"以后所有 seek"都被当成厂商做不到而直接放弃')
+    report('换片源与 Stop 都要把补发计数清零',
+           'seekReplayCount = 0' in body_of(ctrl, 'public synchronized boolean play(String url)')
+           and 'seekReplayCount = 0' in stop_body,
+           '它是"同一次 seek"的计数，换片源 / 停止就是新的一次，必须归零')
+
+if cs:
+    report('checkStall 采样「观察到的最远位置」',
+           'maxPlayedMs' in cs,
+           '看门狗这一路是「控制点不轮询 GetPositionInfo」时的唯一采样点 —— '
+           '缺了它，判据会把"根本没采到位置"读成"位置是 0"')
+if gp:
+    report('getPosition 采样「观察到的最远位置」',
+           'maxPlayedMs' in gp,
+           '控制点轮询是另一路采样点；两路必须都在，否则一条投屏路径上判据就失灵')
+rl = body_of(ctrl, 'private void releasePlayer()')
+report('releasePlayer 复位「观察到的最远位置」',
+       rl is not None and 'maxPlayedMs' in rl,
+       '新实例是另一次播放（重连 / 换片 / 续播）—— 不复位的话，'
+       '上一次播放的远位置会让新播放的假 EOS 判据直接失灵')
+report('PlaybackPolicy 定义了假 EOS 判据与三个阈值',
+       'isSpuriousCompletion(' in pol_src
+       and 'SPURIOUS_EOS_MIN_REMAINING_MS' in pol_src
+       and 'SPURIOUS_EOS_MIN_DURATION_MS' in pol_src
+       and 'SPURIOUS_EOS_EARLY_WINDOW_MS' in pol_src,
+       '阈值与判据收在纯逻辑层，才能在桌面上把'
+       '「真播完 vs 厂商误报」的每条边界逐个跑断言')
 
 sys.exit(1 if failed else 0)
 PY
@@ -1601,6 +1741,39 @@ if pm:
            '透明面板盖不住底下的 Surface —— 面板显示出来了，'
            '用户看到的却还是那层蓝')
 
+# ---- ③.5 面板上的版本号：必须在，且必须来自构建产物 ----
+report('面板上有「版本」这一行（layout: @+id/info_version）',
+       # 判据必须带上结尾的引号：只查子串的话，把 id 改成
+       # info_version_x 照样"命中"（@+id/info_version 是它的前缀）——
+       # 这是证伪实测抓到的假绿。
+       re.search(r'@\+id/info_version"', layout) is not None and 'infoVersion' in act_c,
+       '真机排障第一句问的是「盒子上装的是哪一版」：界面上没有这一行，'
+       '就只能去翻设置或 adb，而现场往往只有一台电视 + 一个遥控器')
+report('版本号取 BuildConfig（不写死字面量），且界面只显示 versionName',
+       'BuildConfig.VERSION_NAME' in act_c and 'BuildConfig.VERSION_CODE' not in act_c,
+       '写死就一定会漂 —— 「APK 是 0.1.11、界面上还写着 0.1.10」让人对着'
+       '错误版本号排障，比不显示更糟。取 BuildConfig 则发版只需改 '
+       'build.gradle 的 versionName/versionCode，界面自动跟上。'
+       '而 versionCode 是给系统比新旧用的整数，界面上没有意义 —— '
+       '原来显示成 0.1.9（10），用户只会问"括号里那个数是什么"')
+
+# ---- ③.6 遥控器返回键 = 结束投屏 ----
+# 真机需求（用户提）：盒子这边没有"关闭投屏"的入口 —— 音乐播完就停在结束位置。
+# 先做过"播完 60 秒没有控制指令就自动收尾"，用户明确否掉了：那是在替他猜意图。
+# 改成返回键手动结束，按下去走控制点 Stop 的同一条路。
+bk = body_of(act_c, 'public boolean onKeyDown(int keyCode, KeyEvent event)')
+report('遥控器返回键 = 结束投屏（走 onStop 清片源回引导面板）',
+       bk is not None and 'KEYCODE_BACK' in bk and 'onStop()' in bk
+       and 'return true' in bk,
+       '锚点：public boolean onKeyDown(int keyCode, KeyEvent event)。'
+       '必须 return true 把按键吃掉 —— 不然系统会顺手把 Activity 关掉，'
+       '电视直接退回 launcher，而不是停在引导面板上；'
+       '必须走 onStop() 而不是 service.getPlayer().stop() —— 后者不清 '
+       'currentUri，界面仍判"在播"，电视就停在结束位置不动')
+report('空闲态按返回键不拦（那时它就该是"退出应用"）',
+       bk is not None and 'MODE_IDLE' in bk,
+       '少了这个判断，空闲态按返回会被吃掉 —— 遥控器再也退不出这个应用')
+
 st = body_of(ctrl_c, 'public synchronized void stop()')
 report('MediaPlayerController.stop 方法体已找到', st is not None,
        '锚点：public synchronized void stop()')
@@ -1737,7 +1910,74 @@ if sub_b:
            '不设上限的话，异常控制点（或有人拿脚本刷）能把这表撑到 OOM ——'
            '0.6GB 的盒子上撑爆的是整个进程')
 
-# ---- ⑥ 服务销毁时的收尾 ----
+# ---- ⑥ 订阅不能因为「回调暂时投不通」就消失 ----
+# 真机铁证（2026-10-01）：16:00:56 SUBSCRIBE（回调 http://192.168.1.6:8058/evetSub，
+# 手机息屏后 App 被挂起）→ 三次 NOTIFY ECONNREFUSED → 原实现把订阅删了 →
+# 16:06:50 控制点拿同一个 SID 来续订，被回 412；它不会去重建订阅，
+# 于是整首歌零事件：电视上下一首已经在放，手机 UI 卡在「暂停」不动。
+# 这几条守卫钉的就是「投递失败只能标记、不能删表」这个不变量。
+del_b = body_of(ed_c, 'private void deliver(String sid)')
+report('EventDispatcher.deliver 方法体已找到', del_b is not None,
+       '锚点：private void deliver(String sid)')
+if del_b:
+    # 判据要看**位置**：deliver 开头那段"过期就清"是应该留着的，
+    # 不能删的是"投递失败"分支里的删除。只查子串存在会把这两件事混淆 ——
+    # 一开始就是这么写红的。
+    _fail_at = del_b.find('s.failCount++')
+    report('投递失败到上限时不删订阅（只标记不可达）',
+           _fail_at >= 0
+           and re.search(r'failCount\s*>=\s*MAX_FAIL', del_b) is not None
+           and 'subs.remove' not in del_b[_fail_at:],
+           '删表 = 控制点续订必然被回 412，而控制点收到 412 不会重建订阅 ——'
+           '事件通道就此永久断掉（真机症状：电视在放下一首，手机 UI 卡在「暂停」）')
+    report('过期订阅仍然会被清掉（不可达标记不是永不回收）',
+           _fail_at > 0 and 'subs.remove' in del_b[:_fail_at],
+           '订阅表必须能自己收敛：条目过期就该走。把 deliver 开头那段一起删掉的话，'
+           '投不通的订阅会一直堆到 MAX_SUBS 才靠淘汰收场')
+    report('失败超限只标记一次 unreachable',
+           re.search(r'failCount\s*>=\s*MAX_FAIL\s*&&\s*!\s*s\.unreachable[\s\S]{0,200}?'
+                     r's\.unreachable\s*=\s*true', del_b) is not None,
+           '不标的话，Auto-Stop 会把一条已经收不到事件的订阅算作「还有人在听」，'
+           '电视守着一条死订阅永远不停')
+    report('投递成功同时清零失败计数与不可达标记',
+           re.search(r'failCount\s*=\s*0[\s\S]{0,120}?s\.unreachable\s*=\s*false',
+                     del_b) is not None,
+           '只清 failCount 的话标记会一直挂到超时：手机明明已经恢复收事件，'
+           'Auto-Stop 的存活计数却还是 0')
+
+ren_b = body_of(ed_c, 'public long renew(String sid, String timeoutHeader)')
+report('EventDispatcher.renew 方法体已找到', ren_b is not None,
+       '锚点：public long renew(String sid, String timeoutHeader)')
+if ren_b:
+    report('续订唯一的拒绝理由是「表里没有这个 SID」',
+           ren_b.count('return -1L') == 1,
+           '再挂一条「失败太多就拒」正是真机上那次 412；条目只该在超时或'
+           '显式退订时才从表里消失')
+    report('续订清零失败计数与不可达标记（重新算它可达）',
+           re.search(r'failCount\s*=\s*0[\s\S]{0,120}?unreachable\s*=\s*false',
+                     ren_b) is not None,
+           '续订是控制点主动连上来发的请求 —— 等于它活着的直接证据。'
+           '不清标记的话，点亮手机后存活计数仍是 0，Auto-Stop 会把正在放的投屏停掉')
+
+asc_b = body_of(ed_c, 'public int aliveSubscriberCount()')
+report('EventDispatcher.aliveSubscriberCount 方法体已找到', asc_b is not None,
+       '锚点：public int aliveSubscriberCount()')
+if asc_b:
+    report('Auto-Stop 的存活计数跳过不可达订阅',
+           re.search(r'expireAtMs\s*>\s*now\s*&&\s*!\s*s\.unreachable', asc_b) is not None,
+           '把不可达的算作存活，Auto-Stop 就永远不会触发 —— 而它存在的意义正是'
+           '「手机退出了，电视别再自己放着」')
+
+na_b = body_of(ed_c, 'public void notifyAll(String service)')
+report('EventDispatcher.notifyAll 方法体已找到', na_b is not None,
+       '锚点：public void notifyAll(String service)')
+if na_b:
+    report('状态变化时对全部订阅照常投递（不滤掉不可达的）',
+           re.search(r'subs\.values\(\)', na_b) is not None and 'unreachable' not in na_b,
+           '滤掉不可达的，它就再没有恢复的机会 —— 投递本身就是探测：'
+           '手机点亮、或换回原来的网段之后，靠它自动接上线')
+
+# ---- ⑦ 服务销毁时的收尾 ----
 # 前台通知不撤的话会变成一条僵尸通知：投屏早就断了，通知栏里却还挂着，
 # 点一下还会去拉起一个已经死掉的服务。
 od = body_of(svc_c, 'public void onDestroy()')
@@ -1758,7 +1998,7 @@ if od:
            '撤得太晚同样不行 —— 后面关 socket / 释放播放器都可能抛异常，'
            '抛在中间这条通知就永远撤不掉了')
 
-# ---- ⑦ 界面显示的地址，必须就是控制点拿到的那个 ----
+# ---- ⑧ 界面显示的地址，必须就是控制点拿到的那个 ----
 # 界面上的地址是排障时唯一能照着去 curl 的东西。它要是来自"候选列表第一张网卡"，
 # 而 LOCATION 来自 joinGroup 真正成功的那张，两者一分叉：
 # 照着界面地址怎么都复现不了用户的问题 —— 而且看起来还像"盒子没问题"。
@@ -2471,6 +2711,171 @@ report('界面片源显示收敛到 currentLabel 单一出口',
        and 'getCurrentTitle' in main_act,
        '「标题优先、取不到回退文件名」这个判据写三份的话，迟早有一处忘了跟着改 —— '
        '界面上同一个片源在不同位置显示成不同的东西')
+
+# ---- (11) 手机投屏的两个实测现象 ----
+# 用户真机报的两句：「投视频投上去了却没有画面」「投照片切了好几张电视还是原来那张」。
+# 它们的共同点是**编译、运行、日志全都正常**，只是功能悄悄失效 ——
+# 正是源码级守卫存在的理由。
+#
+#   ·「照片不跟手」：连投多张照片时形态从头到尾都是 MODE_IMAGE，
+#     applyModeIfChanged() 首句 mode == lastMode 就早退 —— 形态没变，
+#     applyMode() 里的 loadImage() 一次都不会被调到，电视永远停在第 1 张。
+#
+#   ·「视频没有画面」：控制点不给 upnp:class、媒体服务器把 Content-Type 报成
+#     application/octet-stream、而本机 getVideoWidth() 恒返回 0 —— 三路信号全哑，
+#     一个真视频被判成「纯音频」，音乐卡片把画面整个盖住。
+rf = body_of(main_act, 'private void refresh()')
+report('MainActivity.refresh 方法体已找到', rf is not None,
+       '锚点：private void refresh()')
+if rf:
+    report('图片形态每个 tick 都重问片源（同一个形态里也要跟上换图）',
+           re.search(r'mode\s*==\s*MODE_IMAGE[\s\S]{0,200}?'
+                     r'loadImage\(service\.getCurrentUri\(\)\)', rf) is not None,
+           '连投几张照片时形态恒为 MODE_IMAGE，而 applyModeIfChanged() 只在形态'
+           '真的变了时才调 applyMode()（首句 mode == lastMode 直接 return）—— '
+           '于是 loadImage() 一次都不会被调到，电视永远停在第 1 张'
+           '（用户报的「切了好几张还是原来那张」）。'
+           '去重交给 loadImage() 自己（imageUri / imageLoadingUri），不会重复下载')
+
+li2 = body_of(main_act, 'private void loadImage(String uri)')
+si2 = body_of(main_act, 'private void showImage(String uri, Bitmap bmp)')
+ri2 = body_of(main_act, 'private void releaseImage()')
+report('失败的图片地址被记住，不再每 0.5 秒重试一次（三处接线）',
+       li2 is not None and 'imageFailedUri' in li2
+       and si2 is not None
+       and re.search(r'bmp\s*==\s*null[\s\S]{0,200}?imageFailedUri\s*=', si2) is not None
+       and ri2 is not None and 'imageFailedUri = null' in ri2,
+       '三处缺一不可：① loadImage 的早退条件里要带上它；② showImage 的失败分支'
+       '要记下这个地址；③ releaseImage 要清掉它（不然回空闲后再投同一张图永远'
+       '显示不出来）。缺 ① 或 ②：refresh() 每 0.5 秒又问一次，真机实测坏地址'
+       '15 秒内发了 30 次请求、弹了 30 次 Toast —— 0.6GB 的盒子上是纯粹的浪费')
+
+ko = body_of(svc, 'private static int kindOfAny(String uri, String metadata)')
+report('形态判定：元数据判不出来时按地址扩展名兜底',
+       ko is not None and 'kindOfUrl(uri)' in ko
+       and re.search(r'kind\s*!=\s*KIND_UNKNOWN[\s\S]{0,80}?return\s+kind',
+                     ko) is not None,
+       '锚点：private static int kindOfAny(String uri, String metadata)。'
+       '必须先让元数据说话，判不出来才轮到扩展名 —— 顺序反了会把控制点'
+       '明确声明过的形态顶掉（明明给了 upnp:class: audioItem，却因为地址像视频'
+       '而当成视频）')
+report('onSetUri 与 onSourceChanged 都走 kindOfAny（两条入口同一判据）',
+       'kindOfAny(uri, metadata)' in svc
+       and 'kindOfAny(uri, currentMetadata)' in svc,
+       '只改一条的话：正常投屏（onSetUri）对了，而重投 / 续播接棒'
+       '（onSourceChanged）仍按老判据把视频判成纯音频 —— '
+       '表现成"有时行、有时不行"，是最难查的那种形态')
+ex = body_of(svc, 'private static String extensionOf(String name)')
+report('extensionOf 支持 URL：先切查询串/锚点，再只认合法扩展名',
+       ex is not None
+       and re.search(r"indexOf\('\?'\)[\s\S]{0,120}?substring\(0,\s*cut\)",
+                     ex) is not None
+       and re.search(r"indexOf\('#'\)[\s\S]{0,120}?substring\(0,\s*cut\)",
+                     ex) is not None
+       and re.search(r"c\s*>=\s*'a'\s*&&\s*c\s*<=\s*'z'", ex) is not None
+       and re.search(r'ext\.length\(\)\s*>\s*5', ex) is not None,
+       '不切 ? / # 的话 …/a.mp4?token=xx 取出来是 mp4?token=xx；'
+       '不限字形与长度的话 http://h/1.2/video 会取出 "2/video"、'
+       'http://h/video.2019 会取出 "2019" —— 都会把非视频地址误判成视频。'
+       '（本条第一版只查 indexOf(\'#\') 在不在，把 substring(0, cut) 改成 '
+       'substring(0, 0) 照样绿 —— 证伪时抓出来的，所以现在连"切法"一起钉）')
+report('isVideoName 收录常见容器，且刻意不收 m3u8',
+       'private static boolean isVideoName(String name)' in svc
+       and '"mp4".equals(ext)' in svc and '"m3u8"' not in svc,
+       '扩展名兜底靠的就是这张表，漏掉 mp4 等于没兜底；'
+       'm3u8（HLS）是**刻意**不收的 —— 它既可能是视频、也可能是纯音频网络电台，'
+       '而猜错方向的代价不对称：视频被判成音频时，音乐卡片把画面整个盖住')
+
+# ---- (12) 视频「有声音没画面」：判据必须走厂商 info 事件 ----
+# 用户真机报：「投视频投上去了，电视上一片纯黑、声音正常」。
+# 第一版修复用的是 getVideoWidth() —— 当时误以为"画面解出来才 > 0"，结果**被反面
+# 控制抓出误报**：同一台盒子上 H.264（画面完全正常、厂商侧日志有
+# VIDEO_FMT_UPDATE 960x540）@2s/@5s 读出来也是 0x0。画面走厂商硬件图层，
+# 框架压根不知道尺寸。实测对照表见 PlaybackPolicy.INFO_VIDEO_CODEC_NOT_SUPPORT。
+# 下面这组守卫就是"不许再退回那个判据"。
+ctrl = pathlib.Path('app/src/main/java/com/juping/cast/player/MediaPlayerController.java'
+                    ).read_text(encoding='utf-8')
+ctrl = strip_comments(ctrl)
+pol = pathlib.Path('app/src/main/java/com/juping/cast/player/PlaybackPolicy.java'
+                   ).read_text(encoding='utf-8')
+pol = strip_comments(pol)
+
+report('画面判据：只有厂商 info 码 0x8003 这一个信号，且判据留在纯逻辑层',
+       re.search(r'INFO_VIDEO_CODEC_NOT_SUPPORT\s*=\s*0x8003', pol) is not None
+       and re.search(r'isVideoCodecUnsupportedInfo\(int what\)\s*\{'
+                     r'[\s\S]{0,160}?what\s*==\s*INFO_VIDEO_CODEC_NOT_SUPPORT',
+                     pol) is not None,
+       '判据放 PlaybackPolicy 是为了能离线跑断言（与错误分类同一套做法）；'
+       '码值 0x8003 是 MTK 私有区间（标准 MEDIA_INFO_* 最大只到 802），'
+       '真机实测 HEVC 每次发、H.264 从不发')
+
+report('控制器：装了 OnInfoListener 且真的把事件转出去',
+       'setOnInfoListener' in ctrl
+       and re.search(r'isVideoCodecUnsupportedInfo\(what\)[\s\S]{0,400}?'
+                     r'onVideoCodecUnsupported\(', ctrl) is not None,
+       '缺监听：厂商把「画面编码解不了」当 info 发（不中断播放、不走 onError），'
+       '不监听就什么都收不到，用户看到的仍是一块没有任何解释的黑屏；'
+       '装了不转发：服务层拿不到消息，界面照样不吭声')
+
+report('不许再用 getVideoWidth() 当「画面出没出来」的判据（第一版误报的教训）',
+       'hasVideoFrames' not in ctrl and 'hasVideoFrames' not in svc
+       and 'VIDEO_MISSING_GRACE_MS' not in pol
+       and 'scheduleVideoMissingCheck' not in svc,
+       '这三样是"按时间观察 getVideoWidth()"那版修复的化石。它在本机上必然误报：'
+       'H.264 也恒为 0x0，于是正常视频一播到 4 秒就被扣上"编码不支持"。'
+       '这条守卫是**防止有人看它"读起来更直白"又改回去**')
+
+uni = body_of(svc, 'public void onVideoCodecUnsupported(String detail)')
+report('厂商事件只在元数据判成视频时才采纳',
+       uni is not None
+       and re.search(r'kindFromMetadata\s*!=\s*KIND_VIDEO[\s\S]{0,80}?return',
+                     uni) is not None
+       and 'videoMissing = true' in uni
+       and 'notifyEvent("AVTransport")' in uni,
+       '音频流编码不支持时厂商发的是**同一个码** —— 不加这道闸就会对着一个'
+       '"有画面没声音"的片子说"画面编码不支持"，比不报还糟；'
+       '不发事件则控制点与界面都不知道状态变了')
+
+report('换片两条入口都清掉「画面出不来」',
+       re.search(r'kindFromMetadata\s*=\s*kindOfAny\(uri, metadata\)'
+                 r'[\s\S]{0,600}?videoMissing = false', svc) is not None
+       and re.search(r'kindFromMetadata\s*=\s*kindOfAny\(uri, currentMetadata\)'
+                     r'[\s\S]{0,300}?videoMissing = false', svc) is not None,
+       'onSetUri 与 onSourceChanged 缺一不可：只清一条的话，投完一段解不了的'
+       'HEVC 再自动续播下一部（或换片），新片源一上来就顶着上一部的黑屏告警')
+
+tb = body_of(main_act, 'private void applyTopBar(int mode)')
+report('顶条：「画面出不来」要出现、且与出错一样亮红点',
+       tb is not None
+       and re.search(r'noPicture\s*=\s*service\.isVideoMissing\(\)', tb) is not None
+       and re.search(r'show\s*=\s*error \|\| noPicture', tb) is not None
+       and re.search(r'if \(error \|\| noPicture\)', tb) is not None,
+       '不参与 show：顶条根本不出现，黑屏上还是一个字都没有（第一版就是'
+       '只在 idle/暂停时出现，等于白写）；不亮红点：绿点会说"一切正常"，'
+       '跟右边那句自相矛盾')
+
+rf = body_of(main_act, 'private void refresh()')
+report('顶条文案：画面出不来时报原因，且真报错时不抢',
+       rf is not None
+       and re.search(r'if \(!error && service\.isVideoMissing\(\)\)\s*\{'
+                     r'[\s\S]{0,120}?playingText\.setText\('
+                     r'R\.string\.hint_video_unsupported\)', rf) is not None,
+       '这时进度条上的时间对用户毫无意义（屏幕一片黑，他要的是"为什么黑"），'
+       '所以让原因压过进度；但前面那个 !error 不能去掉 —— '
+       '真正的故障有它自己的话要说，拿"编码不支持"去替它背锅会把人带偏')
+
+strings = pathlib.Path('app/src/main/res/values/strings.xml'
+                       ).read_text(encoding='utf-8')
+report('「编码不支持」那句话必须给出可执行的动作',
+       'hint_video_unsupported' in strings and 'H.264' in strings,
+       '只说"不支持"等于没说：用户不会知道下一步该干什么，'
+       '只会以为盒子坏了')
+
+report('dex 核查表收录 OnInfoListener（否则闸门报「没被核到」而红）',
+       'MediaPlayer$OnInfoListener'
+       in pathlib.Path('tools/check_dex_entrypoints.py').read_text(encoding='utf-8'),
+       'R8 会改实现类的名字，不列入核查表就核不到这个方法 —— '
+       '而它一旦被裁掉，厂商事件永远送不过来')
 
 sys.exit(1 if failed else 0)
 PY

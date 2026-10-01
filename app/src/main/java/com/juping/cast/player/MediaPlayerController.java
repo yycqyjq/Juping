@@ -83,6 +83,19 @@ public class MediaPlayerController {
          * 实现方必须幂等 —— 服务层与界面（轮询刷新）都已按此设计。
          */
         void onPrepared(int durationMs, boolean hasVideo);
+
+        /**
+         * 厂商说：这段视频的**画面**编码本机解不了。
+         *
+         * <p>这是 {@link PlaybackPolicy#INFO_VIDEO_CODEC_NOT_SUPPORT} 那个 info 事件
+         * 的回调形态。它**不是错误** —— 播放不中断、{@link #onError} 不会来，音频
+         * 照常走，标准 API 层面（{@code getVideoWidth()}）也看不出任何异常，
+         * 结果就是"有声音、一片纯黑"。真相与实测对照表见
+         * {@link PlaybackPolicy#INFO_VIDEO_CODEC_NOT_SUPPORT}。
+         *
+         * @param detail 给日志用的技术细节（what/extra/地址），不该直接显示给用户
+         */
+        void onVideoCodecUnsupported(String detail);
     }
 
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -151,6 +164,20 @@ public class MediaPlayerController {
      */
     private volatile long lastPosition = -1L;
     private volatile long lastProgressAt;
+
+    /**
+     * 本次播放「起播」的时刻 —— 与 {@link #lastProgressAt} 差别在哪，为什么必须分开记。
+     *
+     * <p>{@code lastProgressAt} 是<b>会动的基准</b>：位置每前进一次就刷新，
+     * 所以 {@code now - lastProgressAt} 度量的是「位置最近一次前进到现在多久」，
+     * 这是卡死判据要的语义。
+     *
+     * <p>而「起播了但一直没出声」要问的是另一个问题：<b>从起播到现在，位置动过没有</b>。
+     * 位置从头到尾是 0 时 {@code lastProgressAt} 会在第一次看门狗检查时被对齐一次、
+     * 之后就不动了，拿它当基准会把这段静止重新算短 —— 用它判会拖到通用阈值。
+     * 单独记一个只由 onPrepared / resume 写入的起点，才是这个问题该有的时钟。
+     */
+    private volatile long playStartedAtMs;
 
     /**
      * 最后一次从播放器读到的有效位置，给「未就绪期间」兜底用。
@@ -301,6 +328,15 @@ public class MediaPlayerController {
         // 换了片源，上一次的 seek 目标立刻作废 ——
         // 不清的话，新片子的「当前位置」会先报成上一部片子拖到的进度。
         pendingSeekMs = -1L;
+        // 「假 EOS 重建补发」同理作废：它扛得过重建，但扛不过换片源 ——
+        // 不清的话，新片子 prepare 完会拿着上一部片子的进度去 seek。
+        seekAfterRebuildMs = -1L;
+        // 「补发次数」也作废：那是"同一次 seek"的计数，换片源就是新的一次。
+        seekReplayCount = 0;
+        // 「起播时刻」同理作废：留着上一部片子的起点在，新片子还没 prepare 完
+        // 就可能被算出「起播已超宽限」—— 虽然 prepared 为假会挡住这次误判，
+        // 但把两件事绑在一起靠巧合成立，不如在换片源时一并清干净。
+        playStartedAtMs = 0L;
         // 新片源到达，「下一曲」队列作废（新歌单会重新 SetNext）
         nextUrl = null;
         nextMetadata = null;
@@ -376,6 +412,9 @@ public class MediaPlayerController {
                     retryCount = 0;
                     lastPosition = -1L;
                     lastProgressAt = System.currentTimeMillis();
+                    // 起播时刻与 lastProgressAt 同源取一次。之后 lastProgressAt 会被
+                    // 位置前进反复刷新，这个起点不动 —— 见字段说明与 checkStall 的判据。
+                    playStartedAtMs = lastProgressAt;
                     hasVideo = detectVideo(mp);
 
                     // 视频尺寸延迟复查：部分老芯片（MTK 5880 实测）在 onPrepared
@@ -396,11 +435,23 @@ public class MediaPlayerController {
                     // prepare 期间攒下的 seek 到这里补发。
                     // 不补的话，投屏刚起来（画面还没出来）时拖的进度条会被
                     // 永久丢弃 —— 手机显示已经拖过去了，电视一动不动。
-                    if (pendingSeekMs >= 0) {
+                    //
+                    // 两个来源，取"更新"的那个：
+                    //   ① prepare 还没完成时控制点就拖了 → pendingSeekMs 本来就在；
+                    //   ② 一次「假 EOS 重建」替控制点保下来的（seekAfterRebuildMs）——
+                    //      pendingSeekMs 已被 releasePlayer() 清掉，这里必须重新装上，
+                    //      否则进度条上报与落地判定都看不见这次 seek。
+                    long replayMs = seekAfterRebuildMs >= 0 ? seekAfterRebuildMs : pendingSeekMs;
+                    seekAfterRebuildMs = -1L;
+                    if (replayMs >= 0) {
+                        pendingSeekMs = replayMs;
+                        pendingSeekAtMs = System.currentTimeMillis();
+                        pendingSeekLanded = false;
+                        hiRaw = (int) replayMs;
+                        hiWall = pendingSeekAtMs;
                         try {
-                            mp.seekTo((int) pendingSeekMs);
-                            pendingSeekAtMs = System.currentTimeMillis();
-                            Log.i(TAG, "prepare 完成，补发暂存的 seek " + pendingSeekMs + "ms");
+                            mp.seekTo((int) replayMs);
+                            Log.i(TAG, "prepare 完成，补发暂存的 seek " + replayMs + "ms");
                         } catch (Exception e) {
                             Log.w(TAG, "补发 seek 失败", e);
                         }
@@ -418,6 +469,28 @@ public class MediaPlayerController {
             player.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
                 @Override
                 public void onCompletion(MediaPlayer mp) {
+                    // 取证：每一次「播完」回调都把判据的输入留下来。
+                    //
+                    // 没有这一行，「判据为什么不触发」事后完全无法回溯 —— 真机踩到过：
+                    // 一次 4 分钟 prepare 卡死之后等来的 EOS，日志里只剩一句
+                    // 「播放状态: STOPPED」，preparing / 已观察位置 / duration
+                    // 当时各是什么值，全无从查起。
+                    //
+                    // 刻意放在**过期实例校验之前**：被丢弃的过期回调同样是静默的，
+                    // 而"这次播完为什么被丢掉"恰恰是要查的问题之一。
+                    long sinceStart = System.currentTimeMillis() - prepareStartedAt;
+                    int dur = getDuration();
+                    Log.i(TAG, "播完回调：过期实例=" + (mp != player)
+                            + "，preparing=" + preparing + "，prepared=" + prepared
+                            + "，userPaused=" + userPaused + "，已观察最远位置=" + maxPlayedMs
+                            + "ms，时长=" + dur + "ms，起播至今=" + sinceStart + "ms");
+                    // 过期实例的「播完」一概忽略：重连 / 换片 / 续播都会重建实例，
+                    // 而老实例的回调可能在新实例已经开工之后才到 —— 照单全收
+                    // 会把刚起来的播放报成 STOPPED。与 scheduleVideoRecheck /
+                    // scheduleContentTypeProbe 是同一条纪律。
+                    if (mp != player) {
+                        return;
+                    }
                     // 播放列表续播：SetNextAVTransportURI 预告过的下一曲在这里接棒。
                     // 必须抛到下一轮消息循环再重建播放器 —— 在播放器自己的
                     // onCompletion 回调里 release 它自己，老平台上有崩溃先例。
@@ -444,6 +517,54 @@ public class MediaPlayerController {
                         }, "auto-advance").start();
                         return;
                     }
+                    // ---- 「假 EOS」判据 ----
+                    //
+                    // 厂商栈会把「释放旧播放器资源」和「切换输入源」规范化成一次
+                    // EOS（日志原文 "This is adt event,the Normal event type is EOS!!!"），
+                    // 框架据此回调到这里。真机 8 次实测，每次都在起播后 1 秒内，
+                    // 最典型的是「投完视频再投音频，首次 Set 直接变 STOPPED」——
+                    // 手机显示投上了，电视其实已经停了。
+                    //
+                    // 判据与阈值全在 PlaybackPolicy（纯逻辑，桌面上有断言）。
+                    // 放在续播分支**之后**：有下一曲时照常接棒，既有行为不变。
+                    if (!userPaused
+                            && PlaybackPolicy.isSpuriousCompletion(preparing, sinceStart,
+                                    maxPlayedMs, dur)) {
+                        Log.w(TAG, "收到疑似假 EOS（厂商层把「释放旧资源 / 切输入源」"
+                                + "当成了播完）：preparing=" + preparing + "，已观察最远位置 "
+                                + maxPlayedMs + "ms / 时长 " + dur + "ms，起播至今 "
+                                + sinceStart + "ms —— 重建播放器，不报 STOPPED");
+                        // 重建要走 releasePlayer()，而那里会把 pendingSeekMs 清掉 ——
+                        // 用户刚拖的那一次 seek 就被这一次假 EOS 吃掉了（真机：Seek 下发
+                        // 113ms 后就来假 EOS，重建完位置回到 0，手机上看就是「拖了没反应」；
+                        // 后面几首偶尔不触发假 EOS，于是"切到后面几首又可以了"）。
+                        // 记到 seekAfterRebuildMs 上：它能扛过 releasePlayer，
+                        // 由 onPrepared 补发。
+                        //
+                        // **但补发必须有上限**：厂商栈对个别文件会直接拒绝 seek
+                        // （真机：秋殇 mp3 → Failed / MTK ret -6），补发过去照样失败、
+                        // 照样来假 EOS。没有上限就是「重建 → 补发 → 又失败 → 又重建」
+                        // 的死循环（真机连续 51 轮）。补发够次数仍失败，就认定这个
+                        // seek 厂商做不到：丢掉它照常播放，不再谎报那个到不了的位置。
+                        if (pendingSeekMs >= 0) {
+                            if (PlaybackPolicy.canReplaySeekAfterRebuild(seekReplayCount)) {
+                                seekAfterRebuildMs = pendingSeekMs;
+                                seekReplayCount++;
+                                Log.w(TAG, "把这次 seek " + pendingSeekMs + "ms 存下来，"
+                                        + "等重建后补发（第 " + seekReplayCount + " 次）");
+                            } else {
+                                Log.w(TAG, "seek " + pendingSeekMs + "ms 重建后补发仍失败，"
+                                        + "放弃该 seek（不再重建），按真实位置继续播放");
+                                seekAfterRebuildMs = -1L;
+                                pendingSeekMs = -1L;
+                                pendingSeekLanded = false;
+                                hiRaw = -1;
+                                hiWall = 0;
+                            }
+                        }
+                        scheduleRetry();
+                        return;
+                    }
                     notifyState("STOPPED");
                 }
             });
@@ -462,6 +583,28 @@ public class MediaPlayerController {
                     }
                     scheduleRetry();
                     return true;
+                }
+            });
+
+            // 厂商把「画面编码解不了」当 info 事件发（不中断播放、不走 onError），
+            // 这是应用唯一能感知到它的地方 —— 详见
+            // PlaybackPolicy.INFO_VIDEO_CODEC_NOT_SUPPORT 里的实测对照表。
+            //
+            // 只认这一个码：同一次播放里厂商还会发标准的 701/702（缓冲开始/结束）
+            // 之类，那些与「解不了」无关，一律不理会。
+            player.setOnInfoListener(new MediaPlayer.OnInfoListener() {
+                @Override
+                public boolean onInfo(MediaPlayer mp, int what, int extra) {
+                    if (PlaybackPolicy.isVideoCodecUnsupportedInfo(what)) {
+                        String detail = "厂商 info what=0x" + Integer.toHexString(what)
+                                + " extra=" + extra + " url=" + currentUrl;
+                        Log.w(TAG, "画面编码解不了（厂商 info 事件）: " + detail);
+                        if (listener != null) {
+                            listener.onVideoCodecUnsupported(detail);
+                        }
+                    }
+                    // 返回 false：不消费，让框架/其它监听方照常处理
+                    return false;
                 }
             });
 
@@ -561,6 +704,17 @@ public class MediaPlayerController {
                 if (player != mp || !prepared || hasVideo) {
                     return;
                 }
+                // 把复查当时读到的尺寸记下来：这条日志是「画面到底有没有出来」
+                // 唯一的现场记录 —— 编码解不了时它恒为 0x0，而正常的 H.264
+                // 会报出真实尺寸（真机实测 960x540），事后排障全靠它。
+                int w = 0, h = 0;
+                try {
+                    w = mp.getVideoWidth();
+                    h = mp.getVideoHeight();
+                } catch (Exception e) {
+                    Log.w(TAG, "读视频尺寸失败", e);
+                }
+                Log.i(TAG, "视频尺寸复查（第 " + attempt + " 次）: " + w + "x" + h);
                 if (detectVideo(mp)) {
                     hasVideo = true;
                     Log.i(TAG, "视频尺寸延迟就绪（第 " + attempt
@@ -774,6 +928,12 @@ public class MediaPlayerController {
                 return;
             }
             long pos = player.getCurrentPosition();
+            // 「假 EOS」判据的第二路采样：看门狗每 5 秒一拍。
+            // 控制点不轮询 GetPositionInfo 时，就只剩这一路在采位置 ——
+            // 没有它，判据会把「根本没采到位置」错当成「位置是 0」。
+            if (pos > maxPlayedMs) {
+                maxPlayedMs = (int) pos;
+            }
             long now = System.currentTimeMillis();
             if (pos != lastPosition) {
                 lastPosition = pos;
@@ -788,7 +948,13 @@ public class MediaPlayerController {
 
             // 时长已知 → 点播流，用严格阈值；时长未知或为 0 → 直播/分段流，放宽
             int duration = player.getDuration();
-            if (!PlaybackPolicy.isStalled(now - lastProgressAt, duration)) {
+            // 「起播了，但一直没出声」：位置从起播到现在恒为 0。
+            // 与「卡死」是两件事（位置前进过 vs 从来没动过），阈值也该是两档 ——
+            // 详见 PlaybackPolicy.isNotStarted。真机：秋殇 mp3 起播后位置冻在 0ms
+            // 整整 25 秒才被通用阈值捞到，用户听到的就是「切到下一首了但没播放」。
+            boolean notStarted = PlaybackPolicy.isNotStarted(prepared, userPaused, pos,
+                    duration, now - playStartedAtMs);
+            if (!notStarted && !PlaybackPolicy.isStalled(now - lastProgressAt, duration)) {
                 return;
             }
 
@@ -802,8 +968,16 @@ public class MediaPlayerController {
                 return;
             }
 
-            Log.w(TAG, "检测到卡死（位置停在 " + pos + "ms，时长 " + duration
-                    + "ms），第 " + stallCount + " 次重连");
+            if (notStarted) {
+                // 位置恒 0 与「播着播着停住」的处置一样（重建），但日志必须分开 ——
+                // 报「位置停在 0ms」会让排障的人以为位置读到过、又退回 0。
+                Log.w(TAG, "起播后位置一直停在 0ms（时长 " + duration + "ms，起播至今 "
+                        + (now - playStartedAtMs) + "ms，已超宽限 "
+                        + PlaybackPolicy.NOT_STARTED_GRACE_MS + "ms），第 " + stallCount + " 次重连");
+            } else {
+                Log.w(TAG, "检测到卡死（位置停在 " + pos + "ms，时长 " + duration
+                        + "ms），第 " + stallCount + " 次重连");
+            }
             if (listener != null) {
                 listener.onError(PlaybackPolicy.ERR_STALLED,
                         "播放卡死，正在重连（第 " + stallCount + " 次）");
@@ -838,6 +1012,9 @@ public class MediaPlayerController {
             try {
                 player.start();
                 lastProgressAt = System.currentTimeMillis();
+                // 取消暂停等于重新起播：起播时刻也要跟着走，否则
+                // 「暂停很久后取消暂停」会被当成"起播后一直没出声"而误重建。
+                playStartedAtMs = lastProgressAt;
                 notifyState("PLAYING");
             } catch (Exception e) {
                 Log.w(TAG, "resume 失败", e);
@@ -906,6 +1083,13 @@ public class MediaPlayerController {
         // 停了就没有"待决的 seek"可言。不清的话，下一次播放的当前位置
         // 会先报成上一次拖到的那个位置。
         pendingSeekMs = -1L;
+        // 「假 EOS 重建补发」同理：Stop 之后不该再补发任何 seek
+        // （它会扛过一次重建，所以必须在这里显式作废）。
+        seekAfterRebuildMs = -1L;
+        // 补发计数一并作废（语义同上）。
+        seekReplayCount = 0;
+        // 起播时刻同理作废：停止之后不该再有"本次起播"可言。
+        playStartedAtMs = 0L;
         // 兜底位置同理归零：用户已经停止投屏了，界面上不该再挂着进度。
         // （注意 releasePlayer() 里**不能**清它 —— 重连也会走那条路，
         //   清了就等于重连期间又跳回 0，正是这次要修的现象。）
@@ -939,6 +1123,9 @@ public class MediaPlayerController {
         pendingSeekMs = ms;
         pendingSeekAtMs = System.currentTimeMillis();
         pendingSeekLanded = false;
+        // 控制点新拖的一次 seek = 用户的新意图：补发计数清零，重新给一次机会。
+        // （上一次"厂商做不到"的结论只针对上一次那个目标，不该连累这一次。）
+        seekReplayCount = 0;
         // 水位线对齐到目标：不改的话，往回拖之后旧的高水位线会让外推
         // 以为位置还停在旧处，甚至把进度直接推到片尾（钳到 dur 的副作用）。
         hiRaw = ms;
@@ -969,6 +1156,54 @@ public class MediaPlayerController {
     private int hiRaw = -1;
     private long hiWall;
 
+    /**
+     * 本次播放**观察到过的最远位置**；从未采到过为 -1。
+     *
+     * <p>只服务「假 EOS」判据（见 {@link PlaybackPolicy#isSpuriousCompletion}）：
+     * 厂商层会把「释放旧播放器资源 / 切换输入源」规范化成一次 EOS
+     * （真机日志原文 {@code This is adt event,the Normal event type is EOS!!!}），
+     * 框架据此回调 {@code onCompletion} —— 而那一刻位置离总时长还差得远。
+     * 靠这条水位线把「真播完」和「假 EOS」分开。
+     *
+     * <p><b>为什么不复用 {@link #hiRaw}</b>：hiRaw 与 {@link #hiWall} 配套，
+     * 服务的是「位置冻结外推」—— 让看门狗单向更新它会让外推量级失准。
+     *
+     * <p>采样点有两处：{@link #getPosition()}（控制点轮询时）与
+     * {@link #checkStall()}（看门狗每 5 秒一拍）。两路都采，是因为只靠前者
+     * 在「控制点不轮询」时会采不到位置，判据就失灵了。
+     *
+     * <p>{@code volatile}：写发生在 HTTP 连接线程与主线程，
+     * 读发生在 onCompletion 回调（主线程）。
+     */
+    private volatile int maxPlayedMs = -1;
+
+    /**
+     * 「假 EOS 重建」要替控制点保住的 seek 目标（毫秒；-1 = 无）。
+     *
+     * <p><b>为什么必须有</b>：厂商栈把 seek 期间「释放旧资源 / 换输入源」也规范化成
+     * 一次 EOS（真机实测：Seek 下发后 113ms 就到）。这次假 EOS 走重建，而
+     * {@link #releasePlayer()} 会顺手清掉 {@link #pendingSeekMs} —— 用户刚拖的那一下
+     * 就这么没了：真机上第一首拖进度条"完全没反应"，正是因为一次假 EOS 把它吃掉了。
+     *
+     * <p><b>为什么不直接不清 pendingSeekMs</b>：那是给「Stop / 换片源」用的语义，
+     * 放开会让控制点看到上一部片子的进度。这个字段的语义窄得多 —— 只活一次重建，
+     * 所以能扛过 releasePlayer，却必须在真正换片源（{@link #play}）与 Stop 时清掉。
+     */
+    private volatile long seekAfterRebuildMs = -1L;
+
+    /**
+     * 本次 seek 已经"重建后补发"过几次。
+     *
+     * <p>厂商栈对个别文件会<b>直接拒绝</b> seek（真机：秋殇 mp3 → {@code Failed}、
+     * MTK {@code ret -6}），随后照例来一次假 EOS。若无上限，重建 → 补发 → 又失败
+     * → 又假 EOS → 又重建 …… 就是死循环（真机连续 51 轮、每轮约 1.5 秒）。
+     * 见 {@link PlaybackPolicy#MAX_SEEK_REPLAY}。
+     *
+     * <p>控制点每下发一次新的 {@link #seekTo(int)} 就清零 —— 那是用户的新意图，
+     * 值得重新给一次机会。
+     */
+    private volatile int seekReplayCount;
+
     public int getPosition() {
         try {
             if (player == null || playerReleased || nativePlayerDead || !prepared) {
@@ -981,14 +1216,32 @@ public class MediaPlayerController {
             int raw = player.getCurrentPosition();
             lastKnownPosition = raw;
             long now = System.currentTimeMillis();
-            // 水位线：会话内见过的最大位置 + 见到它的墙钟。
+            long pending = pendingSeekMs;
+            // **seek 在飞（已下发、尚未落地）期间，这一拍读到的 raw 一律不进两条
+            // 「只抬不落」的账本。** raw 不能丢（落地判定要用它），但它在 seek 刚
+            // 下发的这几十毫秒里不可信：这台厂商播放器会报出 **≈(时长-1 秒)** 的位置
+            // （真机：Seek 200000ms 后 167ms 来 EOS，已观察最远位置=263000ms/264000ms）。
+            boolean seekInFlight = pending >= 0 && !pendingSeekLanded;
+            // 「假 EOS」判据的水位线：只抬不落，记本次播放见过的最远位置。
+            // 采进那个假读数，紧随其后的假 EOS 就"离片尾只差 1 秒"→ 判成真播完
+            // → 报 STOPPED —— 真机第一首拖完直接停就是这么来的。
+            if (!seekInFlight && raw > maxPlayedMs) {
+                maxPlayedMs = raw;
+            }
+            // 位置水位线：会话内见过的最大位置 + 见到它的墙钟。
             // 正常播放时位置每拍都在前进、水位线每拍都在抬，冻结局不会触发；
             // 它只在「位置真的停摆」的平台上兜底（见下面的外推分支）。
-            if (raw > hiRaw) {
+            //
+            // 同样不采 seek 在飞期间的 raw：往回拖时 player 还停在 seek 之前的
+            // 旧位置，而旧位置**比 seekTo 设下的目标大** —— 采进去就把 seekTo 刚
+            // 对齐好的水位线当场顶掉（网易云 15 次/秒的轮询几乎必然命中）。等 seek
+            // 落地、位置低于水位线，外推分支便拿**拖之前的旧位置**当基准，2 秒
+            // （{@link PlaybackPolicy#POSITION_FREEZE_EXTRAPOLATE_MS}）后把手机进度条
+            // 拉回原处 —— 真机表现就是「拖了没生效，卡两秒又跳回原位」。
+            if (!seekInFlight && raw > hiRaw) {
                 hiRaw = raw;
                 hiWall = now;
             }
-            long pending = pendingSeekMs;
             if (pending >= 0) {
                 if (PlaybackPolicy.isSeekSettled(raw, pending)) {
                     // 落地**锁存**：位置一旦到达目标附近，这次 seek 就算完成。
@@ -1150,6 +1403,9 @@ public class MediaPlayerController {
         // 会被当成「冻结」而误触发外推。
         hiRaw = -1;
         hiWall = 0;
+        // 「假 EOS」水位线随实例一起作废：新实例是另一次播放（重连 / 换片 / 续播），
+        // 不清的话上一次播放的远位置会让新播放的假 EOS 判据直接失灵。
+        maxPlayedMs = -1;
         // 实例都没了，"准备中"和"待决的 seek"也就失去了载体。
         // 不清的话，下一次播放的「当前位置」会一直报上一次拖到的那个位置 ——
         // 控制点看到的进度条是上一部片子的。

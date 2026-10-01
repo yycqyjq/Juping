@@ -47,6 +47,53 @@ public final class PlaybackPolicy {
     public static final int VIDEO_RECHECK_MAX_ATTEMPTS = 2;
 
     /**
+     * 厂商 info 事件码：「这段视频的**画面**编码本机解不了」。
+     *
+     * <p>真机实证（海信 MTK 4.0.4，2026-10-01）：手机投一段 HEVC 录像，电视上
+     * **一片纯黑、声音正常、进度照走**，厂商侧日志是
+     * <pre>
+     *   IMTK_PB_CTRL_EVENT_PLAYBACK_ERROR, u4Data = 2
+     *   send event: MTK_MEDIA_INFO_VID_CODEC_NOT_SUPPORT
+     * </pre>
+     * 画面流**根本没被打开** —— 对照同一台盒子上的 H.264 文件，日志里有
+     * {@code open stream type ST_VIDEO} / {@code set video codec(VID_ENC_H264)}
+     * / {@code SVCTX_NTFY_CODE_VIDEO_FMT_UPDATE}，而 HEVC 那份只有
+     * {@code open stream type ST_AUDIO}，从头到尾没有 VS_EOS。
+     *
+     * <p>厂商把这件事当 **info 事件**发，不中断播放：应用收不到
+     * {@code onError}，照样报「含视频画面」，用户在电视前完全无从判断
+     * 「是坏了、还是编码不支持」。这个事件经框架转发的形态就是
+     * {@code MediaPlayer.OnInfoListener.onInfo(what=0x8003, extra=0)}。
+     *
+     * <p><b>为什么不能改用 {@code getVideoWidth()}</b>：本轮真机对照实测（同一台
+     * 盒子，各跑 2~3 遍）——
+     * <pre>
+     *                        HEVC（画面解不了）   H.264（画面正常）
+     *   getVideoWidth()@2s        0x0                  0x0
+     *   getVideoWidth()@5s        0x0                  0x0
+     *   onVideoSizeChanged        从不                  从不
+     *   info what=0x8003          每次都发              从不
+     * </pre>
+     * 也就是说 {@code getVideoWidth()} 在这台盒子上**恒为 0**（画面走厂商硬件
+     * 图层，框架压根不知道尺寸），拿它当判据会把正常视频一起冤枉成"编码不支持"
+     * —— 这个误报是实测抓到的，不是推测。{@code what=0x8003} 是唯一能区分两者的信号。
+     *
+     * <p>Mango TV 之类第三方应用看不到这个码；它是 MTK 私有区间
+     * （{@code >= 0x8000}，标准 {@code MEDIA_INFO_*} 最大只到 802）。
+     */
+    public static final int INFO_VIDEO_CODEC_NOT_SUPPORT = 0x8003;
+
+    /**
+     * 这个 info 事件码是不是「画面编码解不了」。
+     *
+     * <p>放进纯逻辑层是为了能脱离 Android 跑断言 —— 判据在 {@code PlaybackPolicy}
+     * 里可离线验证，接线上报在服务层，与项目里错误分类的做法一致。
+     */
+    public static boolean isVideoCodecUnsupportedInfo(int what) {
+        return what == INFO_VIDEO_CODEC_NOT_SUPPORT;
+    }
+
+    /**
      * 位置冻结判定阈值：播放中原始位置连续这么久不变，就认为媒体时钟停摆
      * （海信 MTK 4.0.4 实测：Seek 后 getCurrentPosition() 永远停在 Seek 点，
      * 画面却在继续播），改用「最后位置 + 墙钟流逝」外推上报。
@@ -116,6 +163,21 @@ public final class PlaybackPolicy {
     /** 直播流 / 时长未知流的卡死判定阈值 */
     public static final long STALL_THRESHOLD_LIVE_MS = 60000L;
 
+    /**
+     * 「起播了，但一直没出声」的宽限期。
+     *
+     * <p>与 {@link #STALL_THRESHOLD_VOD_MS} 的区别是<b>两件不同的事</b>：
+     * 那个管「播着播着停了」（位置前进过、又不动了），这个管「压根没起来」
+     * （位置从始至终是 0）。后者不需要那么长的观察窗口 —— 位置从来没动过，
+     * 就不存在「本来在播、被我误杀」的可能。
+     *
+     * <p>真机证据（秋殇，mp3）：上一首播完，控制点 0.6 秒后送来下一首，
+     * prepare 成功（时长 267000ms 已知）、状态报 PLAYING，但位置从
+     * 18:06:00.108 到 18:06:25.122 一直冻在 0ms —— 全程静音。通用阈值
+     * 20s + 看门狗 5s 才把它捞到，用户感受就是「切到下一首了但没播放」。
+     */
+    public static final long NOT_STARTED_GRACE_MS = 8000L;
+
     /** 错误重连的最大次数 */
     public static final int MAX_RETRY = 5;
 
@@ -159,6 +221,37 @@ public final class PlaybackPolicy {
      */
     public static boolean isStalled(long elapsedSinceProgressMs, int durationMs) {
         return elapsedSinceProgressMs > stallThresholdMs(durationMs);
+    }
+
+    /**
+     * 「起播了，但一直没出声」—— 该立刻重建播放器，而不是等通用卡死阈值。
+     *
+     * <p>厂商栈偶发地出现「prepare 成功、状态报 PLAYING，音频却根本没推出去」：
+     * 位置从起播那一刻起恒为 0，一帧都不走。这不是"卡了一下"，是"没开始"。
+     *
+     * <p>三个必须同时成立的条件，各有理由：
+     * <ul>
+     *   <li>{@code prepared && !userPaused}：还没就绪时位置本来就是 0；用户主动
+     *       暂停时位置也不动 —— 这两种都不是故障。</li>
+     *   <li>{@code positionMs <= 0}：位置动过（哪怕只有 1ms）就说明音频通道是通的，
+     *       那是"卡死"而不是"没起来"，交给 {@link #isStalled} 用长阈值判。</li>
+     *   <li>{@code !isLiveStream}：直播的位置<strong>本来就可能长时间是 0</strong>
+     *       （还没拿到首个时间戳）。把直播算进来的话，正常直播会被反复重建。</li>
+     * </ul>
+     */
+    public static boolean isNotStarted(boolean prepared, boolean userPaused,
+                                       long positionMs, int durationMs,
+                                       long elapsedSincePlayMs) {
+        if (!prepared || userPaused) {
+            return false;
+        }
+        if (positionMs > 0) {
+            return false;
+        }
+        if (isLiveStream(durationMs)) {
+            return false;
+        }
+        return elapsedSincePlayMs >= NOT_STARTED_GRACE_MS;
     }
 
     /**
@@ -404,5 +497,116 @@ public final class PlaybackPolicy {
             case ERR_UNKNOWN: return "UNKNOWN";
             default:          return "NONE";
         }
+    }
+
+    // ------------------------------------------------- 「假 EOS」判据
+
+    /**
+     * 判定「播完」时，位置距离总时长还差多少毫秒就不算真播完。
+     *
+     * <p>10 秒的余量是给真实收尾留的：老芯片在自然播完前的最后一段
+     * 位置上报会稀疏下来，而控制点给的 duration 与实际时长也常有
+     * 几百毫秒到几秒的偏差（本项目实测 flower.mp4 报 00:06 / 实际 11s）。
+     * 差得比 10 秒还多，就绝不可能真的是"播完了"。
+     */
+    public static final long SPURIOUS_EOS_MIN_REMAINING_MS = 10000L;
+
+    /**
+     * 时长小于这个值的流不做「假 EOS」判定。
+     *
+     * <p>短流（提示音、几十秒的短视频）的 duration 元数据质量最差，
+     * 而它本来就该很快播完 —— 对它做判定，收益小、误伤大，不如不判定。
+     */
+    public static final int SPURIOUS_EOS_MIN_DURATION_MS = 20000;
+
+    /**
+     * 起播超过这么久，一律认定为「真播完」，不再做假 EOS 判定。
+     *
+     * <p><b>这是保护自然播完路径的最后一道闸</b>。判据只看「观察到的最大位置」，
+     * 而位置是靠看门狗（每 5 秒一拍）和 {@code GetPositionInfo} 采样来的 ——
+     * 万一采样错过了尾段（比如控制点一直没轮询、看门狗又恰好被判成 idle 跳过），
+     * 最大位置就会停在中段，把一次**正常的播完**误判成假 EOS，
+     * 于是"一首歌正常放完"变成 5 轮退避后报 ERROR —— 比现状更糟。
+     *
+     * <p>所以加一条时间闸：真的播完一个 3 分钟的视频，起播至今必然远超 60 秒；
+     * 而厂商那个把"释放旧资源 / 切输入源"规范化成 EOS 的误报，
+     * 全都在起播后 1 秒内发生（真机 8 次实测，最长 0.51 秒）。
+     * 60 秒足以把两者彻底分开，又留了几十倍的余量。
+     */
+    public static final long SPURIOUS_EOS_EARLY_WINDOW_MS = 60000L;
+
+    /**
+     * 这次 {@code onCompletion} 是不是厂商层的「假 EOS」。
+     *
+     * <h3>为什么要判这个</h3>
+     * 本机的厂商栈（海信 Vision-TV / MTK CmpbPlayer）会把
+     * <b>「释放旧播放器资源」和「切换输入源」规范化成一次 EOS 事件</b>
+     * （日志原文 {@code This is adt event,the Normal event type is EOS!!!}），
+     * 框架据此回调 Java 层 {@code onCompletion}。真机实测 8 次，每次都在 1 秒内
+     * 紧跟一个「播放状态: STOPPED」。
+     *
+     * <p>最典型的表现：<b>投完视频再投音频，首次 Set 直接变 STOPPED</b> ——
+     * 因为切到音频要重新配置输出通道，触发了上面那次资源释放。
+     * 手机侧显示"投上了"，电视侧却已经停了，用户以为投屏坏了。
+     *
+     * <p>正确的处置是：这明显不是"播完了"，应当重建播放器重试
+     * （{@link #SPURIOUS_EOS_EARLY_WINDOW_MS} 的时间闸保证不会误伤真播完）。
+     *
+     * @param preparing         是否仍在 prepare（回调还没到）
+     * @param elapsedSinceStartMs 起播至今的毫秒数
+     * @param maxObservedPositionMs 本次播放观察到过的最远位置；从未采到传 -1
+     * @param durationMs        总时长；未知传 0 或负
+     * @return true 表示这是假 EOS，不该报 STOPPED，应当重连
+     */
+    public static boolean isSpuriousCompletion(boolean preparing, long elapsedSinceStartMs,
+                                               int maxObservedPositionMs, int durationMs) {
+        // ① 还没 prepare 完，谈不上「播完」。
+        //
+        // 这一条直接覆盖用户报的那个现象：14:47:40 那次 Set 之后，
+        // PREPARING(.321) 与 STOPPED(.831) 之间**没有 PLAYING** ——
+        // onPrepared 从未到达，preparing 仍为 true。
+        // 定义上不可能播完，不必等任何采样。
+        if (preparing) {
+            return true;
+        }
+        // ② 时长未知或太短：判据的两个输入都不可靠，不做判定。
+        if (durationMs < SPURIOUS_EOS_MIN_DURATION_MS) {
+            return false;
+        }
+        // ③ 起播已久 —— 保护自然播完（见 SPURIOUS_EOS_EARLY_WINDOW_MS 的长注释）。
+        if (elapsedSinceStartMs >= SPURIOUS_EOS_EARLY_WINDOW_MS) {
+            return false;
+        }
+        // ④ 观察到的最大位置离总时长还差得远 → 不可能真播完。
+        //
+        // 从未采到位置（-1）按 0 处理：宁可把一次「采不到位置的短播放」
+        // 判成假 EOS 去重连（重连至少能让它继续），也不要凭空报一个 STOPPED。
+        int max = maxObservedPositionMs > 0 ? maxObservedPositionMs : 0;
+        return (long) durationMs - max > SPURIOUS_EOS_MIN_REMAINING_MS;
+    }
+
+    /**
+     * 「假 EOS 重建」后允许补发同一次 seek 的最大次数。
+     *
+     * <p><b>为什么必须有上限</b>：厂商栈对个别文件会<b>直接拒绝</b> seek ——
+     * 真机（秋殇 mp3，267000ms）Seek 53000ms 时日志原文
+     * {@code IMtkPb_Ctrl_TimeSeekMS() Failed !}、MTK 报 {@code ret -6}，
+     * 随后照例来一次假 EOS。重建后 {@code onPrepared} 把这个 seek 原样补发，
+     * 于是又失败、又来假 EOS、又重建……形成死循环（真机一轮约 1.5 秒，
+     * 连续 51 轮不止；这段时间盒子既不播、又一直向控制点谎报"已到 53 秒"）。
+     *
+     * <p>补发过 {@link #MAX_SEEK_REPLAY} 次仍失败，就认定这个 seek 厂商做不到：
+     * 丢掉它、照常从头播放、如实报真实位置；用户想重试再拖一次即可
+     * （新的 {@code seekTo} 会把计数清零）。
+     */
+    public static final int MAX_SEEK_REPLAY = 1;
+
+    /**
+     * 重建后还能不能再补发一次 seek（超过上限就丢掉，避免无限重建）。
+     *
+     * @param replaysSoFar 本次 seek 已经补发过几次
+     */
+    public static boolean canReplaySeekAfterRebuild(int replaysSoFar) {
+        return replaysSoFar < MAX_SEEK_REPLAY;
     }
 }

@@ -11,6 +11,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.util.Log;
+import android.view.KeyEvent;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
@@ -99,6 +100,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private TextView infoAddress;
     private TextView infoNetwork;
     private TextView infoState;
+    private TextView infoVersion;
     private TextView infoSource;
     private TextView playingText;
     private TextView musicSource;
@@ -133,6 +135,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * 每 tick 都往后台再排一个下载任务，同一个文件被重复下一堆。
      */
     private String imageLoadingUri;
+    /**
+     * 已经下载/解码**失败**过的那个地址 —— 同一个地址不再每个 tick 重试。
+     *
+     * <p>{@link #refresh()} 每 0.5 秒问一次 {@link #loadImage}，而失败的地址既不会
+     * 进 {@code imageUri} 也不会进 {@code imageLoadingUri}，于是下一个 tick 又原样
+     * 重来一遍。真机实测（地址 404 时）：15 秒内发了 30 次请求、弹了 30 次 Toast ——
+     * 在这台 0.6GB 的盒子上是纯粹的浪费。记下来，等地址换了再试。
+     */
+    private String imageFailedUri;
 
     private final Handler handler = new Handler();
 
@@ -182,11 +193,24 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         infoAddress = (TextView) findViewById(R.id.info_address);
         infoNetwork = (TextView) findViewById(R.id.info_network);
         infoState = (TextView) findViewById(R.id.info_state);
+        infoVersion = (TextView) findViewById(R.id.info_version);
         infoSource = (TextView) findViewById(R.id.info_source);
         playingText = (TextView) findViewById(R.id.playing_text);
         musicSource = (TextView) findViewById(R.id.music_source);
         musicProgress = (TextView) findViewById(R.id.music_progress);
         btnRestart = (Button) findViewById(R.id.btn_restart);
+
+        // 版本号只在进程启动时取一次：它是构建产物里的常量（BuildConfig 由
+        // build.gradle 的 versionName/versionCode 生成），运行期不会变 ——
+        // 放进 refresh() 的 tick 里每 0.5 秒重刷一遍是白烧 CPU。
+        //
+        // **刻意不写死字面量**：写死就一定会漂。真机排障第一句问的是
+        // 「盒子上装的是哪一版」，答错等于白试一轮；而发版时唯一的动作
+        // 就是改 build.gradle 那两个数，界面自动跟上。
+        //
+        // 只显示 versionName（如 0.1.11）：versionCode 是给系统比新旧用的整数，
+        // 界面上没有意义 —— 原来写成 "0.1.9（10）"，用户看到括号里的数只会问"这是什么"。
+        infoVersion.setText(getString(R.string.fmt_version, BuildConfig.VERSION_NAME));
 
         surfaceView.getHolder().addCallback(this);
 
@@ -241,6 +265,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // 所以它必须每个 tick 重算一次，不能只在形态切换时算。
         applyTopBar(mode);
 
+        // 图片形态下，片源地址会在**同一个形态之内**换掉 —— 相册里连投几张就是
+        // 这种：每一张都是 MODE_IMAGE，形态从头到尾没变过。而
+        // applyModeIfChanged() 只在形态真的变了时才调 applyMode()，
+        // 形态不变就一次都不会走到 loadImage()，于是电视永远停在第 1 张
+        // （用户报的「切了好几张还是原来那张」）。
+        // 所以这里每个 tick 都问一次；loadImage() 自己按地址去重
+        // （imageUri / imageLoadingUri），地址没变时立刻返回，不会重复下载。
+        if (mode == MODE_IMAGE) {
+            loadImage(service.getCurrentUri());
+        }
+
         // 面板（含它那个状态圆点）只有 idle 时才看得见。
         // 播放期间每 0.5 秒重刷一遍这些文字和背景是白费力气 ——
         // 它们在此期间根本不会变，而面板此时本来就是隐藏的。
@@ -287,7 +322,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // 「放到哪儿了」，所以两种形态都报进度。原来音频时这里固定写
         // 「音乐投屏」是因为状态条常驻、和音乐卡片的大标题重复了 ——
         // 条子不再常驻，那个理由也就不成立了。
-        playingText.setText(dur > 0 ? progress : currentLabel());
+        //
+        // 例外是「画面出不来」：那时进度条上的时间对用户毫无意义 ——
+        // 屏幕一片黑，他要知道的是"为什么黑"。而这条子正是为这种时刻准备的
+        // （见 applyTopBar 的说明），所以让它说原因，优先级高于进度。
+        // 真报错时不抢：报错自报错，别拿"编码不支持"去替真正的故障背锅。
+        boolean error = (service.getLastErrorKind() != PlaybackPolicy.ERR_NONE);
+        if (!error && service.isVideoMissing()) {
+            playingText.setText(R.string.hint_video_unsupported);
+        } else {
+            playingText.setText(dur > 0 ? progress : currentLabel());
+        }
     }
 
     /**
@@ -356,7 +401,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (uri == null || uri.length() == 0) {
             return;
         }
-        if (uri.equals(imageUri) || uri.equals(imageLoadingUri)) {
+        if (uri.equals(imageUri) || uri.equals(imageLoadingUri)
+                || uri.equals(imageFailedUri)) {
             return;
         }
         imageLoadingUri = uri;
@@ -468,6 +514,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      */
     private void showImage(String uri, Bitmap bmp) {
         if (bmp == null) {
+            // 记下这个坏地址：refresh() 每 0.5 秒就会再问一次 loadImage，
+            // 不记的话同一个坏地址会被无限重试（真机实测 15 秒 30 次请求 + 30 次
+            // Toast）。等控制点换成别的地址，imageFailedUri 自然不匹配，重试恢复。
+            imageFailedUri = uri;
             imageView.setImageBitmap(null);
             Toast.makeText(this, R.string.toast_image_failed, Toast.LENGTH_LONG).show();
             return;
@@ -489,6 +539,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         imageBitmap = null;
         imageUri = null;
         imageLoadingUri = null;
+        // 「失败过的地址」也要一起清：回到空闲再投同一张图时应当重试一次，
+        // 不能因为上次失败（比如当时网还没通）就永远显示不出来。
+        imageFailedUri = null;
         if (b != null) {
             imageView.setImageBitmap(null);
             if (!b.isRecycled()) {
@@ -656,13 +709,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             // 用分类判断，不用「细节字符串非空」—— 后者是拿"有没有那句话"
             // 当"有没有出错"，一旦哪天细节被清空而分类还在，这里就会漏报。
             boolean error = (service.getLastErrorKind() != PlaybackPolicy.ERR_NONE);
-            show = error || "PAUSED_PLAYBACK".equals(ts) || "TRANSITIONING".equals(ts);
-            if (error) {
-                // 出错就亮红点。
+            // 「形态是视频、画面却始终没出来」也算"有话说"：那种情形下屏幕就是
+            // **一片纯黑**，而顶条是用户唯一能看到的解释。不写它，他连"是盒子坏了
+            // 还是这段视频放不了"都判断不了（真机实证见
+            // PlaybackPolicy.INFO_VIDEO_CODEC_NOT_SUPPORT）。
+            boolean noPicture = service.isVideoMissing();
+            show = error || noPicture || "PAUSED_PLAYBACK".equals(ts) || "TRANSITIONING".equals(ts);
+            if (error || noPicture) {
+                // 出错、以及「画面出不来」都亮红点。
                 // 这个点原来是**写死的绿色**，而顶部条现在恰恰只在
                 // 「暂停 / 出错 / 缓冲」时出现 —— 出错时左边一个绿点、
                 // 右边写着「出错：…」，自己跟自己打架。
-                // 三米外先被看见的是颜色而不是那行小字，所以颜色必须说实话。
+                // 三米外先被看见的是颜色而不是那行小字，所以颜色必须说实话；
+                // 「画面出不来」同样是"这条投屏没成功"，绿点会让人以为一切正常。
                 dot = R.drawable.dot_error;
             } else if ("TRANSITIONING".equals(ts)) {
                 // 缓冲 / 重连中：蓝点表示"还在动"，而不是"已经好了"
@@ -836,6 +895,30 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (service != null && service.getPlayer() != null) {
             service.getPlayer().setSurface(null);
         }
+    }
+
+    /**
+     * 遥控器返回键 = 结束投屏，回引导面板。
+     *
+     * <p><b>为什么是返回键</b>：盒子这边没有"关闭投屏"的入口 —— DLNA 只管推流，
+     * 控制点（手机 App）退出时不会告诉盒子"我不玩了"。原先试过"播完 60 秒没有
+     * 控制指令就自动收尾"，那是在替用户猜他的意图；现在改成用户自己按一下，
+     * 盒子立刻回引导面板。
+     *
+     * <p>走的是控制点 Stop 的同一条路（{@code service.onStop()}）：清 currentUri、
+     * 清元数据与下一曲、发一次 AVTransport 事件 —— 与手机端按停止的效果完全一致
+     * （包括"回到二维码面板"）。
+     *
+     * <p><b>空闲态不拦</b>：那时返回键就是正常的"退出应用"，没理由改变它。
+     */
+    @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        if (keyCode == KeyEvent.KEYCODE_BACK && service != null
+                && currentMode() != MODE_IDLE) {
+            service.onStop();
+            return true;
+        }
+        return super.onKeyDown(keyCode, event);
     }
 
     @Override

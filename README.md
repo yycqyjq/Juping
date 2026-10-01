@@ -87,8 +87,8 @@ Juping/
     │   ├── verify-device-selftest.sh  用假 adb 验 verify-on-device.sh 的管道
     │   └── android/util/Log.java    android.util.Log 的桌面替身
     ├── policy-test/          播放重连策略测试（纯逻辑，不需要真机）
-    │   ├── run.sh            编译 + 57 项断言 + 306 条源码级守卫
-    │   └── PolicyTest.java   57 项断言 + 「卡死→重连→又卡死」循环模拟
+    │   ├── run.sh            编译 + 78 项断言 + 364 条源码级守卫
+    │   └── PolicyTest.java   78 项断言 + 「卡死→重连→又卡死」循环模拟
     ├── proxy-test/           本地预取代理字节一致性测试（11 项）
     │   ├── run.sh            编译 → 起源站 → 全量/Range/回拖/EOS/中途重连 逐字节比对
     │   └── ProxyTest.java    JDK 自带 HttpServer 当片源
@@ -121,8 +121,8 @@ Juping/
 产物：
 
 ```
-dist/juping-0.1.7-release.apk   ← 装机用这个（已签名）
-dist/juping-0.1.7-debug.apk     ← 排障用（带 debuggable 标记）
+dist/juping-0.1.13-release.apk   ← 装机用这个（已签名）
+dist/juping-0.1.13-debug.apk     ← 排障用（带 debuggable 标记）
 ```
 
 `dist` 目标会在归集后**自动跑八道闸**，任何一道不过就报错退出 —— 免得把一个装不上的、点开就崩的、投不进来的、断联后恢复不了的、字节被传坏了、或者带着签名密钥的包交出去：
@@ -186,7 +186,7 @@ release 密钥在 `keystore/juping-release.jks`，密码在 `keystore.properties
 可以用这个命令确认：
 
 ```bash
-unzip -p dist/juping-0.1.7-release.apk META-INF/MANIFEST.MF | grep Digest
+unzip -p dist/juping-0.1.13-release.apk META-INF/MANIFEST.MF | grep Digest
 # 应该看到 SHA1-Digest: ...，而不是 SHA-256-Digest
 ```
 
@@ -206,7 +206,7 @@ unzip -p dist/juping-0.1.7-release.apk META-INF/MANIFEST.MF | grep Digest
 
 ```bash
 adb connect <盒子IP>:5555        # 或 USB 连接
-adb install -r dist/juping-0.1.7-release.apk
+adb install -r dist/juping-0.1.13-release.apk
 ```
 
 局域网 adb 需要盒子侧已经开着网络调试并在监听 5555 —— 零售盒子默认是关的，
@@ -214,7 +214,7 @@ adb install -r dist/juping-0.1.7-release.apk
 
 ### 路径 B：U 盘（最通用，不依赖任何调试通道）
 
-1. 把 `dist/juping-0.1.7-release.apk` 拷到 U 盘。**用 FAT32** ——
+1. 把 `dist/juping-0.1.13-release.apk` 拷到 U 盘。**用 FAT32** ——
    老盒子对 exFAT / NTFS 的支持看 ROM 心情，FAT32 是唯一稳的
 2. U 盘插上盒子，用盒子自带的「文件管理 / 本地媒体 / USB 设备」找到这个文件
 3. 点它安装
@@ -228,7 +228,7 @@ adb install -r dist/juping-0.1.7-release.apk
   和源文件比一下大小，不一致就重拷一遍：
 
   ```bash
-  ls -l dist/juping-0.1.7-release.apk   # 记下这个字节数，再和 U 盘里那个比
+  ls -l dist/juping-0.1.13-release.apk   # 记下这个字节数，再和 U 盘里那个比
   # 两个数一致就说明拷完整了。
   # 刻意不写死具体数字 —— 每次重新构建都会变，写死的那份迟早对不上，
   # 反而会让人以为文件拷坏了（这里原来就写着一个过期的字节数）。
@@ -240,7 +240,7 @@ adb install -r dist/juping-0.1.7-release.apk
 
 ```bash
 cd dist && python3 -m http.server 8000
-# 盒子浏览器打开 http://<Mac 的 IP>:8000/juping-0.1.7-release.apk
+# 盒子浏览器打开 http://<Mac 的 IP>:8000/juping-0.1.12-release.apk
 ```
 
 ### 共同前提：允许「未知来源」
@@ -634,7 +634,7 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 ```
 
 ```
-播放策略：57 / 57 通过
+播放策略：67 / 67 通过
 ```
 
 > **抓出的 bug：熔断机制形同虚设。**
@@ -890,7 +890,7 @@ com/juping/cast/player/…                   →  找不到这个前缀
 
 > **最后一条是在防「核了个陈旧产物」。** 这条闸门接在 `dist` 流程里，核的是
 > 刚编出来的包；但万一有人对着 `dist/` 里的旧包跑核验，常量这一项会立刻戳穿它。
-> 顺手把 `dist/` 清干净也是同一个道理：升过版本之后不清目录，`0.1.7` 和 `0.1.7`
+> 顺手把 `dist/` 清干净也是同一个道理：升过版本之后不清目录，`0.1.12` 和 `0.1.11`
 > 会一起躺着，装机时文件名只差一个数字，眼睛一扫就挑错。
 > 现在 `collect()` 第一件事就是 `rm -f dist/*.apk`。
 >
@@ -1360,8 +1360,8 @@ SCPD 如实声明、控制点发的动作如实响应 —— 做不到的如实�
   一轮，暴露并修掉：视频误判音频、进度条冻死在 Seek 点、-38 错误刷屏
   死循环、切歌后媒体服务卡死（全部见「排障」一节）。
   桌面核验现在是十六项全绿：编译 / lint `NewApi` 零命中 /
-  API 引用 377 项（release 383 项）全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
-  DLNA 协议 245 项通过 / 播放策略 57 项断言 + 306 条源码级守卫通过 /
+  API 引用 381 项（release 387 项）全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
+  DLNA 协议 245 项通过 / 播放策略 78 项断言 + 364 条源码级守卫通过 /
   断言/守卫计数与 README、AGENTS 文档一致（`check_gate_counts.py`，覆盖协议/代理/网页/probe/策略五道）/
   本地预取代理字节一致性 11 项通过 / 网页逻辑一致性 32 项通过 / R8 dex 入口点 42 项通过 /
   控制点自检脚本 33 或 34 项通过（组播回退分支所致，均为合法值）/

@@ -67,6 +67,37 @@ public class PolicyTest {
                 PlaybackPolicy.stallDetectionUpperBoundMs(7200000) == 25000L,
                 "得到 " + PlaybackPolicy.stallDetectionUpperBoundMs(7200000));
 
+        System.out.println("\n── 2.5 「起播了但一直没出声」的判据 ──");
+        System.out.println("   与卡死是两件事：卡死是「位置前进过、又停了」，");
+        System.out.println("   这个是「位置从头到尾是 0」—— 后者不该等 20 秒那道阈值。");
+
+        check("就绪 + 位置恒 0 + 刚够宽限 8s → 判「没起播」",
+                PlaybackPolicy.isNotStarted(true, false, 0, 267000, 8000L), "elapsed=8000");
+        check("位置恒 0 但只过了 7.999s → 还没到，再等等",
+                !PlaybackPolicy.isNotStarted(true, false, 0, 267000, 7999L), "elapsed=7999");
+        check("位置动过 1ms → 不是「没起播」（那是卡死，交给 20s 阈值）",
+                !PlaybackPolicy.isNotStarted(true, false, 1, 267000, 60000L), "pos=1");
+        check("还没 prepare 完 → 不判（此时位置本来就是 0）",
+                !PlaybackPolicy.isNotStarted(false, false, 0, 267000, 60000L), "prepared=false");
+        check("用户主动暂停 → 不判（暂停时位置当然不动）",
+                !PlaybackPolicy.isNotStarted(true, true, 0, 267000, 60000L), "userPaused=true");
+        check("直播（时长 0）位置长时间为 0 → 不判（直播位置本来就可能恒 0）",
+                !PlaybackPolicy.isNotStarted(true, false, 0, 0, 120000L), "duration=0");
+        check("时长未知（-1）按直播处理 → 同样不判",
+                !PlaybackPolicy.isNotStarted(true, false, 0, -1, 120000L), "duration=-1");
+
+        System.out.println("\n── 2.6 「重建后补发 seek」的次数上限 ──");
+        System.out.println("   厂商栈对个别文件直接拒绝 seek，补发过去照样失败、照样来假 EOS；");
+        System.out.println("   没有上限就是「重建 → 补发 → 又失败 → 又重建」的死循环。");
+
+        check("还没补发过 → 允许补发一次", PlaybackPolicy.canReplaySeekAfterRebuild(0), "count=0");
+        check("已经补发 1 次 → 不再补发（否则死循环）",
+                !PlaybackPolicy.canReplaySeekAfterRebuild(1), "count=1");
+        check("已经补发 2 次 → 更不该补发",
+                !PlaybackPolicy.canReplaySeekAfterRebuild(2), "count=2");
+        check("上限常量为 1（补发一次仍失败就丢）", PlaybackPolicy.MAX_SEEK_REPLAY == 1,
+                "MAX_SEEK_REPLAY=" + PlaybackPolicy.MAX_SEEK_REPLAY);
+
         System.out.println("\n── 3. 指数退避表 ──");
 
         long[] expected = {1000L, 2000L, 4000L, 8000L, 16000L};
@@ -247,6 +278,55 @@ public class PolicyTest {
         // 注意：这一节刻意**不调用** PlaybackPolicy —— 它只证明「旧错法确实会错」。
         // 语义断言全部在第 10 节，两边不重叠，破坏性证伪时才能一处破坏只红一条。
 
+        System.out.println("\n── 12. 「假 EOS」判据（厂商层把「切输入源」报成了播完）──");
+        System.out.println("   厂商栈会把「释放旧播放器资源」和「切换输入源」规范化成一次 EOS");
+        System.out.println("   （日志原文 This is adt event,the Normal event type is EOS!!!），");
+        System.out.println("   框架据此回调 onCompletion —— 而那时位置离总时长还差得远。");
+
+        // ① 还在 prepare：定义上不可能播完。
+        // 这一格就是用户报的「投完视频再投音频，首次 Set 直接变 STOPPED」——
+        // 真机上 PREPARING 与 STOPPED 之间没有 PLAYING，onPrepared 从未到达。
+        check("还在 prepare → 判为假 EOS",
+                PlaybackPolicy.isSpuriousCompletion(true, 300L, -1, 271000),
+                "preparing=true：prepare 回调都没到，谈不上播完");
+        check("还在 prepare 且时长未知 → 仍是假 EOS",
+                PlaybackPolicy.isSpuriousCompletion(true, 300L, -1, 0),
+                "不能因为 duration=0 就放行 —— 否则「首次 Set 即 STOPPED」照样漏网。"
+                + "preparing 这一条必须排在时长判定**之前**");
+
+        // ② 真机那一幕：271 秒的歌，起播半秒就报播完。
+        check("271s 的音频只播了 0.5s 就报播完 → 假 EOS",
+                PlaybackPolicy.isSpuriousCompletion(false, 500L, 300, 271000),
+                "真机 14:47:40 那一幕：位置 ≈0.3s / 时长 271s");
+
+        // ③ 真播完与边界 —— 这一组是「别误伤自然播完」的护栏。
+        check("真播完（位置≈时长）→ 不是假 EOS",
+                !PlaybackPolicy.isSpuriousCompletion(false, 20000L, 271000, 271000),
+                "这是必须保护的路径：正常放完的歌不能被判成假 EOS 去重连");
+        check("剩余恰好 10s → 不是假 EOS（判定用严格大于）",
+                !PlaybackPolicy.isSpuriousCompletion(false, 20000L, 261000, 271000),
+                "差 10000ms");
+        check("剩余 10001ms → 是假 EOS（与上一条只差 1 毫秒）",
+                PlaybackPolicy.isSpuriousCompletion(false, 20000L, 260999, 271000),
+                "差 10001ms —— 差一毫秒结论必须相反");
+
+        // ④ 两道闸：时长闸与时间闸。
+        check("时长 < 20s → 不做判定（短流元数据最不可靠）",
+                !PlaybackPolicy.isSpuriousCompletion(false, 500L, 0, 15000),
+                "duration=15000");
+        check("起播已 61s 才报播完 → 不做判定（保护自然播完）",
+                !PlaybackPolicy.isSpuriousCompletion(false, 61000L, 1000, 271000),
+                "elapsed=61000 —— 真播完一个长视频必然远超 60s，"
+                + "而厂商的误报真机 8 次全在起播 1s 内");
+        check("从未采到位置（-1）→ 按 0 处理 → 假 EOS",
+                PlaybackPolicy.isSpuriousCompletion(false, 500L, -1, 271000),
+                "宁可重连一次，也不要凭空报一个 STOPPED");
+
+        // ⑤ 反向验证：旧实现（不看位置、照实报 STOPPED）在真机那一幕确实误报。
+        check("【反向验证】旧实现照实报 STOPPED，而新判据判它是假 EOS",
+                oldAlwaysStops() && PlaybackPolicy.isSpuriousCompletion(false, 500L, 300, 271000),
+                "新旧结论相反 —— 这条断言能区分对错，不是恒真");
+
         System.out.println();
         System.out.println("=".repeat(62));
         System.out.println("播放策略：" + passed + " / " + total + " 通过");
@@ -302,6 +382,20 @@ public class PolicyTest {
      */
     static boolean urlOnlyWouldRebuild(String newUrl, String currentUrl) {
         return !(newUrl != null && newUrl.equals(currentUrl));
+    }
+
+    /**
+     * 旧实现（加「假 EOS」判据之前）的 onCompletion 行为，**仅用于反向验证**：
+     * 位置多近都照实报「播完」—— 末尾就是一句 {@code notifyState("STOPPED")}，
+     * 完全不看「播到哪了」，厂商层报什么就信什么。
+     *
+     * <p>留着它是为了让第 12 节那条反向断言**能红**：只有旧实现确实会误报、
+     * 新旧结论确实相反，那条断言才有证伪力。
+     *
+     * @return 恒为 true —— 旧实现无条件报播完
+     */
+    static boolean oldAlwaysStops() {
+        return true;
     }
 
     /**

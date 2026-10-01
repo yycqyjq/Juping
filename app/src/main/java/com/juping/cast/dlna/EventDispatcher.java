@@ -65,7 +65,18 @@ public class EventDispatcher {
 
     private static final int CONNECT_TIMEOUT_MS = 3000;
     private static final int READ_TIMEOUT_MS = 3000;
-    /** 连续失败这么多次就丢弃订阅 —— 控制点可能已经退出了。 */
+    /**
+     * 连续失败这么多次，就把订阅**标记为不可达**（{@link Sub#unreachable}）。
+     *
+     * <p><b>这里刻意不删表。</b>删表的下场是真机实测过的：控制点息屏后
+     * App 被挂起、回调连接被拒，三次投递失败就把订阅删了；等用户重新点亮
+     * 手机、App 恢复，拿原 SID 来续订 —— 表里已经没有这条，只能回 412。
+     * 而控制点收到 412 不会去重建订阅，于是事件通道**永久断掉**：
+     * 电视上下一首已经在放了，手机 UI 还卡在「暂停」不动。
+     *
+     * <p>正确做法是把它留到超时（或显式 UNSUBSCRIBE）为止，只打个"不可达"
+     * 的标记 —— 续订能原样接回来，投递也能自动恢复。
+     */
     private static final int MAX_FAIL = 3;
 
     /**
@@ -92,6 +103,14 @@ public class EventDispatcher {
         volatile long grantedSec;
         volatile int seq;
         volatile int failCount;
+        /**
+         * 连续投递失败已到 {@link #MAX_FAIL}，判定回调地址当前不可达。
+         *
+         * <p>只是个标记，**不代表订阅失效**：条目会一直留到超时或显式退订，
+         * 期间每次状态变化照常尝试投递；任意一次投递成功、或者控制点来续订，
+         * 都会把它清掉。{@link #aliveSubscriberCount()} 会跳过带这个标记的。
+         */
+        volatile boolean unreachable;
 
         Sub(String sid, String service) {
             this.sid = sid;
@@ -191,13 +210,24 @@ public class EventDispatcher {
         }
     }
 
-    /** 当前存活的（未过期）订阅数 —— Auto-Stop 判据用 */
+    /**
+     * 当前**投递得通**的订阅数 —— Auto-Stop 判据用。
+     *
+     * <p>为什么把不可达的排除掉：Auto-Stop 问的是「现在还有没有控制点在听」。
+     * 回调连接被拒三次之后（App 被杀、手机换了网段），这条订阅已经收不到
+     * 任何事件了 —— 把它算作存活，电视就会守着一条死订阅**永远不停**。
+     * 所以只有既未过期、又没被标为不可达的才算。
+     *
+     * <p>注意这不影响订阅本身的生命周期：不可达的条目照样留到超时、照样
+     * 接受续订。那是「事件通道能不能接回来」的问题，与「现在还有没有人在听」
+     * 是两件事。
+     */
     public int aliveSubscriberCount() {
         synchronized (this) {
             long now = System.currentTimeMillis();
             int n = 0;
             for (Sub s : subs.values()) {
-                if (s.expireAtMs > now) {
+                if (s.expireAtMs > now && !s.unreachable) {
                     n++;
                 }
             }
@@ -213,6 +243,14 @@ public class EventDispatcher {
     /**
      * 续订。控制点会带着 SID 再来一次 SUBSCRIBE。
      *
+     * <p>**只要表里还有这个 SID 就接受**，不管它之前被标成过什么状态。
+     * 条目只会因为两件事从表里消失：自己超时、控制点显式 UNSUBSCRIBE
+     * （见 {@link #MAX_FAIL}）—— 那才是真的"不认识"。
+     *
+     * <p>续订本身就是控制点还活着的直接证据：它是主动连上来发的这条请求。
+     * 所以顺手把失败计数和"不可达"标记一起清掉，重新算它可达；
+     * 要是回调其实还是死的，下一次投递失败会重新标记。
+     *
      * @return 新的超时秒数；SID 不认识时返回 -1（调用方应回 412）
      */
     public long renew(String sid, String timeoutHeader) {
@@ -225,6 +263,7 @@ public class EventDispatcher {
             s.grantedSec = t;
             s.expireAtMs = System.currentTimeMillis() + t * 1000L;
             s.failCount = 0;
+            s.unreachable = false;
             lastSubscribeAtMs = System.currentTimeMillis();
             Log.d(TAG, "续订 SID=" + sid + " 再保 " + t + "s");
             return t;
@@ -270,6 +309,10 @@ public class EventDispatcher {
      * <p>**非阻塞**：只是往单线程池里排个队，调用方（主线程 / HTTP 线程）
      * 不会被网络 IO 拖住。这一点很重要 —— 这个方法是从
      * {@code onStateChanged} 里调的，卡住就是界面卡住。
+     *
+     * <p>投递对象**包括被标为不可达的那些**：一次投递就是一次探测，
+     * 控制点恢复（手机点亮、换回原来的网）之后靠它自动接上线，
+     * 不需要任何人工干预。
      */
     public void notifyAll(String service) {
         List<String> sids = new ArrayList<String>();
@@ -330,14 +373,15 @@ public class EventDispatcher {
         }
         if (anyOk) {
             s.failCount = 0;
+            s.unreachable = false;
             Log.d(TAG, "已推送 " + s.service + " SEQ=" + seq + " 给 " + s.callbacks.size() + " 个回调");
         } else {
             s.failCount++;
-            if (s.failCount >= MAX_FAIL) {
-                synchronized (this) {
-                    subs.remove(sid);
-                }
-                Log.w(TAG, "回调连续失败 " + MAX_FAIL + " 次，丢弃订阅 SID=" + sid);
+            if (s.failCount >= MAX_FAIL && !s.unreachable) {
+                // 只标记，不删表 —— 删了的话控制点续订会被回 412，通道再也接不回来
+                // （见 MAX_FAIL 的注释）。标记之后照常投递，控制点一恢复就自动接上。
+                s.unreachable = true;
+                Log.w(TAG, "回调连续失败 " + MAX_FAIL + " 次，标记订阅不可达（保留） SID=" + sid);
             }
         }
     }
