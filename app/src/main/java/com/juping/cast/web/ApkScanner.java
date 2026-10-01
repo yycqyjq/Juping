@@ -53,7 +53,10 @@ public final class ApkScanner {
     private final Object lock = new Object();
     /** 最近一次扫描结果；null = 从未扫过。 */
     private List<ApkEntry> cache;
+    /** 上次结果是否被截断（到顶或超时）。 */
     private boolean cacheTruncated;
+    /** 上次结果是否因**超时**被截断（与到顶区分，页面文案不同）。 */
+    private boolean cacheTimedOut;
     private boolean scanning;
 
     public ApkScanner(Context context) {
@@ -133,21 +136,23 @@ public final class ApkScanner {
      * 同步扫描（含补元数据）。
      *
      * <p>跑在**调用者线程**上 —— 生产路径请用 {@link #scanAsync}，别在连接线程上调它。
+     *
+     * @return 扫描结果（含命中条目与**停因** —— 超时 / 到顶 / 取消都要如实带回去）
      */
-    public List<ApkEntry> scanNow() {
+    public ApkScan.Result scanNow() {
         List<File> rs = roots();
         long deadline = System.currentTimeMillis() + ApkScan.MAX_MILLIS;
-        List<ApkEntry> found = ApkScan.scan(rs, deadline, ApkScan.MAX_DEPTH,
+        ApkScan.Result res = ApkScan.scan(rs, deadline, ApkScan.MAX_DEPTH,
                 ApkScan.MAX_RESULTS, null);
         // 补元数据也吃时间预算：getPackageArchiveInfo 只读 zip 中央目录（不整包读入），
         // 但 300 个包挨个读也不便宜。超时就停，剩下的留 null —— 列表退回显示文件名。
-        for (int i = 0; i < found.size(); i++) {
+        for (int i = 0; i < res.entries.size(); i++) {
             if (System.currentTimeMillis() > deadline) {
                 break;
             }
-            enrich(found.get(i));
+            enrich(res.entries.get(i));
         }
-        return found;
+        return res;
     }
 
     /**
@@ -163,19 +168,22 @@ public final class ApkScanner {
         Thread t = new Thread(new Runnable() {
             @Override
             public void run() {
-                List<ApkEntry> r = scanNow();
-                boolean trunc = r.size() >= ApkScan.MAX_RESULTS;
+                ApkScan.Result res = scanNow();
+                // 截断判据来自内核的**停因**，不再按条数猜 —— 超时（没扫完）也必须算截断，
+                // 否则慢盘 / 大树下会把「没扫完」误报成「扫全了」。
+                boolean trunc = res.truncated();
                 boolean fresh;
                 synchronized (lock) {
                     fresh = (myGen == generation);
                     if (fresh) {
-                        cache = r;
+                        cache = res.entries;
                         cacheTruncated = trunc;
+                        cacheTimedOut = res.timedOut;
                         scanning = false;
                     }
                 }
                 if (fresh && cb != null) {
-                    cb.onResult(r, trunc);
+                    cb.onResult(res.entries, trunc);
                 }
             }
         }, "apk-scan");
@@ -209,6 +217,18 @@ public final class ApkScanner {
     public boolean isTruncated() {
         synchronized (lock) {
             return cacheTruncated;
+        }
+    }
+
+    /**
+     * 上次结果是否因**超时**被截断（8 秒预算用尽）。
+     *
+     * <p>与「到顶」区分开是为了文案：到顶是「只显示前 N 个（已达上限）」，
+     * 超时是「扫描超时，结果可能不全，点刷新重试」—— 后者还值得再试一次。
+     */
+    public boolean isTimedOut() {
+        synchronized (lock) {
+            return cacheTimedOut;
         }
     }
 

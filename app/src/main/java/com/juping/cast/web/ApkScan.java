@@ -112,19 +112,19 @@ public final class ApkScan {
     /**
      * 遍历所有根，收集 {@code .apk}。
      *
-     * @param roots      扫描根（通常来自 {@code ApkScanner.roots()}）；null/空 → 返回空表
+     * @param roots      扫描根（通常来自 {@code ApkScanner.roots()}）；null/空 → 返回空结果
      * @param deadlineMs 绝对截止时刻（{@code System.currentTimeMillis()} 口径）；
      *                   到点即停
      * @param maxDepth   深度上限（根 = 0）；≤0 时只扫根这一层
-     * @param maxResults 条数上限；≤0 时返回空表
+     * @param maxResults 条数上限；≤0 时返回空结果
      * @param cancel     取消回调；可为 null
-     * @return 命中的 APK（只填 file/name/size/modified），按遍历顺序
+     * @return 扫描结果（含命中条目与**停因**，见 {@link Result}）
      */
-    public static List<ApkEntry> scan(List<File> roots, long deadlineMs, int maxDepth,
-                                      int maxResults, Cancel cancel) {
+    public static Result scan(List<File> roots, long deadlineMs, int maxDepth,
+                              int maxResults, Cancel cancel) {
         List<ApkEntry> out = new ArrayList<ApkEntry>();
         if (roots == null || roots.isEmpty() || maxResults <= 0) {
-            return out;
+            return new Result(out, false, false, false);
         }
         // 已访问目录的真实路径集合 —— 防「同一卷挂多处 / 软链自指」把同一棵树扫两遍甚至死循环
         Set<String> visited = new HashSet<String>();
@@ -133,11 +133,15 @@ public final class ApkScan {
         for (int i = roots.size() - 1; i >= 0; i--) {
             stack.add(new Frame(roots.get(i), 0));
         }
+        boolean timedOut = false;
+        boolean cancelled = false;
         while (!stack.isEmpty()) {
             if (cancel != null && cancel.isCancelled()) {
+                cancelled = true;
                 break;
             }
             if (System.currentTimeMillis() > deadlineMs) {
+                timedOut = true;
                 break;
             }
             Frame f = stack.remove(stack.size() - 1);
@@ -164,7 +168,12 @@ public final class ApkScan {
                 } else if (k.isFile() && isApk(k.getName())) {
                     out.add(new ApkEntry(k, k.getName(), k.length(), k.lastModified()));
                     if (out.size() >= maxResults) {
-                        return out;     // 到顶即停
+                        // 到顶即停：不再往下递归 / 换卷 —— 0.6GB 设备上多扫一圈就是性能回归。
+                        // 「有没有漏」不必再遍历，只看**已经 list 出来的**东西（见 moreRemaining）：
+                        // 本目录剩余项里还有 apk/子目录、已收集的子目录、栈上待处理的目录，任一非空即
+                        // 保守地认为还有 —— 宁可多报一次「已截断」，也不能漏报成「扫全了」。
+                        return new Result(out, moreRemaining(kids, i + 1, subdirs, stack),
+                                false, false);
                     }
                 }
             }
@@ -172,7 +181,27 @@ public final class ApkScan {
                 stack.add(new Frame(subdirs.get(i), f.depth + 1));
             }
         }
-        return out;
+        return new Result(out, false, timedOut, cancelled);
+    }
+
+    /**
+     * 到顶时判断「是否可能还有漏的」—— <b>只看已 list 出来的东西，不额外遍历</b>。
+     *
+     * <p>任一为真即保守地认为还有：本目录剩余项里还有 apk 或子目录、本目录已收集到子目录、
+     * 栈上还有待处理的其它目录。都为空才是「确实扫完了、恰好 N 个」。
+     */
+    private static boolean moreRemaining(File[] kids, int from, List<File> subdirs,
+                                         List<Frame> stack) {
+        if (!subdirs.isEmpty() || !stack.isEmpty()) {
+            return true;
+        }
+        for (int j = from; j < kids.length; j++) {
+            File k = kids[j];
+            if (k.isDirectory() || (k.isFile() && isApk(k.getName()))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static String canonical(File f) {
@@ -199,6 +228,43 @@ public final class ApkScan {
         Frame(File dir, int depth) {
             this.dir = dir;
             this.depth = depth;
+        }
+    }
+
+    /**
+     * 一次扫描的结果：命中条目 + <b>停因</b>。
+     *
+     * <p><b>为什么必须带停因</b>：8 秒时间预算用尽时扫描会提前收手。若只回一个
+     * {@code List}，调用方就只能按「条数是否到顶」猜 —— 慢盘 / 大树在 8 秒内没扫完
+     * 时条数没到顶，于是被判成「扫全了」，用户对着**不全**的列表还以为都在。
+     * 所以把「怎么停的」一并带回来。
+     *
+     * <p>三个停因里，{@link #hitResultCap}（收满）与 {@link #timedOut}（超时）都算
+     * **截断**（{@link #truncated()}）；{@link #cancelled}（用户连点刷新 / 主动停）
+     * 不算 —— 那是用户自己要停，不是结果不全。
+     */
+    public static final class Result {
+
+        /** 命中的 APK（只填 file/name/size/modified） */
+        public final List<ApkEntry> entries;
+        /** 收满 {@link #MAX_RESULTS} 即停（后面可能还有） */
+        public final boolean hitResultCap;
+        /** 时间预算 {@link #MAX_MILLIS} 用尽即停（后面可能还有） */
+        public final boolean timedOut;
+        /** 被取消回调中断（用户连点刷新 / 主动停） */
+        public final boolean cancelled;
+
+        Result(List<ApkEntry> entries, boolean hitResultCap, boolean timedOut,
+               boolean cancelled) {
+            this.entries = entries;
+            this.hitResultCap = hitResultCap;
+            this.timedOut = timedOut;
+            this.cancelled = cancelled;
+        }
+
+        /** 结果是否**不全**（到顶或超时）。取消不算 —— 用户自己要停。 */
+        public boolean truncated() {
+            return hitResultCap || timedOut;
         }
     }
 }

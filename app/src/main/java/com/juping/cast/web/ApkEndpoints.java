@@ -109,6 +109,7 @@ public final class ApkEndpoints implements UpnpHttpServer.WebEndpoints {
         List<ApkEntry> apps = scanner.cached();
         boolean scanning = scanner.isScanning();
         boolean truncated = scanner.isTruncated();
+        boolean timedOut = scanner.isTimedOut();
         StringBuilder sb = new StringBuilder();
         sb.append("{\"apps\":[");
         if (apps != null) {
@@ -121,6 +122,8 @@ public final class ApkEndpoints implements UpnpHttpServer.WebEndpoints {
         }
         sb.append("],\"scanning\":").append(scanning);
         sb.append(",\"truncated\":").append(truncated);
+        // 单独报「超时」：到顶与超时都算截断，但文案不同（超时还值得点刷新重试）
+        sb.append(",\"timedOut\":").append(timedOut);
         sb.append(",\"installAllowed\":").append(target.isInstallAllowed());
         sb.append(",\"roots\":[");
         List<File> roots = scanner.roots();
@@ -376,7 +379,12 @@ public final class ApkEndpoints implements UpnpHttpServer.WebEndpoints {
             + "  for(var i=0;i<apps.length;i++){list.appendChild(row(apps[i]))}\n"
             + "  if(d.scanning){say('正在扫描外接存储…')}\n"
             + "  else if(!apps.length){say('外接存储上没有找到 APK 安装包')}\n"
-            + "  else{say('找到 '+apps.length+' 个'+(d.truncated?'（已截断，只显示前 '+apps.length+' 个）':''))}\n"
+            + "  else{\n"
+            + "    var note='';\n"
+            + "    if(d.timedOut){note='（扫描超时，结果可能不全，点「刷新」重试）'}\n"
+            + "    else if(d.truncated){note='（只显示前 '+apps.length+' 个，已达上限 300）'}\n"
+            + "    say('找到 '+apps.length+' 个'+note)\n"
+            + "  }\n"
             + "}\n"
             + "function row(a){\n"
             + "  var li=document.createElement('li');\n"

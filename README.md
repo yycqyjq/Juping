@@ -97,7 +97,7 @@ Juping/
     ├── proxy-test/           本地预取代理字节一致性测试（11 项）
     │   ├── run.sh            编译 → 起源站 → 全量/Range/回拖/EOS/中途重连 逐字节比对
     │   └── ProxyTest.java    JDK 自带 HttpServer 当片源
-    └── web-test/             网页逻辑一致性测试（47 项）
+    └── web-test/             网页逻辑一致性测试（52 项）
         ├── run.sh            编译 → multipart 逐字节/名字编码/流式边界 → APK 扫描内核 → 源码不变量
         ├── WebTest.java      MultipartLite + LocalStore.sanitize 的纯逻辑断言
         ├── ApkScanTest.java  ApkScan 纯逻辑断言（跳过规则/深度/上限/时间预算/取消/去重）
@@ -854,9 +854,9 @@ com/juping/cast/dlna/…                     →  找不到这个前缀
 com/juping/cast/player/…                   →  找不到这个前缀
 ```
 
-`dlna` 与 `player` 被**纵向合并**进了 `a` / `b` 两个匿名包（26 个类里 19 个是
-`La/…` / `Lb/…`）。这是正常行为 —— 引用改得一致就无害。`DlnaRendererService`
-与 `MainActivity` 反而因为实现了框架接口，类名被保留了。
+`dlna` 与 `player` 等被**纵向合并**进了匿名包（74 个类里 59 个是 `La/…` /
+`Lb/…` / `Lc/…` / `Ld/…`）。这是正常行为 —— 引用改得一致就无害。
+`DlnaRendererService` 与 `MainActivity` 反而因为实现了框架接口，类名被保留了。
 
 问题在于**有一类名字改不得**：框架是靠接口名回调我们的 —— Activity 生命周期、
 `SurfaceHolder.Callback`、`View.OnClickListener`、`MediaPlayer` 的各种 Listener、
@@ -871,27 +871,27 @@ com/juping/cast/player/…                   →  找不到这个前缀
 ```
 
 ```
-（反汇编 26 个类，来自 1 个 dex）
+（反汇编 74 个类，来自 1 个 dex）
   [PASS] DlnaRendererService 仍继承 Service
          父类 Landroid/app/Service;
   [PASS] MainActivity 的生命周期回调名没被改
          onCreate, onDestroy, onPause, onResume
   [PASS] MainActivity; 实现了 SurfaceHolder$Callback，方法名保留
          surfaceCreated, surfaceChanged, surfaceDestroyed
-  [PASS] 所有框架接口实现都在核查表内（共核了 13 个）
-  [PASS] Thread 子类没有在合并中丢失（源码 2 个 / dex 2 个）
+  [PASS] 所有框架接口实现都在核查表内（共核了 30 个）
+  [PASS] Thread 子类没有在合并中丢失（源码 3 个 / dex 3 个）
   [PASS] 协议常量还在：413 Request Entity Too Large
   …
   结论：框架回调、Thread 子类、协议常量全部完好，R8 输出可用。
 ```
 
-共 **33 项**，核四类东西：
+共 **47 项**，核四类东西：
 
 | 核什么                                       | 为什么                                                                  |
 | -------------------------------------------- | ----------------------------------------------------------------------- |
 | manifest 三个组件的类名、父类、生命周期回调名 | 类被并掉 / 回调被改名 = 装上就崩                                        |
-| 16 个框架接口实现的方法名                     | 这些名字是系统写死的，改了等于没实现                                    |
-| `extends Thread` 的子类数量（源码 2 / dex 2） | 纵向合并若并掉一个，它的 `run()` 永远不被调用 —— 而那正是 SSDP 接收循环 |
+| 30 个框架接口实现的方法名                     | 这些名字是系统写死的，改了等于没实现                                    |
+| `extends Thread` 的子类数量（源码 3 / dex 3） | 纵向合并若并掉一个，它的 `run()` 永远不被调用 —— 而那正是 SSDP 接收循环 |
 | 6 个协议常量字符串                            | 找不到就说明这个 APK 不是当前源码编的，后面所有核验都白做               |
 
 > **最后一条是在防「核了个陈旧产物」。** 这条闸门接在 `dist` 流程里，核的是
@@ -904,6 +904,10 @@ com/juping/cast/player/…                   →  找不到这个前缀
 > 那时名字本来就是原样，全过是应该的。它是为**「名字被改过」**才需要的。
 
 **开 R8 的收益**
+
+> ⚠️ 下表是**当年首次开 R8 时的一次性测量**（同源码、同工具链、只翻
+> `minifyEnabled` 一个开关），语义是「R8 本身省了多少」。**它不代表今天的体积** ——
+> 后来代码一直在加，今天的包比当年大；要看当前体积请 `ls -lh dist/`。
 
 同源码、同工具链，只翻 `minifyEnabled` 这一个开关：
 
@@ -1369,7 +1373,7 @@ SCPD 如实声明、控制点发的动作如实响应 —— 做不到的如实�
   API 引用 381 项（release 387 项）全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
   DLNA 协议 245 项通过 / 播放策略 78 项断言 + 364 条源码级守卫通过 /
   断言/守卫计数与 README、AGENTS 文档一致（`check_gate_counts.py`，覆盖协议/代理/网页/probe/策略五道）/
-  本地预取代理字节一致性 11 项通过 / 网页逻辑一致性 47 项通过 / R8 dex 入口点 47 项通过 /
+  本地预取代理字节一致性 11 项通过 / 网页逻辑一致性 52 项通过 / R8 dex 入口点 47 项通过 /
   控制点自检脚本 33 或 34 项通过（组播回退分支所致，均为合法值）/
   真机验收脚本管道自测 6 项通过 / 密钥核查干净 /
   工具链脚本的变量名边界检查通过（UTF-8 locale 下不再崩）/

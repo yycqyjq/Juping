@@ -23,7 +23,7 @@ cd /Users/yjq/Desktop/Juping   # 所有命令都从这里出发
 
 # ── 单独闸门 ──
 ./tools/build.sh proxy         # 本地预取代理字节一致性（11 项）
-./tools/build.sh web           # 网页逻辑一致性（47 项）
+./tools/build.sh web           # 网页逻辑一致性（52 项）
 ./tools/build.sh lint          # lint
 ./tools/build.sh clean         # 清理
 
@@ -118,7 +118,7 @@ tools/
 ├── protocol-test/        DLNA 协议一致性 245 项（桌面 JVM + 真实协议栈桩）
 ├── policy-test/          播放策略 78 断言 + 364 源码级守卫
 ├── proxy-test/           MediaProxy 字节一致性 11 项
-└── web-test/             MultipartLite + sanitize + ApkScan 网页逻辑一致性（47 项）
+└── web-test/             MultipartLite + sanitize + ApkScan 网页逻辑一致性（52 项）
 ```
 
 ## 4. 测试与闸门矩阵
@@ -135,10 +135,10 @@ tools/
 | verify_policy | 播放策略 78 断言 + 364 源码级守卫 | 78+ |
 | ↳ 内含计数 | 文档里的用例总数 ↔ 闸门期望值（`check_gate_counts.py`，覆盖协议/代理/网页/probe/策略） | 一致性 |
 | verify_proxy | MediaProxy 字节一致性（全量/Range/回拖/EOS/中途重连） | 11 |
-| verify_web | multipart 解析逐字节一致 / 名字编码 / APK 扫描内核 / 上传页与安装页零外链 | 47 |
+| verify_web | multipart 解析逐字节一致 / 名字编码 / APK 扫描内核 / 上传页与安装页零外链 | 52 |
 | verify_secrets | 密钥泄漏 | 零命中 |
 
-**总数守卫是特性**：协议 245、probe 33/34 双态（组播回退分支）、策略 78、网页逻辑一致性 47 项。
+**总数守卫是特性**：协议 245、probe 33/34 双态（组播回退分支）、策略 78、网页逻辑一致性 52 项。
 有意增删断言后必须同步 build.sh / run.sh 里的期望值。
 
 **计数单一事实来源**：策略的断言/守卫数，以及协议/proxy/web/probe 的用例总数，

@@ -80,22 +80,27 @@ final class ApkScanTest {
         WebTest.check("结果上限：maxResults=2 时只返回 2 条（到顶即停）", r4.size() == 2,
                 "返回 " + r4.size());
 
-        // ---- 时间预算（deadline 已过 → 立刻退出）----
+        // ---- 时间预算（deadline 已过 → 立刻退出，且必须标 timedOut）----
         File big = mkTempDir("apkbig");
         touch(new File(big, "x.apk"), 1);
-        List<ApkEntry> r5 = ApkScan.scan(list(big), 0L, ApkScan.MAX_DEPTH,
+        ApkScan.Result res5 = ApkScan.scan(list(big), 0L, ApkScan.MAX_DEPTH,
                 ApkScan.MAX_RESULTS, null);
-        WebTest.check("时间预算：deadline 已过 → 立即返回空表", r5.isEmpty());
+        WebTest.check("时间预算：deadline 已过 → 立即返回空表", res5.entries.isEmpty());
+        WebTest.check("时间预算：deadline 已过 → timedOut 置位（不能装作扫全了）",
+                res5.timedOut && res5.truncated());
 
         // ---- 取消标志 ----
-        List<ApkEntry> r6 = ApkScan.scan(list(big), Long.MAX_VALUE, ApkScan.MAX_DEPTH,
+        ApkScan.Result res6 = ApkScan.scan(list(big), Long.MAX_VALUE, ApkScan.MAX_DEPTH,
                 ApkScan.MAX_RESULTS, new ApkScan.Cancel() {
                     @Override
                     public boolean isCancelled() {
                         return true;
                     }
                 });
-        WebTest.check("取消标志：置位后不再收集（连点刷新不堆叠线程的底层保证）", r6.isEmpty());
+        WebTest.check("取消标志：置位后不再收集（连点刷新不堆叠线程的底层保证）",
+                res6.entries.isEmpty());
+        WebTest.check("取消标志：cancelled 置位，且不算截断（用户自己要停）",
+                res6.cancelled && !res6.truncated());
 
         // ---- canonical 去重：同一目录给两次，只收一条 ----
         File dup = mkTempDir("apkdup");
@@ -103,10 +108,40 @@ final class ApkScanTest {
         List<File> twice = new ArrayList<File>();
         twice.add(dup);
         twice.add(dup);
-        List<ApkEntry> r7 = ApkScan.scan(twice, Long.MAX_VALUE, ApkScan.MAX_DEPTH,
+        ApkScan.Result res7 = ApkScan.scan(twice, Long.MAX_VALUE, ApkScan.MAX_DEPTH,
                 ApkScan.MAX_RESULTS, null);
-        WebTest.check("canonical 去重：同一目录给两次只收一条", r7.size() == 1,
-                "收 " + r7.size());
+        WebTest.check("canonical 去重：同一目录给两次只收一条", res7.entries.size() == 1,
+                "收 " + res7.entries.size());
+
+        // ---- 截断上报：到顶 vs 恰好收满 vs 自然扫完（本批修的真 bug）----
+        // 到顶：3 个包、上限 2 → 确实还有漏的 → 必须报截断
+        File cap3 = mkTempDir("apkcap3");
+        touch(new File(cap3, "a.apk"), 1);
+        touch(new File(cap3, "b.apk"), 1);
+        touch(new File(cap3, "c.apk"), 1);
+        ApkScan.Result resCap = ApkScan.scan(list(cap3), Long.MAX_VALUE,
+                ApkScan.MAX_DEPTH, 2, null);
+        WebTest.check("到顶即停：3 个包、上限 2 → hitResultCap 置位且 truncated",
+                resCap.hitResultCap && resCap.truncated() && resCap.entries.size() == 2,
+                "收 " + resCap.entries.size());
+
+        // 恰好收满：2 个包、上限 2 → 没有漏的 → 不算截断（别误报）
+        File cap2 = mkTempDir("apkcap2");
+        touch(new File(cap2, "a.apk"), 1);
+        touch(new File(cap2, "b.apk"), 1);
+        ApkScan.Result resExact = ApkScan.scan(list(cap2), Long.MAX_VALUE,
+                ApkScan.MAX_DEPTH, 2, null);
+        WebTest.check("恰好收满：2 个包、上限 2 → 不算截断（没有漏的）",
+                !resExact.hitResultCap && !resExact.truncated()
+                        && resExact.entries.size() == 2,
+                "收 " + resExact.entries.size());
+
+        // 自然扫完：未到顶、未超时 → 不报截断
+        ApkScan.Result resFull = ApkScan.scan(list(cap2), Long.MAX_VALUE,
+                ApkScan.MAX_DEPTH, ApkScan.MAX_RESULTS, null);
+        WebTest.check("自然扫完：未到顶、未超时 → truncated 为 false",
+                !resFull.truncated() && resFull.entries.size() == 2,
+                "收 " + resFull.entries.size());
 
         // ---- 上限常量存在（防被静默删掉）----
         WebTest.check("上限常量存在（深度 8 / 条数 300 / 时间 8000ms）",
@@ -119,7 +154,7 @@ final class ApkScanTest {
     // ------------------------------------------------------------ 小工具
 
     private static List<ApkEntry> scan(File root, int maxDepth, int maxResults) {
-        return ApkScan.scan(list(root), Long.MAX_VALUE, maxDepth, maxResults, null);
+        return ApkScan.scan(list(root), Long.MAX_VALUE, maxDepth, maxResults, null).entries;
     }
 
     private static List<File> list(File f) {

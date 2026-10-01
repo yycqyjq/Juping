@@ -144,6 +144,12 @@ report('ApkScan 时间预算常量存在（MAX_MILLIS = 8000）',
 report('ApkScan 跳过集合含 Android / LOST.DIR（省 IO 的关键）',
        '"Android"' in scan and '"LOST.DIR"' in scan)
 
+# ⑤ 截断上报必须把「超时」算进去 —— 这是批 3.5 收尾修的真 bug：
+#    只按「条数是否到顶」判截断，会让 8 秒没扫完的慢盘 / 大树误报成「扫全了」。
+report('截断判据来自内核停因（ApkScanner 引用 timedOut）', 'timedOut' in scnr)
+report('不再用「纯条数」判截断（r.size() >= ApkScan.MAX_RESULTS 已删）',
+       'r.size() >= ApkScan.MAX_RESULTS' not in scnr)
+
 if failed:
     sys.exit(1)
 PY
