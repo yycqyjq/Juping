@@ -642,6 +642,46 @@ report('读不到的容量显示「—」而不是 0（老设备 statvfs 返回 
        'fmtBytes(' in act_src and 'if (n <= 0)' in act_src,
        '把 0 报成「0 GB」等于谎报盘满了 —— 与 LocalStore.usableBytes 同一条纪律')
 
+# ⑱-e 左列布局对齐（2026-10-02 二夜拍板：「左边下面的区域框把按钮也框住，
+#     底部和右边的底部对齐」）。守的是两条"编译照过、肉眼看着就是歪"的静默回归：
+#     ① 按钮被挪回卡片外 → 左列底变成卡片底 + 按钮底两条线；
+#     ② 左列 gravity 改回 center_vertical → 与通高的二维码列底边不再同线。
+import xml.etree.ElementTree as _ET
+try:
+    _root = _ET.fromstring(layout_src)
+    _parent = {}
+    def _walk(_n):
+        for _c in _n:
+            _parent[_c] = _n
+            _walk(_c)
+    _walk(_root)
+    def _find_by_id(_n, _rid):
+        if _n.get(AND + 'id') == _rid:
+            return _n
+        for _c in _n:
+            _r = _find_by_id(_c, _rid)
+            if _r is not None:
+                return _r
+        return None
+    _btn = _find_by_id(_root, '@+id/btn_restart')
+    _chain, _cur = [], _btn
+    while _cur in _parent:
+        _cur = _parent[_cur]
+        _chain.append(_cur)
+    _btn_in_card = any(_n.get(AND + 'background') == '@drawable/bg_card' for _n in _chain)
+    _panel = _find_by_id(_root, '@+id/panel')
+    _left_gravity = (_panel[0].get(AND + 'gravity') if _panel is not None and len(_panel) else None)
+except Exception as _e:
+    _btn_in_card, _left_gravity = False, '解析失败:%s' % _e
+report('操作按钮框在卡片内（左列底边只有一条线）',
+       _btn_in_card,
+       '按钮裸在卡片外时，卡片底和按钮底是两条线 —— 二维码那列却是通高一整块，'
+       '两列底边对不上，界面看着就是歪的')
+report('左列贴底 gravity=bottom（与右侧二维码列底部对齐）',
+       _left_gravity == 'bottom',
+       '实际：%r —— 改回 center_vertical 后左列居中、右列贴底，'
+       '两条底边各走各的；这是二夜点名要对齐的那条线' % _left_gravity)
+
 # 图片层（批 3）：MediaPlayer 解不了静态图，所以图片有自己的一层。
 # 这几条守的是「照片投上去，电视全黑」——布局把这一层漏了 / 藏反了，
 # 代码全都照常编译运行，只是照片永远显示不出来。

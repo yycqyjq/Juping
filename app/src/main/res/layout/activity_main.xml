@@ -168,13 +168,18 @@
         android:paddingTop="40dp"
         android:paddingBottom="40dp">
 
-        <!-- 左列：标题、引导、设备信息、按钮，整体垂直居中 -->
+        <!-- 左列：标题、引导、设备信息、按钮，整体贴底。
+
+             为什么是 bottom 不是 center_vertical（2026-10-02 二夜拍板）：
+             右列二维码是 match_parent 通高卡片，底边贴着 panel 的内容区下沿；
+             左列若垂直居中，两条底边各走各的，卡片底 vs 卡片底差出一截，
+             看着就是歪的。贴底后左右两列底边同线，视觉上才是一对。 -->
         <LinearLayout
             android:layout_width="0dp"
             android:layout_height="match_parent"
             android:layout_weight="1"
             android:orientation="vertical"
-            android:gravity="center_vertical">
+            android:gravity="bottom">
 
         <!-- 标题行 -->
         <LinearLayout
@@ -504,29 +509,32 @@
                     android:textColor="@color/text_secondary"
                     android:textSize="15sp" />
             </LinearLayout>
-        </LinearLayout>
 
-        <!-- 操作按钮 -->
-        <LinearLayout
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="28dp"
-            android:orientation="horizontal">
-
-            <Button
-                android:id="@+id/btn_restart"
+            <!-- 操作按钮：框进设备信息卡片里（二夜 2026-10-02：「左边下面的
+                 区域框把按钮也框住」）。按钮原先裸露在两张卡片之外，卡片底、
+                 按钮底是两条线；收进卡里后左列只剩「标题 + 引导卡 + 信息卡」
+                 三个块，底边与右列二维码卡片对齐。 -->
+            <LinearLayout
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:background="@drawable/btn_selector"
-                android:focusable="true"
-                android:minWidth="160dp"
-                android:paddingLeft="28dp"
-                android:paddingRight="28dp"
-                android:paddingTop="12dp"
-                android:paddingBottom="12dp"
-                android:text="@string/btn_restart"
-                android:textColor="@color/text_primary"
-                android:textSize="16sp" />
+                android:layout_marginTop="20dp"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/btn_restart"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:background="@drawable/btn_selector"
+                    android:focusable="true"
+                    android:minWidth="160dp"
+                    android:paddingLeft="28dp"
+                    android:paddingRight="28dp"
+                    android:paddingTop="12dp"
+                    android:paddingBottom="12dp"
+                    android:text="@string/btn_restart"
+                    android:textColor="@color/text_primary"
+                    android:textSize="16sp" />
+            </LinearLayout>
         </LinearLayout>
         </LinearLayout>
         <!-- 左列结束 -->
