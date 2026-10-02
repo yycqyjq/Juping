@@ -169,6 +169,14 @@ public class ProtocolTestServer {
         expect("albumArtURI 缺失返回空", "",
                 DidlLite.albumArtUri("<item><dc:title>x</dc:title></item>"));
 
+        // 没有 dlna:profileID 档位时退回**第一个**可用地址 —— 真机上网易云送的正是
+        // 这种裸元素（不带档位），**恰恰是这条路径生效**；此前无断言覆盖（批 3.7 补）。
+        expect("albumArtURI 无档位退回第一个", "http://h/a.jpg",
+                DidlLite.albumArtUri("<item>"
+                        + "<upnp:albumArtURI>http://h/a.jpg</upnp:albumArtURI>"
+                        + "<upnp:albumArtURI>http://h/b.jpg</upnp:albumArtURI>"
+                        + "</item>"));
+
         // 专辑名（upnp:album）—— 本轮界面不用，但解析器补齐
         expect("upnp:album", "十一月的萧邦",
                 DidlLite.album("<item><upnp:album>十一月的萧邦</upnp:album></item>"));
@@ -191,7 +199,7 @@ public class ProtocolTestServer {
         // 「协议一致性：N / N」），所以改这个数字是安全的 —— 但前提是
         // check_gate_counts.py 里那条锚点正则始终是具体的「控制点自检：」。
         // 若哪天有人把它放宽成「自检：…」，DidlLite 的这个数就会漏进 probe 计数。
-        System.out.println("  DidlLite 自检：17 / 17 通过");
+        System.out.println("  DidlLite 自检：18 / 18 通过");
     }
 
     private static void expect(String what, String want, String got) {

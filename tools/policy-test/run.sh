@@ -465,8 +465,31 @@ if _cs:
 _ld = body_of(act_src, 'private void loadCover(String uri)')
 report('封面解码用 View 尺寸作目标（不复用照片的 1600）',
        _ld is not None and 'coverSizePx()' in _ld,
-       'loadCover 必须把 coverSizePx() 的结果传给 decodeScaled；'
+       'loadCover 必须把 coverSizePx() 的结果传给封面解码；'
        '传 1600 就是 4 倍过采样，3000×3000 封面解出约 9–10MB')
+
+# ㉒ 封面拉取改「流式落盘 + 从文件两遍解码」（批 3.7）：真机实测同一个控制点送的
+# 封面从 27KB 到 5.5MB 不等 —— 5.5MB 整份进内存是 OOM 入口，而旧的 4MB 上限又把
+# 那张直接拒了（回落图标，用户看到「没封面」）。改成先落盘再解码，约束从「内存」
+# 变成「磁盘/时间」；解码从文件两遍，失败按类别打日志（原来几乎完全静默）。
+_dcv = body_of(act_src, 'private Bitmap decodeCoverScaled(String uri, long maxBytes, int targetPx)')
+report('decodeCoverScaled 方法体已找到', _dcv is not None,
+       '锚点：private Bitmap decodeCoverScaled(String uri, long maxBytes, int targetPx)')
+if _dcv:
+    report('封面下载流式落临时文件（不整份进内存）',
+           'createTempFile' in _dcv and 'getCacheDir' in _dcv,
+           '封面地址是控制点给的任意 URL，真机实测最大 5.5MB —— 整份读进 byte[] 在 '
+           '0.6GB 的盒子上就是 OOM 入口。改成边下边落盘，内存占用与文件大小脱钩')
+    report('封面临时文件在 finally 里删（成功/失败/超限/中断都删）',
+           'finally' in _dcv and 'delete()' in _dcv,
+           '临时文件不删会随换歌次数累积，把盒子缓存目录塞满')
+    report('封面从文件两遍解码（inJustDecodeBounds + inSampleSize + decodeFile）',
+           'inJustDecodeBounds' in _dcv and 'inSampleSize' in _dcv and 'decodeFile' in _dcv,
+           '与照片同一条纪律：先量尺寸再降采样；从文件解，不把整份数据留在内存')
+    report('封面失败有分类日志（带 URL）',
+           'Log.w' in _dcv and 'uri' in _dcv,
+           '封面失败原来几乎完全静默（超限那条直接 return null，连日志都没有）—— '
+           '真机排障只能靠 logcat，静默失败等于没法查')
 
 # ⑬b 顶部条那个圆点必须**有 id**，否则代码改不了它的颜色。
 # 它原来是写死的 dot_online（绿）—— 而顶部条现在只在「暂停 / 出错 / 缓冲」
@@ -858,6 +881,33 @@ if cm:
     report('currentMode 先判 isImage（图片优先于音频/视频）',
            'isImage()' in cm,
            '图片不是音频，落到那个二选一里只会被判成"视频" —— 又是黑屏')
+    # ㉔ 换歌不闪面板：UI 侧宽限（批 3.7）。网易云换歌 = 先 Stop 再 SetAVTransportURI
+    # （相隔 ~230ms），而 IDLE 的刷新间隔是 1500ms —— 230ms 的瞬态被放大成 1.5s 的
+    # 待机面板。宽限只对音频（视频宽限会把「闪面板」换成「闪蓝屏」）。
+    report('currentMode 有宽限期（GRACE_MS）',
+           'GRACE_MS' in cm,
+           '没有宽限，换歌时 Stop→Set 的 230ms 窗口一旦落拍就闪面板（真机实测 1–2s）')
+    report('宽限只作用于 MODE_AUDIO（不推广到视频）',
+           'lastPlayingMode == MODE_AUDIO' in cm,
+           '视频态宽限会把「闪面板」换成「闪蓝屏」：player.stop() 后视频层无内容，'
+           '老 MTK 输出一屏蓝，宽限会把蓝屏多留 1.5s')
+    report('宽限有会终结的时间判据（lastPlayingAtMs 与 GRACE_MS 比较）',
+           'lastPlayingAtMs' in cm and 'GRACE_MS' in cm,
+           '宽限必须靠时间比较终结 —— 写成「只要 lastPlayingMode != IDLE 就维持」'
+           '会永不回 IDLE（用户按停止后卡在音乐卡片）')
+
+# 冻结：宽限期内 refresh 不更新音乐字段（只加宽限不冻结 = 从「闪面板」变「闪空卡片」）
+_rfz = body_of(act_code, 'private void refresh()')
+report('refresh 的音频更新块受 staleHeld 冻结',
+       _rfz is not None and 'staleHeld' in _rfz,
+       '只加宽限不冻结，卡片会拿服务里已被清空的字段重绘成空白 —— '
+       '仍是一次可见的闪，只是从「闪面板」变成「闪空卡片」')
+
+# 遥控器返回键 = 真结束，不吃宽限（用户主动停止必须立即回面板）
+_kd = body_of(act_code, 'public boolean onKeyDown(int keyCode, KeyEvent event)')
+report('onKeyDown 置 userInitiatedStop（遥控器返回不吃宽限）',
+       _kd is not None and 'userInitiatedStop' in _kd,
+       '遥控器返回 = 用户明确要结束，不该等 1.5s；不置位就会被宽限拖住')
 
 am2 = body_of(act_code, 'private void applyMode(int mode)')
 report('applyMode 方法体已找到（去注释后）', am2 is not None,

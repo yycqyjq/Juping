@@ -24,6 +24,8 @@ import android.widget.Toast;
 import com.juping.cast.player.PlaybackPolicy;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.net.URL;
 import java.net.URLConnection;
@@ -63,6 +65,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * 0.5 秒是「跟得上」与「不浪费」之间的折中：一次 tick 不过是几次 setText。
      */
     private static final long REFRESH_INTERVAL_PLAYING_MS = 500L;
+
+    /**
+     * 「刚停止」的宽限期（毫秒）—— 换歌时别闪待机面板。
+     *
+     * <p>控制点换歌是**先 Stop 再 SetAVTransportURI**（真机实测网易云相隔 ≈230ms）。
+     * Stop 一到，服务立刻清 {@code currentUri}（这是协议正确性，不能改）—— 界面这一拍
+     * 就判成空闲、闪出待机面板；而空闲态的下一拍要等 {@link #REFRESH_INTERVAL_IDLE_MS}
+     * （1500ms），于是 230ms 的瞬态被放大成 1.5 秒的「先闪面板、再切回」。
+     *
+     * <p>取值 1.5s：实测 230ms 有 6 倍余量，能吸收控制点/网络抖动；同时把「控制点真停止」
+     * 时面板晚出现的延迟压在无感范围（遥控器返回键路径**不吃**宽限，用户主动停止是立即的）。
+     * 必须 ≥ 一拍播放态 tick（500ms），否则新 URI 可能在宽限过期后才被发现。
+     */
+    private static final long GRACE_MS = 1500L;
 
     /**
      * 界面四态。
@@ -116,6 +132,25 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private DlnaRendererService service;
     private boolean bound;
     private int lastMode = MODE_IDLE;
+
+    /** 上一次「在放」时的形态。宽限期内据此判断「刚才是不是在放音频」。 */
+    private int lastPlayingMode = MODE_IDLE;
+    /** 上一次「在放」的时刻（毫秒）。宽限的**终结判据**就是它与当前时间之差。 */
+    private long lastPlayingAtMs = 0L;
+    /**
+     * 是否正处在「宽限维持态」：刚停止、仍保持音频形态、卡片冻结显示上一首。
+     *
+     * <p>{@link #refresh()} 据此决定要不要跳过音乐字段更新 —— 不跳过的话，服务里已被
+     * 清空的 title/artist/cover 会把卡片重绘成空白（从「闪面板」变成「闪空卡片」）。
+     */
+    private boolean staleHeld = false;
+    /**
+     * 用户是否刚按了遥控器返回键结束投屏。
+     *
+     * <p>返回键 = 用户明确要结束，不该等宽限 —— 置位后 {@link #currentMode()} 跳过宽限、
+     * 立即回空闲。只有控制点发起的 Stop 才吃宽限。
+     */
+    private boolean userInitiatedStop = false;
 
     /**
      * 当前二维码对应的地址 —— 同时也是「要不要重画」的缓存键。
@@ -177,14 +212,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private String coverFailedUri;
 
     /**
-     * 封面下载的字节上限（约 4MB）。
+     * 封面下载的**字节上限**（16MB）。
      *
-     * <p>封面地址是控制点给的**任意** URL —— 可能指向一个巨大文件。
-     * {@link #decodeScaled(String, long, int)} 原本把整个响应读进内存（那是给本地
-     * {@code /media/} 照片写的），对封面必须加闸：超限即中断、判失败、退回图标，
-     * 绝不让它成为 0.6GB 设备上的 OOM 入口。
+     * <p>封面地址是控制点给的**任意** URL —— 可能指向一个巨大文件。真机实测同一个
+     * 控制点送的封面从 27KB 到 5.5MB 不等（网易云《短发》27KB vs《天龙八部之宿敌》
+     * 5.5MB），16MB 足够容纳实测最大的那张，又不至于让一个失控的响应把缓存目录写满。
+     *
+     * <p>注意这个上限现在的约束对象是**磁盘/时间**而不是内存：封面下载已改成流式落
+     * 临时文件（见 {@link #decodeCoverScaled}），不再把整个响应读进 {@code byte[]} ——
+     * 所以它不必再像原来那样压到 4MB（那会把实测的 5.5MB 那张直接拒了、回落图标）。
      */
-    private static final long COVER_MAX_BYTES = 4L * 1024 * 1024;
+    private static final long COVER_MAX_BYTES = 16L * 1024 * 1024;
 
     /**
      * 照片解码的目标长边（像素）。
@@ -377,14 +415,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 ? getString(R.string.fmt_progress, formatClock(pos), formatClock(dur))
                 : getString(R.string.music_live);
         if (mode == MODE_AUDIO) {
-            musicSource.setText(currentLabel());
-            updateArtist(service.getCurrentArtist());
-            updateLyrics(service.getCurrentLyrics());
-            musicProgress.setText(progress);
-            // 封面每个 tick 都问一次：地址在**同一个形态之内**就会换（连投几首），
-            // 而 applyModeIfChanged 只在形态真的变了时才走 applyMode —— 形态不变
-            // 就永远轮不到封面更新。updateCover 自己按地址去重，不会重复下载。
-            updateCover(service.getCurrentAlbumArtUri());
+            // 宽限维持态（刚停止、卡片冻结）：**不更新**这 5 个字段 —— 服务里已被
+            // 清空，更新会把卡片重绘成空白（歌名空、歌手/封面退回图标），从「闪面板」
+            // 变成「闪空卡片」，仍是一次可见的闪。判据是「是否处于维持态」（staleHeld），
+            // **不是**「服务字段是否为空」—— 新歌可能真的没封面，那时应当正常降级。
+            if (!staleHeld) {
+                musicSource.setText(currentLabel());
+                updateArtist(service.getCurrentArtist());
+                updateLyrics(service.getCurrentLyrics());
+                musicProgress.setText(progress);
+                // 封面每个 tick 都问一次：地址在**同一个形态之内**就会换（连投几首），
+                // 而 applyModeIfChanged 只在形态真的变了时才走 applyMode —— 形态不变
+                // 就永远轮不到封面更新。updateCover 自己按地址去重，不会重复下载。
+                updateCover(service.getCurrentAlbumArtUri());
+            }
         }
         // 顶部条现在只在暂停 / 出错 / 缓冲时出现，那些时刻用户要的正是
         // 「放到哪儿了」，所以两种形态都报进度。原来音频时这里固定写
@@ -572,6 +616,100 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     /**
+     * 封面专用：**流式落临时文件 → 从文件两遍解码**。
+     *
+     * <p><b>为什么不能沿用照片那条 {@link #decodeScaled}</b>（把整个响应读进
+     * {@code byte[]}）：封面地址是控制点给的**任意** URL，真机实测同一个控制点送的
+     * 封面从 27KB 到 5.5MB 不等（网易云《短发》27KB vs《天龙八部之宿敌》5.5MB）。
+     * 5.5MB 整份进内存再解码，在这台 0.6GB 的盒子上就是 OOM 入口；而旧的 4MB 上限
+     * 又把 5.5MB 那张**直接拒了**（回落图标，用户看到「没封面」）。
+     *
+     * <p>改成先落盘再解码，约束就从「内存」变成「磁盘/时间」—— 盒子内部还有 2.4GB
+     * 富余，于是上限可以放宽到 {@link #COVER_MAX_BYTES}（16MB），既装得下实测最大的
+     * 5.5MB，又不至于让一个失控的响应把缓存目录写满。连接 5s / 读 15s 超时保留。
+     *
+     * <p>解码**从文件两遍**：先 {@code inJustDecodeBounds} 读尺寸 → 算
+     * {@code inSampleSize} → 再按 View 尺寸目标（{@link #coverSizePx()}）解码。
+     * 两遍都只读文件，不把整份数据留在内存里。
+     *
+     * <p><b>临时文件在 {@code finally} 里删</b>：成功、失败、超限、中断都要删 ——
+     * 不删会随换歌次数累积，把盒子缓存目录塞满。
+     *
+     * <p>失败时按类别打日志（下载失败 / 超限 / 解不出尺寸 / 解码失败 / 内存不足），
+     * 都带上 URL：封面失败原来几乎完全静默（超限那条直接 {@code return null}，连日志
+     * 都没有），而电视上没有日志可看，只能靠 logcat —— 静默失败等于没法查。
+     */
+    private Bitmap decodeCoverScaled(String uri, long maxBytes, int targetPx) {
+        File tmp = null;
+        InputStream in = null;
+        try {
+            URLConnection conn = new URL(uri).openConnection();
+            conn.setConnectTimeout(5000);
+            conn.setReadTimeout(15000);
+            in = conn.getInputStream();
+            // 流式落盘：边读边写，内存占用与文件大小脱钩（照片那条是整份进 byte[]）
+            tmp = File.createTempFile("cover-", ".tmp", getCacheDir());
+            FileOutputStream out = new FileOutputStream(tmp);
+            try {
+                byte[] buf = new byte[16 * 1024];
+                int n;
+                long total = 0;
+                while ((n = in.read(buf)) > 0) {
+                    total += n;
+                    if (maxBytes > 0 && total > maxBytes) {
+                        Log.w(TAG, "封面超限（> " + maxBytes + " 字节），放弃: " + uri);
+                        return null;
+                    }
+                    out.write(buf, 0, n);
+                }
+            } finally {
+                try {
+                    out.close();
+                } catch (Exception ignored) {
+                    // 关闭失败无碍后续解码（文件已落盘），忽略
+                }
+            }
+            // 从文件两遍解码：第一遍只量尺寸，不算像素
+            BitmapFactory.Options probe = new BitmapFactory.Options();
+            probe.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(tmp.getAbsolutePath(), probe);
+            if (probe.outWidth <= 0 || probe.outHeight <= 0) {
+                Log.w(TAG, "封面解不出尺寸: " + uri);
+                return null;
+            }
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            opts.inSampleSize = sampleSizeFor(probe.outWidth, probe.outHeight, targetPx);
+            Bitmap bmp = BitmapFactory.decodeFile(tmp.getAbsolutePath(), opts);
+            if (bmp == null) {
+                Log.w(TAG, "封面解码失败: " + uri);
+            }
+            return bmp;
+        } catch (Exception e) {
+            Log.w(TAG, "封面下载失败: " + uri + "（" + e + "）");
+            return null;
+        } catch (OutOfMemoryError e) {
+            // 位图是 native 内存，OOM 是个 Error 而不是 Exception，
+            // 只 catch Exception 的话它会直接掀掉整个进程。
+            Log.w(TAG, "封面太大，内存不足: " + uri);
+            return null;
+        } finally {
+            if (in != null) {
+                try {
+                    in.close();
+                } catch (Exception ignored) {
+                    // 忽略
+                }
+            }
+            if (tmp != null) {
+                // 无论成败都要删：成功、失败、超限、中断都走这里
+                if (!tmp.delete()) {
+                    tmp.deleteOnExit();
+                }
+            }
+        }
+    }
+
+    /**
      * 算 {@code inSampleSize}：**必须是 2 的幂**。
      *
      * <p>Android 的文档明写它会向下取整到 2 的幂，非 2 的幂的取值等于白算。
@@ -746,7 +884,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         new Thread(new Runnable() {
             @Override
             public void run() {
-                final Bitmap bmp = decodeScaled(target, COVER_MAX_BYTES, targetPx);
+                final Bitmap bmp = decodeCoverScaled(target, COVER_MAX_BYTES, targetPx);
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
@@ -847,16 +985,38 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * MediaPlayer 报的真实视频尺寸两个信号合并得出，界面不自己猜。
      */
     private int currentMode() {
-        if (!isPlaying()) {
-            return MODE_IDLE;
+        if (isPlaying()) {
+            // 正常播放：记下「上一次在放的形态」与时刻，供刚停止时的宽限判断使用。
+            // 图片要**先于**音频判（它不是音频，却同样没有 MediaPlayer 画面 —— 落到
+            // 下面那个 isAudioOnly() 二选一里只会被判成"视频"，界面去等一个永远
+            // 不会来的视频帧，屏幕就是一块黑屏）。
+            lastPlayingMode = service.isImage() ? MODE_IMAGE
+                    : (service.isAudioOnly() ? MODE_AUDIO : MODE_VIDEO);
+            lastPlayingAtMs = System.currentTimeMillis();
+            staleHeld = false;
+            // 新歌到来，清掉「用户主动停止」标志 —— 免得误伤下一次控制点 Stop 的宽限。
+            userInitiatedStop = false;
+            return lastPlayingMode;
         }
-        // 图片要**先于**音频判。它不是音频，但它同样没有 MediaPlayer 画面 ——
-        // 落到下面那个 isAudioOnly() 二选一里，只会被判成"视频"，
-        // 然后界面去等一个永远不会来的视频帧，屏幕上就是一块黑屏。
-        if (service.isImage()) {
-            return MODE_IMAGE;
+        // 非播放：若刚在放**音频**、且不是用户主动停止、且还在宽限期内 → 继续保持
+        // 音频形态（面板一次都不出现），并标记「维持态」让 refresh 冻结卡片。
+        //
+        // 宽限**只对音频**：视频态 player.stop() 后视频层无内容，老 MTK 会输出一屏
+        // 蓝 —— 对视频宽限会把「闪面板」换成「闪蓝屏」，还把蓝屏多留 1.5s。图片态
+        // 本无此 bug，同样不纳入。终结判据是「时间比较」（必然到点），**不是**
+        // 「只要 lastPlayingMode != IDLE 就维持」—— 后者会永不回空闲。
+        if (lastPlayingMode == MODE_AUDIO
+                && !userInitiatedStop
+                && System.currentTimeMillis() - lastPlayingAtMs < GRACE_MS) {
+            staleHeld = true;
+            return MODE_AUDIO;
         }
-        return service.isAudioOnly() ? MODE_AUDIO : MODE_VIDEO;
+        // 到这里要么是用户主动停止、要么宽限已过：回空闲，并消费掉「用户主动停止」
+        // 标志（成对：置位在 onKeyDown，消费在这里 / isPlaying() 分支）。
+        userInitiatedStop = false;
+        lastPlayingMode = MODE_IDLE;
+        staleHeld = false;
+        return MODE_IDLE;
     }
 
     /** 形态真的变了才动 View —— 每 1.5 秒重设一次 visibility 会触发无谓的重新布局 */
@@ -1196,6 +1356,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     public boolean onKeyDown(int keyCode, KeyEvent event) {
         if (keyCode == KeyEvent.KEYCODE_BACK && service != null
                 && currentMode() != MODE_IDLE) {
+            // 用户明确要结束：置位跳过宽限。必须在 service.onStop() **之前** ——
+            // onStop() 会清 currentUri，下一拍 currentMode() 见到这个标志就立即回
+            // 空闲、不等 1.5s（比现状还快）。只有控制点发起的 Stop 才吃宽限。
+            userInitiatedStop = true;
             service.onStop();
             return true;
         }

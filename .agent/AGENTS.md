@@ -63,9 +63,12 @@ app/src/main/java/com/juping/cast/
 │                              空闲时画二维码（扫码进上传页，批 2）：按地址缓存、
 │                              换图 recycle 旧位图、生成失败整块 GONE
 │                              音乐态（批 3.6）：歌名放大（32sp 主位）+ 封面 +
-│                              歌手/歌词行；封面走 albumArtURI（后台线程 / ≤4MB /
-│                              按 View 尺寸解码 / 三字段缓存 / 代次作废 / recycle），
-│                              取不到一律退回 ic_music（不留白块）
+│                              歌手/歌词行；封面走 albumArtURI（后台线程 / 流式落盘
+│                              ≤16MB / 按 View 尺寸解码 / 三字段缓存 / 代次作废 /
+│                              recycle），取不到一律退回 ic_music（不留白块）
+│                              换歌宽限（批 3.7）：控制点 Stop→Set（~230ms）之间保持
+│                              音频态 + 冻结卡片，不闪待机面板；只对音频（视频宽限会
+│                              闪蓝屏），遥控器返回键置 userInitiatedStop 不吃宽限
 ├── QrRenderer.java            二维码位图绘制：QrCode → 逐格 int[] → 一次 setPixels
 │                              （替代上游 toImage()，Android 无 java.awt/ImageIO）
 ├── RenameReceiver.java        adb 改名广播入口（唯一 exported 指令面）
@@ -121,7 +124,7 @@ tools/
 ├── apk_info.py           APK 包名/minSdk 解析
 ├── make_icon.py          位图资源生成（纯标准库）
 ├── protocol-test/        DLNA 协议一致性 245 项（桌面 JVM + 真实协议栈桩）
-├── policy-test/          播放策略 78 断言 + 377 源码级守卫
+├── policy-test/          播放策略 78 断言 + 387 源码级守卫
 ├── proxy-test/           MediaProxy 字节一致性 11 项
 └── web-test/             MultipartLite + sanitize + ApkScan 网页逻辑一致性（52 项）
 ```
@@ -133,11 +136,11 @@ tools/
 | 闸门 | 内容 | 断言数 |
 |------|------|--------|
 | verify_apk | 签名/minSdk | 每包 |
-| verify_api | 平台 API 引用逐个核对（目标 API 15/33） | 407/413 |
+| verify_api | 平台 API 引用逐个核对（目标 API 15/33） | 412/419 |
 | verify_dex | R8 后框架回调/Thread 子类/协议常量存活 | 全量 |
 | verify_protocol | DLNA 协议一致性（drive.py，期望 245/245） | 245 |
 | ↳ 内含 probe | 控制点自检（**33 或 34 双态**：组播回退分支） | 33/34 |
-| verify_policy | 播放策略 78 断言 + 377 源码级守卫 | 78+ |
+| verify_policy | 播放策略 78 断言 + 387 源码级守卫 | 78+ |
 | ↳ 内含计数 | 文档里的用例总数 ↔ 闸门期望值（`check_gate_counts.py`，覆盖协议/代理/网页/probe/策略） | 一致性 |
 | verify_proxy | MediaProxy 字节一致性（全量/Range/回拖/EOS/中途重连） | 11 |
 | verify_web | multipart 解析逐字节一致 / 名字编码 / APK 扫描内核 / 上传页与安装页零外链 | 52 |
@@ -253,10 +256,10 @@ adb -s 192.168.1.8:5555 logcat -v time > /tmp/tv_session.log 2>&1
 
 ## 7. 当前状态指针
 
-- 版本 0.2.1（versionCode 16）—— 批 3.6「音乐投屏界面优化（歌名放大 + 封面 +
-  歌词）」为**小更新**（改进，末位 +1），版本从 0.2.0 → 0.2.1。上一次 0.2.0
-  （versionCode 15）是批 3.5「外接存储 APK 扫描 + 安装」的中等更新（新能力，
-  0.1.13 → 0.2.0）。历史版本已全部推送 GitHub（main）。
+- 版本 0.2.2（versionCode 17）—— 批 3.7「修换歌闪面板 + 封面改流式落盘」为**小更新**
+  （修 bug，末位 +1），版本从 0.2.1 → 0.2.2。上一次 0.2.1（versionCode 16）是批 3.6
+  「音乐投屏界面优化（歌名放大 + 封面 + 歌词）」的小更新（0.2.0 → 0.2.1）；再上一次
+  0.2.0（versionCode 15）是批 3.5 的中等更新。历史版本已全部推送 GitHub（main）。
 - **发版规则（用户定的，每次打包都要遵守）**：改 `app/build.gradle` 的
   `versionName`，界面「版本」那一行读的就是它（不写死字面量）。
   **小更新**（修 bug、小改进）→ 改最后一位（0.1.12 → 0.1.13）；
