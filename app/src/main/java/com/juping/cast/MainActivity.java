@@ -13,11 +13,13 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.util.Log;
+import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
 import android.widget.Button;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -160,6 +162,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private DlnaRendererService service;
     private boolean bound;
     private int lastMode = MODE_IDLE;
+
+    /**
+     * 已经应用到 SurfaceView 的比例宽高（0 = 当前是全屏）。
+     *
+     * <p>用来做「变了才动」的去重：{@link #refresh()} 每 0.5 秒跑一次，而
+     * {@code setLayoutParams} 会触发重新布局 —— 没变还每拍设一次是白烧 CPU
+     * （这台盒子只有 0.6GB 内存）。探测结果是异步到的，形态不变也可能刚到，
+     * 所以判据只能放在 {@link #refresh()} 里每拍算，靠这两个字段挡住重复动作。
+     */
+    private int appliedAspectW = 0;
+    private int appliedAspectH = 0;
 
     /** 上一次「在放」时的形态。宽限期内据此判断「刚才是不是在放音频」。 */
     private int lastPlayingMode = MODE_IDLE;
@@ -394,6 +407,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             applyStatusDot(false);
             applyModeIfChanged(MODE_IDLE);
             applyTopBar(MODE_IDLE);
+            // 服务没了 → 没有比例可依，复位全屏。
+            applyVideoAspect(MODE_IDLE);
             return;
         }
 
@@ -402,6 +417,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // 顶部条与「形态」无关：同一个形态里，播放 ↔ 暂停 ↔ 出错随时会变。
         // 所以它必须每个 tick 重算一次，不能只在形态切换时算。
         applyTopBar(mode);
+        // 软件信箱同理每个 tick 都算：探测结果是**异步**到的，形态不变也可能刚到。
+        // 内部按「已应用的宽高有没有变」去重，没变不动 View。
+        applyVideoAspect(mode);
 
         // 图片形态下，片源地址会在**同一个形态之内**换掉 —— 相册里连投几张就是
         // 这种：每一张都是 MODE_IMAGE，形态从头到尾没变过。而
@@ -1213,6 +1231,59 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             // 地址没变时 loadImage 会直接返回，不会重复下载。
             loadImage(service.getCurrentUri());
         }
+    }
+
+    /**
+     * 按真实视频宽高摆 SurfaceView（软件信箱）。
+     *
+     * <p><b>为什么需要它</b>：这台海信 MTK5880 对<b>直连 MP4</b> 没有信箱计算链，
+     * 厂商 native 直接 {@code set overscan!!!} 把画面放大铺满 —— 竖屏视频被撑满
+     * 全屏。控制面已穷尽（关不掉厂商的 overscan），只能在我们这一层按真实宽高
+     * 摆 SurfaceView。HLS 走厂商自研的信箱链、比例本来就是对的，所以
+     * {@link DlnaRendererService#getVideoAspect()} 对 .m3u8 恒返回 null ——
+     * 我们**不会**对 HLS 摆比例（否则是双重信箱）。
+     *
+     * <p><b>判据</b>：只有 {@code mode == MODE_VIDEO} 且探到真实宽高才按比例摆；
+     * 其它形态一律全屏 —— {@code MODE_VIDEO_PENDING} 是空视频层（摆比例只会
+     * 露出黑边，没有意义）、音频/图片根本不走这层、IDLE 更该复位。
+     *
+     * <p><b>黑边来自哪</b>：SurfaceView 缩小后，露出来的是根 {@code FrameLayout}
+     * 的背景 {@code @color/bg = #FF0F1419}（近黑）—— 那正是我们要的软件信箱，
+     * 不需要再叠一层黑色遮罩。
+     *
+     * <p><b>每个 tick 都调</b>：探测结果是异步到的，形态不变也可能刚到。内部
+     * 记住已应用的宽高，没变就直接 return —— 每 0.5 秒 setLayoutParams 一次会
+     * 触发无谓的重排。
+     */
+    private void applyVideoAspect(int mode) {
+        int w = 0;
+        int h = 0;
+        if (mode == MODE_VIDEO && service != null) {
+            int[] size = service.getVideoAspect();
+            if (size != null && size.length >= 2) {
+                w = size[0];
+                h = size[1];
+            }
+        }
+        // 没变就别动 View：setLayoutParams 会触发重新布局。
+        if (w == appliedAspectW && h == appliedAspectH) {
+            return;
+        }
+        appliedAspectW = w;
+        appliedAspectH = h;
+        FrameLayout.LayoutParams lp;
+        if (w > 0 && h > 0) {
+            // 有比例 → 居中摆真实宽高，露出的近黑背景就是软件信箱。
+            lp = new FrameLayout.LayoutParams(w, h, Gravity.CENTER);
+        } else {
+            // 无比例 → 复位全屏（match_parent）。
+            lp = new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT);
+        }
+        surfaceView.setLayoutParams(lp);
+        Log.i(TAG, "视频比例: " + (w > 0 && h > 0 ? w + "x" + h : "全屏")
+                + "（形态 " + modeName(mode) + "）");
     }
 
     /**

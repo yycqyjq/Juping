@@ -34,6 +34,8 @@ trap 'rm -rf "$OUT"' EXIT INT TERM
 
 POLICY="app/src/main/java/com/juping/cast/player/PlaybackPolicy.java"
 CTRL="app/src/main/java/com/juping/cast/player/MediaPlayerController.java"
+ASPECT="app/src/main/java/com/juping/cast/player/Mp4Aspect.java"
+PROBE="app/src/main/java/com/juping/cast/player/VideoAspectProbe.java"
 HTTP="app/src/main/java/com/juping/cast/dlna/UpnpHttpServer.java"
 ED="app/src/main/java/com/juping/cast/dlna/EventDispatcher.java"
 SVC="app/src/main/java/com/juping/cast/DlnaRendererService.java"
@@ -45,7 +47,7 @@ QR="app/src/main/java/com/juping/cast/QrRenderer.java"
 # ── 1. 编译（不需要 android.jar —— PlaybackPolicy 零 Android 依赖）──
 echo "── 编译播放策略（桌面 JVM，零 Android 依赖）──"
 if ! "$JAVAC" -nowarn -encoding UTF-8 -d "$OUT" \
-        "$POLICY" "$HERE/PolicyTest.java" 2>"$OUT/javac.err"; then
+        "$POLICY" "$ASPECT" "$HERE/PolicyTest.java" 2>"$OUT/javac.err"; then
     echo "编译失败：" >&2
     cat "$OUT/javac.err" >&2
     exit 2
@@ -65,7 +67,7 @@ if [ ! -f "$ANDROID_JAR" ]; then
 else
     mkdir -p "$OUT/ctrl"
     if "$JAVAC" -nowarn -encoding UTF-8 -cp "$ANDROID_JAR" -d "$OUT/ctrl" \
-            "$POLICY" "$CTRL" "$MPROXY" 2>"$OUT/ctrl.err"; then
+            "$POLICY" "$CTRL" "$ASPECT" "$PROBE" "$MPROXY" 2>"$OUT/ctrl.err"; then
         echo "  通过（MediaPlayerController 语法与类型检查无误）"
     else
         echo "编译失败：" >&2
@@ -3179,6 +3181,74 @@ report('strings.xml 有「正在准备视频」占位文案',
        'name="video_wait"' in strings,
        '布局里 @string/video_wait 引用它，缺了会编译期红 —— 钉这条是为了'
        '让「删文案」这种回退在闸门而不是装机时暴露')
+
+# ---- (14) 直连 MP4 软件信箱（方案 B）----
+# 真机现象：直连 MP4（抖音 / 腾讯偶给的 .f632）没有厂商信箱计算链，native
+# 直接 set overscan 放大铺满 —— 竖屏视频被撑满全屏。控制面已穷尽（关不掉），
+# 只能在我们这一层按真实宽高摆 SurfaceView。这组守卫钉的是「修好的别被改回去」，
+# 以及一条红线：HLS 走厂商自带的信箱链，我们**绝不能碰**（否则双重信箱）。
+probe_src = strip_comments(
+    pathlib.Path('app/src/main/java/com/juping/cast/player/VideoAspectProbe.java'
+                 ).read_text(encoding='utf-8'))
+
+pb = body_of(probe_src, 'public static int[] probe(String url)')
+report('VideoAspectProbe.probe 方法体已找到', pb is not None,
+       '锚点：public static int[] probe(String url)')
+if pb:
+    _m = pb.find('.m3u8')
+    _r = pb.find('return null', _m) if _m >= 0 else -1
+    report('probe 对 .m3u8 早退返回 null（红线：HLS 不许碰）',
+           _m >= 0 and _r > _m,
+           'HLS 走厂商自研的信箱链，比例本来就是对的 —— 我们再摆一次就是'
+           '双重信箱。这条是整个方案的红线')
+    report('probe 的 catch 分支返回 null（不抛、不猜值）',
+           re.search(r'catch\s*\([^)]*\)\s*\{[^}]*return\s+null', pb) is not None,
+           '探测是可选优化：任何异常都必须静默退回全屏，不许抛、不许弹错误')
+    report('probe 有尺寸合法性闸（16~8192 上下界）',
+           re.search(r'MIN_DIM\s*=\s*16\b', probe_src) is not None
+           and re.search(r'MAX_DIM\s*=\s*8192\b', probe_src) is not None
+           and 'MIN_DIM' in pb and 'MAX_DIM' in pb,
+           'stsdSize 读到音频 entry 的垃圾字节时会给出荒谬值 —— '
+           '宁可全屏也不摆错信箱')
+
+av = body_of(main_act, 'private void applyVideoAspect(int mode)')
+report('MainActivity.applyVideoAspect 方法体已找到', av is not None,
+       '锚点：private void applyVideoAspect(int mode)')
+if av:
+    _vid = av.find('MODE_VIDEO')
+    _full = av.find('MATCH_PARENT')
+    report('只在 MODE_VIDEO 应用比例，其它形态复位 MATCH_PARENT',
+           _vid >= 0 and _full > _vid
+           and re.search(r'mode\s*==\s*MODE_VIDEO', av) is not None,
+           'MODE_VIDEO_PENDING 是空视频层（摆比例只会露黑边）、音频/图片不走这层、'
+           'IDLE 该复位 —— 判据反了会把全屏画面缩成一个小方块')
+    report('applyVideoAspect 真的设了 SurfaceView 的 LayoutParams',
+           'surfaceView.setLayoutParams(' in av,
+           '不设 LayoutParams 的话比例只是个变量，画面还是被厂商铺满')
+rf_aspect = body_of(main_act, 'private void refresh()')
+report('refresh 每 tick 调 applyVideoAspect（探测异步到达也要跟上）',
+       rf_aspect is not None and 'applyVideoAspect(' in rf_aspect,
+       '探测结果异步到达，形态不变也可能刚到 —— 只写在 applyMode 里会永远轮不到')
+
+play_body = body_of(ctrl, 'public synchronized boolean play(String url)')
+report('MediaPlayerController.play 方法体已找到', play_body is not None,
+       '锚点：public synchronized boolean play(String url)')
+if play_body:
+    _cur = play_body.find('currentUrl = url')
+    _clr = play_body.find('aspectUrl = null')
+    _st = play_body.find('startInternal()')
+    report('换片源按地址清账（清账在 currentUrl=url 之后、startInternal 之前）',
+           _cur >= 0 and _clr > _cur and (_st < 0 or _clr < _st),
+           '不清的话，新片源在探完之前会拿到上一部的宽高 —— 黑边方向直接错')
+report('MediaPlayerController 暴露 getVideoAspect 且持有按地址记账三字段',
+       'public int[] getVideoAspect()' in ctrl
+       and 'videoAspect' in ctrl and 'aspectUrl' in ctrl and 'aspectProbing' in ctrl,
+       '探测结果要出得来（getter），且必须按地址记账 —— 换片源即作废')
+gva = body_of(svc, 'public int[] getVideoAspect()')
+report('DlnaRendererService.getVideoAspect 存在且委托给 player（不自己算）',
+       gva is not None and 'player' in gva and 'getVideoAspect()' in gva,
+       '判据权威在播放控制器（探测与记账都在那边），界面不自己猜 —— '
+       '与 isAudioOnly()/isVideoPending() 同一条纪律')
 
 # ---- 版本纪律（二夜定的规矩：每次 dist 构建必须升版本）----
 build_sh = pathlib.Path('tools/build.sh').read_text(encoding='utf-8')

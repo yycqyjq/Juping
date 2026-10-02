@@ -1,4 +1,7 @@
+import com.juping.cast.player.Mp4Aspect;
 import com.juping.cast.player.PlaybackPolicy;
+
+import java.util.Arrays;
 
 /**
  * 播放重连策略的一致性测试。
@@ -327,6 +330,55 @@ public class PolicyTest {
                 oldAlwaysStops() && PlaybackPolicy.isSpuriousCompletion(false, 500L, 300, 271000),
                 "新旧结论相反 —— 这条断言能区分对错，不是恒真");
 
+        System.out.println("\n── 13. 直连 MP4 的真实宽高解析（软件信箱的判据）──");
+        System.out.println("   这台电视对直连 MP4 没有信箱计算链，厂商 native 会把画面放大铺满；");
+        System.out.println("   而 getVideoWidth() 在本机恒为 0，只能从 MP4 的 tkhd 里读。");
+        System.out.println("   下面用字节现造 MP4（不读任何文件），覆盖横屏 / 旋转 / stsd / v1 / 尾部 moov。");
+
+        byte[] c1 = moovOf(videoTrak(0, 1920, 1080, false));
+        int[] r1 = Mp4Aspect.parse(c1, c1.length);
+        check("横屏 tkhd 1920×1080 → 原样返回 {1920,1080}",
+                r1 != null && r1[0] == 1920 && r1[1] == 1080, "得到 " + fmt(r1));
+
+        byte[] c2 = moovOf(videoTrak(0, 1280, 720, true));
+        int[] r2 = Mp4Aspect.parse(c2, c2.length);
+        check("旋转 90° 的 matrix（a=0,d=0,b/c≠0）→ 交换成 {720,1280}",
+                r2 != null && r2[0] == 720 && r2[1] == 1280, "得到 " + fmt(r2));
+
+        byte[] c3 = moovOf(trakWithStsd(720, 1280));
+        int[] r3 = Mp4Aspect.parse(c3, c3.length);
+        check("tkhd 宽高为 0 → 退到 stsd/avc1 的 720×1280",
+                r3 != null && r3[0] == 720 && r3[1] == 1280, "得到 " + fmt(r3));
+
+        byte[] c4 = moovOf(videoTrak(0, 0, 0, false), videoTrak(0, 1920, 1080, false));
+        int[] r4 = Mp4Aspect.parse(c4, c4.length);
+        check("第一条 trak 是音频（tkhd 宽高 0）、第二条视频 → 仍返回视频尺寸",
+                r4 != null && r4[0] == 1920 && r4[1] == 1080, "得到 " + fmt(r4));
+
+        byte[] c5 = moovOf(videoTrak(1, 3840, 2160, false));
+        int[] r5 = Mp4Aspect.parse(c5, c5.length);
+        check("tkhd v1（version=1，宽高 +96/+100）3840×2160 → 原样返回",
+                r5 != null && r5[0] == 3840 && r5[1] == 2160, "得到 " + fmt(r5));
+
+        byte[] c6 = tailWindow(moovOf(videoTrak(0, 720, 1280, false)));
+        int[] r6 = Mp4Aspect.parse(c6, c6.length);
+        check("moov 在尾部（窗口开头是 mdat 载荷）→ 仍能解析",
+                r6 != null && r6[0] == 720 && r6[1] == 1280, "得到 " + fmt(r6));
+
+        byte[] garbage = new byte[128];
+        Arrays.fill(garbage, (byte) 0xAB);
+        check("垃圾字节 → null（不是 MP4 就别猜）",
+                Mp4Aspect.parse(garbage, garbage.length) == null, "整段 0xAB");
+        byte[] ftypOnly = box("ftyp", new byte[16]);
+        check("只有 ftyp 没有 moov → null",
+                Mp4Aspect.parse(ftypOnly, ftypOnly.length) == null, "ftyp + 16 字节载荷");
+
+        byte[] full = moovOf(videoTrak(0, 1920, 1080, false));
+        byte[] trunc = Arrays.copyOf(full, full.length - 20);
+        check("moov 不完整落在窗口内 → null（不读窗口外的垃圾）",
+                Mp4Aspect.parse(trunc, trunc.length) == null,
+                "声明 " + full.length + " 字节、实际只有 " + trunc.length);
+
         System.out.println();
         System.out.println("=".repeat(62));
         System.out.println("播放策略：" + passed + " / " + total + " 通过");
@@ -396,6 +448,121 @@ public class PolicyTest {
      */
     static boolean oldAlwaysStops() {
         return true;
+    }
+
+    // ------------------------------------------------------------------
+    // 合成 MP4（给 Mp4Aspect 的行为断言用）—— 不读任何文件，全部现造字节
+    // ------------------------------------------------------------------
+
+    /** 造一个 box：8 字节头（4 字节大端长度 + 4 字节 fourcc）+ 载荷。 */
+    static byte[] box(String type, byte[] payload) {
+        byte[] b = new byte[8 + payload.length];
+        putInt(b, 0, b.length);
+        b[4] = (byte) type.charAt(0);
+        b[5] = (byte) type.charAt(1);
+        b[6] = (byte) type.charAt(2);
+        b[7] = (byte) type.charAt(3);
+        System.arraycopy(payload, 0, b, 8, payload.length);
+        return b;
+    }
+
+    static byte[] concat(byte[]... parts) {
+        int n = 0;
+        for (byte[] p : parts) {
+            n += p.length;
+        }
+        byte[] out = new byte[n];
+        int off = 0;
+        for (byte[] p : parts) {
+            System.arraycopy(p, 0, out, off, p.length);
+            off += p.length;
+        }
+        return out;
+    }
+
+    /** moov box，装若干 trak。 */
+    static byte[] moovOf(byte[]... traks) {
+        return box("moov", concat(traks));
+    }
+
+    /** 一条视频 trak：trak &gt; tkhd。 */
+    static byte[] videoTrak(int version, int w, int h, boolean rot90) {
+        return box("trak", box("tkhd", tkhdPayload(version, w, h, rot90)));
+    }
+
+    /**
+     * tkhd 的载荷（不含 8 字节 box 头）。
+     *
+     * <p>偏移按 box 起始算：v0 matrix 在 +48、宽高在 +84/+88；v1 因
+     * creation/modification/duration 各从 32 位变 64 位（各 +4），matrix 移到
+     * +60、宽高移到 +96/+100。载荷里各减去 8 字节 box 头。
+     */
+    static byte[] tkhdPayload(int version, int w, int h, boolean rot90) {
+        byte[] p = new byte[(version == 1) ? 96 : 84];
+        p[0] = (byte) version;
+        int mOff = (version == 1) ? 52 : 40;
+        // 9 个 16.16 定点数：a,b,u,c,d,v,x,y,w。1.0 = 0x00010000。
+        // 恒等：a=d=1。旋转 90°：a=d=0、b=c=1（Mp4Aspect 据此交换宽高）。
+        putInt(p, mOff, rot90 ? 0 : 0x00010000);          // a
+        putInt(p, mOff + 4, rot90 ? 0x00010000 : 0);      // b
+        putInt(p, mOff + 12, rot90 ? 0x00010000 : 0);     // c
+        putInt(p, mOff + 16, rot90 ? 0 : 0x00010000);     // d
+        int wOff = (version == 1) ? 88 : 76;
+        int hOff = (version == 1) ? 92 : 80;
+        putInt(p, wOff, w << 16);                          // 16.16 定点
+        putInt(p, hOff, h << 16);
+        return p;
+    }
+
+    /** tkhd 宽高为 0 的 trak：trak &gt; tkhd + mdia&gt;minf&gt;stbl&gt;stsd&gt;avc1。 */
+    static byte[] trakWithStsd(int w, int h) {
+        return box("trak", concat(
+                box("tkhd", tkhdPayload(0, 0, 0, false)),
+                box("mdia", box("minf", box("stbl", stsdBox(w, h))))));
+    }
+
+    /** stsd：version/flags(4) + entry_count(4) + avc1。 */
+    static byte[] stsdBox(int w, int h) {
+        byte[] entry = avc1Box(w, h);
+        byte[] p = new byte[8 + entry.length];
+        putInt(p, 4, 1);                                   // entry_count = 1
+        System.arraycopy(entry, 0, p, 8, entry.length);
+        return box("stsd", p);
+    }
+
+    /** avc1：VisualSampleEntry，宽高在 entry 起始 +32/+34（16 位无符号）。 */
+    static byte[] avc1Box(int w, int h) {
+        byte[] p = new byte[40];
+        putShort(p, 24, w);                                // entry +32
+        putShort(p, 26, h);                                // entry +34
+        return box("avc1", p);
+    }
+
+    /** 把 moov 放到「窗口开头是 mdat 载荷」的位置，逼 Mp4Aspect 走 scanForMoov 回退。 */
+    static byte[] tailWindow(byte[] moov) {
+        // 尾部窗口的开头落在 mdat 载荷**中间** —— 不是 box 边界，头 4 字节是
+        // 随机载荷（这里用 0xAB 模拟，含高位为 1 的字节）。findTopLevel 必须
+        // 判定「这里不是 box 边界」而返回 null，逼 parse 走 scanForMoov 回退。
+        byte[] filler = new byte[200];
+        Arrays.fill(filler, (byte) 0xAB);
+        return concat(filler, moov);
+    }
+
+    static void putInt(byte[] b, int off, int v) {
+        b[off] = (byte) (v >>> 24);
+        b[off + 1] = (byte) (v >>> 16);
+        b[off + 2] = (byte) (v >>> 8);
+        b[off + 3] = (byte) v;
+    }
+
+    static void putShort(byte[] b, int off, int v) {
+        b[off] = (byte) (v >>> 8);
+        b[off + 1] = (byte) v;
+    }
+
+    /** 只给失败信息用的可读格式。 */
+    static String fmt(int[] size) {
+        return size == null ? "null" : "{" + size[0] + "," + size[1] + "}";
     }
 
     /**

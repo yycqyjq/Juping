@@ -139,6 +139,29 @@ public class MediaPlayerController {
     private boolean prepared;
 
     /**
+     * 当前片源的真实视频宽高（软件信箱用）；{@code null} = 还没探到 / 探不到。
+     *
+     * <p><b>按地址记账</b>：它只对 {@link #aspectUrl} 这个地址成立，换片源即作废
+     * （见 {@link #play}）—— 否则新片源在探完之前会拿着上一部的宽高去摆信箱，
+     * 黑边方向直接错。
+     *
+     * <p>{@code volatile}：探测在 daemon 线程上跑，结果由 handler 切回主线程写；
+     * 界面刷新线程会读它。
+     */
+    private volatile int[] videoAspect;
+
+    /**
+     * 已经探测完成的地址（探到 {@code null} 也算完成 —— 避免每个 tick 对同一个
+     * 地址反复发探测请求）。<b>按地址记账，换片源即作废。</b>
+     */
+    private volatile String aspectUrl;
+
+    /**
+     * 正在探测的地址（防重入：同一个地址不并发探两次）。<b>按地址记账，换片源即作废。</b>
+     */
+    private volatile String aspectProbing;
+
+    /**
      * 是否正在 prepare（{@code prepareAsync} 已发出、回调还没到）。
      *
      * <p><b>必须和 {@link #prepared} 分开</b>：这两者的正确处置完全相反。
@@ -330,6 +353,14 @@ public class MediaPlayerController {
         // 把用户刚投上来的新视频顶掉。表现就是"投了新视频，画面跳回上一个"。
         cancelPendingRetry();
         currentUrl = url;
+        // 换了片源，按地址记的宽高账立刻作废：新片源在探完之前若还拿着上一部的
+        // 宽高去摆软件信箱，黑边方向直接错（横屏视频被摆成竖屏）。探测结果
+        // 是**按地址**成立的，地址一变就必须全清，等新地址探完再落账。
+        if (!url.equals(aspectUrl)) {
+            videoAspect = null;
+            aspectUrl = null;
+            aspectProbing = null;
+        }
         retryCount = 0;
         stallCount = 0;
         userPaused = false;
@@ -408,6 +439,11 @@ public class MediaPlayerController {
             // 「释放播放器: release 结束」的时差就是 teardown→prepare 的实际间隔。
             Log.i(TAG, "setDataSource 完成: t=" + prepareStartedAt
                     + "，距释放 " + (prepareStartedAt - lastReleaseAtMs) + "ms");
+            // 起播的同时异步探一下直连 MP4 的真实宽高（软件信箱用）。
+            // 探测只对非 m3u8 地址有意义 —— 这里不重复挡 m3u8，交给
+            // VideoAspectProbe.probe 自己挡（红线只留一处，免得两处判据漂移）。
+            // 探到与否都不影响播放：失败静默退回全屏。
+            maybeProbeAspect(currentUrl);
             player.setScreenOnWhilePlaying(true);
 
             player.setOnPreparedListener(new MediaPlayer.OnPreparedListener() {
@@ -1405,6 +1441,72 @@ public class MediaPlayerController {
      */
     public boolean hasVideo() {
         return hasVideo;
+    }
+
+    /**
+     * 当前片源的真实视频宽高（软件信箱用）；{@code null} = 还没探到 / 探不到 / 不是直连 MP4。
+     *
+     * <p>界面据此按比例摆 SurfaceView —— 判据的权威在这里（探测与按地址记账都在
+     * 控制器内），界面不自己猜，与 {@code isAudioOnly()} / {@code isVideoPending()}
+     * 同一条纪律。
+     */
+    public int[] getVideoAspect() {
+        return videoAspect;
+    }
+
+    /**
+     * 异步探测当前片源的真实宽高（软件信箱用）。
+     *
+     * <p>纪律：
+     * <ol>
+     *   <li><b>按地址记账</b>：{@link #aspectUrl}（已探完）或 {@link #aspectProbing}
+     *       （探测中）等于这个地址就早退 —— 同一个地址不重复探、不并发探。</li>
+     *   <li><b>只对非 m3u8 有意义</b>：这里**不**重复挡 m3u8，交给
+     *       {@link VideoAspectProbe#probe} 自己挡 —— 红线只留一处，两处判据迟早漂移。</li>
+     *   <li><b>结果切回主线程再落账</b>：{@code videoAspect} 等字段是 volatile，
+     *       跨线程直接写本身是安全的；但「排队期间是否已换片 / 停止」的一致性校验
+     *       必须和 {@link #currentUrl} 的读在同一时刻 —— 统一在 handler.post 里做，
+     *       避免「校验通过 → 换片 → 写入旧宽高」的竞态。而换片/停止都会清账
+     *       （见 {@link #play}），所以只要落账时地址对得上，写进去的就是当前片源的。</li>
+     *   <li><b>失败静默</b>：探到 {@code null} 也照样记 {@link #aspectUrl} ——
+     *       表示"这个地址探过了、没有"，免得每个 tick 反复探。</li>
+     * </ol>
+     */
+    private void maybeProbeAspect(final String url) {
+        if (url == null || url.length() == 0) {
+            return;
+        }
+        // 探完了 / 正在探 —— 同一个地址都不再发第二次。
+        if (url.equals(aspectUrl) || url.equals(aspectProbing)) {
+            return;
+        }
+        aspectProbing = url;
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final int[] size = VideoAspectProbe.probe(url);
+                handler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        // 排队期间可能已换片 / 停止：只有当前地址仍是它才落账。
+                        if (!url.equals(currentUrl)) {
+                            // 这次探测已过期。若占位仍是它，摘掉，免得这个地址
+                            // 以后再被当成"正在探"而永远不探（换片会清账，但
+                            // 停止→重投同一个地址这条路上要靠这里兜住）。
+                            if (url.equals(aspectProbing)) {
+                                aspectProbing = null;
+                            }
+                            return;
+                        }
+                        videoAspect = size;
+                        aspectUrl = url;
+                        aspectProbing = null;
+                    }
+                });
+            }
+        }, "aspect-probe");
+        t.setDaemon(true);
+        t.start();
     }
 
     /**

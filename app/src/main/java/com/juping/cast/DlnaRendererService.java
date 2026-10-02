@@ -1670,6 +1670,17 @@ public class DlnaRendererService extends Service
         return player;
     }
 
+    /**
+     * 当前片源的真实视频宽高（软件信箱用）；{@code null} = 未知或不是直连 MP4。
+     *
+     * <p>判据权威在播放控制器（探测与按地址记账都在那边）—— 界面不自己猜，
+     * 与 {@link #isAudioOnly()} / {@link #isVideoPending()} 同一条纪律。
+     */
+    public int[] getVideoAspect() {
+        MediaPlayerController p = player;
+        return p == null ? null : p.getVideoAspect();
+    }
+
     public String getFriendlyName() {
         return friendlyName;
     }
