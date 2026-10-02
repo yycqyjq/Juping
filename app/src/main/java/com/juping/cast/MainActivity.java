@@ -574,6 +574,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (uri == null || uri.length() == 0) {
             return;
         }
+        // 失败黑名单只对「当前这个地址」有效 —— 地址一换就作废。
+        //
+        // 不清的话有一条静默死路：投 A 失败（imageFailedUri=A）→ 投 B 成功
+        // （imageUri=B，黑名单还挂着 A）→ 再回 A，下面那句
+        // `uri.equals(imageFailedUri)` 直接早退，A 永远不再重试，电视就一直
+        // 显示着 B。而「同一坏地址被 0.5s tick 无限重试」这条防刷不受影响：
+        // 地址没变时 uri 仍等于 imageFailedUri，走不到这里。
+        if (imageFailedUri != null && !uri.equals(imageFailedUri)) {
+            imageFailedUri = null;
+        }
         if (uri.equals(imageUri) || uri.equals(imageLoadingUri)
                 || uri.equals(imageFailedUri)) {
             return;

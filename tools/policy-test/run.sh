@@ -2968,7 +2968,24 @@ report('失败的图片地址被记住，不再每 0.5 秒重试一次（三处�
        '三处缺一不可：① loadImage 的早退条件里要带上它；② showImage 的失败分支'
        '要记下这个地址；③ releaseImage 要清掉它（不然回空闲后再投同一张图永远'
        '显示不出来）。缺 ① 或 ②：refresh() 每 0.5 秒又问一次，真机实测坏地址'
-       '15 秒内发了 30 次请求、弹了 30 次 Toast —— 0.6GB 的盒子上是纯粹的浪费')
+        '15 秒内发了 30 次请求、弹了 30 次 Toast —— 0.6GB 的盒子上是纯粹的浪费')
+
+# 黑名单只对「当前这个地址」有效 —— 换地址即作废。
+# 少了这一步会有一条**静默死路**（编译过、日志正常、功能悄悄失效）：
+#   投 A 失败（imageFailedUri=A）→ 投 B 成功（imageUri=B，黑名单仍挂着 A）
+#   → 再回 A：loadImage 的早退 `uri.equals(imageFailedUri)` 直接命中，
+#   A 永远不再重试，电视一直显示着 B。
+# 而防刷不受影响：地址没变时 uri 仍等于 imageFailedUri，同样走不到重试。
+_warn_fail = re.search(r'imageFailedUri\s*!=\s*null\s*&&\s*'
+                       r'!uri\.equals\(imageFailedUri\)\s*\)\s*\{\s*'
+                       r'imageFailedUri\s*=\s*null;', li2 or '')
+report('失败黑名单换地址即作废（换图再换回来能重试）',
+       li2 is not None and _warn_fail is not None
+       and li2.find(_warn_fail.group(0)) < li2.find('uri.equals(imageUri)'),
+       '清理必须排在早退判断**之前**：放后面等于没清。'
+       '反例就是上面那条死路 —— 三处接线（loadImage/showImage/releaseImage）'
+       '都还在，守卫照绿，但「A→B→A」这条路永远回不来，'
+       '用户看到的是「明明投过了却显示另一张」')
 
 ko = body_of(svc, 'private static int kindOfAny(String uri, String metadata)')
 report('形态判定：元数据判不出来时按地址扩展名兜底',
