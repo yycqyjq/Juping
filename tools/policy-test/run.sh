@@ -616,6 +616,32 @@ report('使用说明文案真实（同 Wi-Fi + 两条路径都提）',
            pathlib.Path('app/src/main/res/values/strings.xml').read_text(encoding='utf-8')),
        '文案要与实际能力一致：扫码传文件、手机自带投屏选设备名，两条路都存在才写')
 
+# ⑱-c 设备基础信息四格（2026-10-02 二夜要求：面板多列安卓/处理器/内存/存储）。
+#    守的是两类静默失败：① 布局里删了格子或 MainActivity 忘了绑定 → 值永远空白，
+#    编译过、运行不报错；② 内存那格改用 MemoryInfo.totalMem —— **API16 才有**，
+#    这台 4.0.4（API15）一点开就 NoSuchFieldError 崩掉整个 Activity，而 minSdk 14
+#    的 lint 只会提示、拦不住。
+_info_ids = ['@+id/info_system', '@+id/info_cpu', '@+id/info_mem', '@+id/info_storage']
+report('设备信息卡有基础信息四格（系统/处理器/内存/存储）',
+       all(i in by_id for i in _info_ids),
+       '缺：%s —— 少一格面板就是空白行，没人会为"少个数字"报 bug，'
+       '但排障时它偏偏是最想一眼看到的东西'
+       % ([i for i in _info_ids if i not in by_id]))
+report('MainActivity 把四格都绑上并喂了值',
+       all(('R.id.' + i[5:]) in act_src for i in _info_ids)
+       and 'fillStaticDeviceFacts()' in act_src
+       and 'fillDynamicDeviceFacts()' in act_src,
+       '绑了不填 / 填了没绑，格子都永远是空的 —— 这类问题编译器不吭声')
+_act_code = '\n'.join(l.split('//')[0] for l in act_src.splitlines())   # 去掉行内注释再匹配
+report('内存总量走 /proc/meminfo，不用 MemoryInfo.totalMem（API16）',
+       'totalMem' not in _act_code and '/proc/meminfo' in act_src,
+       'totalMem 是 API16 字段，本机 API15 调用即 NoSuchFieldError 直接崩界面；'
+       '项目纪律又是零反射（没有绕法），/proc/meminfo 是唯一正路 —— '
+       '注释里可以提这个字段名，代码里用就红')
+report('读不到的容量显示「—」而不是 0（老设备 statvfs 返回 0）',
+       'fmtBytes(' in act_src and 'if (n <= 0)' in act_src,
+       '把 0 报成「0 GB」等于谎报盘满了 —— 与 LocalStore.usableBytes 同一条纪律')
+
 # 图片层（批 3）：MediaPlayer 解不了静态图，所以图片有自己的一层。
 # 这几条守的是「照片投上去，电视全黑」——布局把这一层漏了 / 藏反了，
 # 代码全都照常编译运行，只是照片永远显示不出来。

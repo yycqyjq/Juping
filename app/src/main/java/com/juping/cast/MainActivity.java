@@ -1,12 +1,14 @@
 package com.juping.cast;
 
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
@@ -23,9 +25,12 @@ import android.widget.Toast;
 
 import com.juping.cast.player.PlaybackPolicy;
 
+import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.FileReader;
+import java.io.IOException;
 import java.io.InputStream;
 import java.net.URL;
 import java.net.URLConnection;
@@ -129,6 +134,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private TextView infoNetwork;
     private TextView infoState;
     private TextView infoVersion;
+    /**
+     * 设备基础信息那 2×2 网格的四个值（系统 / 处理器 / 内存 / 存储）。
+     *
+     * <p>前两个是**静态事实**（换系统、换机型要重装 APK，那时自然重读）；
+     * 后两个的「可用」部分会变，随 idle 刷新重新读 —— 见
+     * {@link #fillStaticDeviceFacts} / {@link #fillDynamicDeviceFacts}。
+     */
+    private TextView infoSystem;
+    private TextView infoCpu;
+    private TextView infoMem;
+    private TextView infoStorage;
     private TextView infoSource;
     private TextView playingText;
     private TextView musicSource;
@@ -304,6 +320,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         infoNetwork = (TextView) findViewById(R.id.info_network);
         infoState = (TextView) findViewById(R.id.info_state);
         infoVersion = (TextView) findViewById(R.id.info_version);
+        infoSystem = (TextView) findViewById(R.id.info_system);
+        infoCpu = (TextView) findViewById(R.id.info_cpu);
+        infoMem = (TextView) findViewById(R.id.info_mem);
+        infoStorage = (TextView) findViewById(R.id.info_storage);
         infoSource = (TextView) findViewById(R.id.info_source);
         playingText = (TextView) findViewById(R.id.playing_text);
         musicSource = (TextView) findViewById(R.id.music_source);
@@ -324,6 +344,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // 只显示 versionName（如 0.1.11）：versionCode 是给系统比新旧用的整数，
         // 界面上没有意义 —— 原来写成 "0.1.9（10）"，用户看到括号里的数只会问"这是什么"。
         infoVersion.setText(getString(R.string.fmt_version, BuildConfig.VERSION_NAME));
+
+        // 设备基础信息（系统/处理器/内存/存储）。静态的两格读一次就够，
+        // 内存与存储的「可用」会随后续 idle 刷新重新读。
+        fillStaticDeviceFacts();
+        fillDynamicDeviceFacts();
 
         surfaceView.getHolder().addCallback(this);
 
@@ -408,6 +433,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             updateQr("http://" + service.getLocalIp() + ":" + service.getHttpPort() + "/");
             infoNetwork.setText(service.getBoundInterfaceName());
             infoState.setText(describeState());
+            // 可用内存/可用存储会随使用变化，空闲时顺手重读一次（开销是一次
+            // /proc 读 + 一次 statfs，都在没在播的空闲态，无所谓）。
+            fillDynamicDeviceFacts();
             return;
         }
 
@@ -1255,6 +1283,196 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             dot = R.drawable.dot_online;
         }
         statusDot.setBackgroundResource(dot);
+    }
+
+    /**
+     * 设备基础信息里**不会变**的那两格：系统版本、处理器。onCreate 读一次。
+     *
+     * <p>所有值都是从系统真读出来的，读不到就显示「—」—— 界面上印一个猜的数，
+     * 比留空更害人（排障时会顺着错的线索走）。
+     */
+    private void fillStaticDeviceFacts() {
+        // 系统：Build.VERSION 是标准 API（API 4+），零反射。
+        String rel = Build.VERSION.RELEASE;
+        infoSystem.setText(rel == null || rel.trim().length() == 0
+                ? "—"
+                : "Android " + rel.trim() + "（API " + Build.VERSION.SDK_INT + "）");
+
+        // 处理器：优先 /proc/cpuinfo 的 Hardware 行（这台盒子是 "MT5880" ——
+        // 芯片型号比 ABI 有用得多）；没有这行就退回 Build.CPU_ABI。
+        String cpu = procValue("/proc/cpuinfo", "Hardware");
+        if (cpu == null || cpu.length() == 0) {
+            cpu = Build.CPU_ABI;
+        }
+        StringBuilder out = new StringBuilder();
+        if (cpu != null && cpu.length() > 0) {
+            out.append(cpu);
+        }
+        // 核数：**只数小写 processor 开头的行**（"Processor" 那行是架构描述
+        // "ARMv7 Processor rev 0"，大小写敏感地 startsWith 正好把它排掉）。
+        int cores = cpuCoreCount();
+        if (cores > 0) {
+            if (out.length() > 0) {
+                out.append(" · ");
+            }
+            out.append(cores).append(" 核");
+        }
+        infoCpu.setText(out.length() == 0 ? "—" : out.toString());
+    }
+
+    /**
+     * 会变的那两格：内存（总量 + 可用）、存储（总量 + 可用）。
+     * onCreate 填一次初值，之后随 idle 刷新重读可用部分。
+     */
+    private void fillDynamicDeviceFacts() {
+        // 内存总量只能读 /proc/meminfo —— ActivityManager.MemoryInfo.totalMem 是
+        // **API 16**，这台 4.0.4（API 15）上调一下就是 NoSuchFieldError，
+        // 而项目纪律是零反射（见 build.gradle 的 minSdk 注释），没有绕的余地。
+        String totalS = fmtBytes(firstLong(procValue("/proc/meminfo", "MemTotal")) * 1024L);
+        String availS = null;
+        ActivityManager am = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+        if (am != null) {
+            // availMem 是 API 1，随便用
+            ActivityManager.MemoryInfo mi = new ActivityManager.MemoryInfo();
+            am.getMemoryInfo(mi);
+            availS = fmtBytes(mi.availMem);
+        }
+        StringBuilder mem = new StringBuilder();
+        if (totalS != null) {
+            mem.append("总 ").append(totalS);
+        }
+        if (availS != null) {
+            if (mem.length() > 0) {
+                mem.append(" · ");
+            }
+            mem.append("可用 ").append(availS);
+        }
+        infoMem.setText(mem.length() == 0 ? "—" : mem.toString());
+
+        // 存储：报**上传目录所在卷**（getFilesDir() 底下，与 LocalStore 同一个
+        // statfs 目标）—— 这样面板上的「可用」和上传页的剩余空间是同一件事。
+        // 读不到就如实空着：老设备 statvfs 会返回 0，把 0 报成「0 GB」等于
+        // 谎报盘满了（LocalStore.usableBytes 同一条纪律）。
+        File root = getFilesDir();
+        String tot = fmtBytes(root.getTotalSpace());
+        String use = fmtBytes(root.getUsableSpace());
+        StringBuilder st = new StringBuilder();
+        if (tot != null) {
+            st.append("总 ").append(tot);
+        }
+        if (use != null) {
+            if (st.length() > 0) {
+                st.append(" · ");
+            }
+            st.append("可用 ").append(use);
+        }
+        infoStorage.setText(st.length() == 0 ? "—" : st.toString());
+    }
+
+    /**
+     * /proc 里 {@code Key: value} 型的一行取值。
+     *
+     * @return 冒号后面的值（已 trim）；节点不存在 / 读不出来 / 值为空 → null
+     */
+    private static String procValue(String path, String key) {
+        BufferedReader reader = null;
+        try {
+            reader = new BufferedReader(new FileReader(path), 2048);
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (!line.startsWith(key)) {
+                    continue;
+                }
+                int colon = line.indexOf(':');
+                if (colon < 0) {
+                    continue;
+                }
+                String v = line.substring(colon + 1).trim();
+                if (v.length() > 0) {
+                    return v;
+                }
+            }
+        } catch (IOException e) {
+            // 节点不存在或没权限 —— 交给调用方显示「—」，不猜
+        } finally {
+            if (reader != null) {
+                try {
+                    reader.close();
+                } catch (IOException ignored) {
+                }
+            }
+        }
+        return null;
+    }
+
+    /** /proc/cpuinfo 里小写 {@code processor} 行的条数 = 核数；读不到返回 0。 */
+    private static int cpuCoreCount() {
+        BufferedReader reader = null;
+        int n = 0;
+        try {
+            reader = new BufferedReader(new FileReader("/proc/cpuinfo"), 4096);
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.startsWith("processor")) {
+                    n++;
+                }
+            }
+        } catch (IOException e) {
+            return 0;
+        } finally {
+            if (reader != null) {
+                try {
+                    reader.close();
+                } catch (IOException ignored) {
+                }
+            }
+        }
+        return n;
+    }
+
+    /**
+     * 字符串开头的十进制数；没有数字或溢出 → -1。
+     * 用于 {@code "624532 kB"} 这种格式。
+     */
+    private static long firstLong(String s) {
+        if (s == null) {
+            return -1;
+        }
+        int i = 0;
+        while (i < s.length() && !Character.isDigit(s.charAt(i))) {
+            i++;
+        }
+        int j = i;
+        while (j < s.length() && Character.isDigit(s.charAt(j))) {
+            j++;
+        }
+        if (j == i) {
+            return -1;
+        }
+        try {
+            return Long.parseLong(s.substring(i, j));
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    /**
+     * 字节数 → 给人看的容量；{@code <= 0}（读不出来）返回 null，调用方显示「—」。
+     *
+     * <p>1 GiB 以上用「2.4 GB」，否则用「610 MB」—— 盒子上 /data 才 2.4G，
+     * 全折成 MB 会得到「2458 MB」这种没人有概念的数。
+     */
+    private static String fmtBytes(long n) {
+        if (n <= 0) {
+            return null;
+        }
+        long oneG = 1024L * 1024L * 1024L;
+        if (n >= oneG) {
+            long tenths = n / (oneG / 10);
+            return (tenths / 10) + "." + (tenths % 10) + " GB";
+        }
+        long mb = (n + 1024L * 1024L - 1) / (1024L * 1024L);
+        return (mb < 1 ? 1 : mb) + " MB";
     }
 
     private String describeState() {

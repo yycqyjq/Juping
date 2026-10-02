@@ -359,6 +359,126 @@
                     android:textSize="16sp" />
             </LinearLayout>
 
+            <!-- 设备基础信息：2×2 网格（系统 / 处理器 / 内存 / 存储）。
+
+                 为什么是网格、不是四行：panel 现在是左右两列（右边整列给了二维码），
+                 左列只剩这么多高度 —— 再堆四行会把「重启服务」按钮顶出屏幕。
+                 两列并排只多占两行的高度，值却全露在外面。
+
+                 每格沿用上面那张表的样式（96dp 标签 + 值），读起来还是同一张表。
+                 值全是运行时读出来的：系统=Build，处理器=/proc/cpuinfo，
+                 内存=/proc/meminfo，存储=statfs 上传目录所在卷 ——
+                 读不到就显示「—」，绝不编一个数。 -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:orientation="horizontal">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="horizontal">
+
+                    <TextView
+                        android:layout_width="96dp"
+                        android:layout_height="wrap_content"
+                        android:text="@string/label_system"
+                        android:textColor="@color/text_hint"
+                        android:textSize="16sp" />
+
+                    <TextView
+                        android:id="@+id/info_system"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:ellipsize="end"
+                        android:singleLine="true"
+                        android:textColor="@color/text_secondary"
+                        android:textSize="16sp" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="horizontal">
+
+                    <TextView
+                        android:layout_width="96dp"
+                        android:layout_height="wrap_content"
+                        android:text="@string/label_cpu"
+                        android:textColor="@color/text_hint"
+                        android:textSize="16sp" />
+
+                    <TextView
+                        android:id="@+id/info_cpu"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:ellipsize="end"
+                        android:singleLine="true"
+                        android:textColor="@color/text_secondary"
+                        android:textSize="16sp" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:orientation="horizontal">
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="horizontal">
+
+                    <TextView
+                        android:layout_width="96dp"
+                        android:layout_height="wrap_content"
+                        android:text="@string/label_mem"
+                        android:textColor="@color/text_hint"
+                        android:textSize="16sp" />
+
+                    <TextView
+                        android:id="@+id/info_mem"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:ellipsize="end"
+                        android:singleLine="true"
+                        android:textColor="@color/text_secondary"
+                        android:textSize="16sp" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="horizontal">
+
+                    <TextView
+                        android:layout_width="96dp"
+                        android:layout_height="wrap_content"
+                        android:text="@string/label_storage"
+                        android:textColor="@color/text_hint"
+                        android:textSize="16sp" />
+
+                    <TextView
+                        android:id="@+id/info_storage"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:ellipsize="end"
+                        android:singleLine="true"
+                        android:textColor="@color/text_secondary"
+                        android:textSize="16sp" />
+                </LinearLayout>
+            </LinearLayout>
+
             <LinearLayout
                 android:id="@+id/row_source"
                 android:layout_width="match_parent"

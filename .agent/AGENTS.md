@@ -124,7 +124,7 @@ tools/
 ├── apk_info.py           APK 包名/minSdk 解析
 ├── make_icon.py          位图资源生成（纯标准库）
 ├── protocol-test/        DLNA 协议一致性 245 项（桌面 JVM + 真实协议栈桩）
-├── policy-test/          播放策略 78 断言 + 403 源码级守卫
+├── policy-test/          播放策略 78 断言 + 407 源码级守卫
 ├── proxy-test/           MediaProxy 字节一致性 11 项
 └── web-test/             MultipartLite + sanitize + ApkScan 网页逻辑一致性（52 项）
 ```
@@ -140,7 +140,7 @@ tools/
 | verify_dex | R8 后框架回调/Thread 子类/协议常量存活 | 全量 |
 | verify_protocol | DLNA 协议一致性（drive.py，期望 245/245） | 245 |
 | ↳ 内含 probe | 控制点自检（**33 或 34 双态**：组播回退分支） | 33/34 |
-| verify_policy | 播放策略 78 断言 + 403 源码级守卫 | 78+ |
+| verify_policy | 播放策略 78 断言 + 407 源码级守卫 | 78+ |
 | ↳ 内含计数 | 文档里的用例总数 ↔ 闸门期望值（`check_gate_counts.py`，覆盖协议/代理/网页/probe/策略） | 一致性 |
 | verify_proxy | MediaProxy 字节一致性（全量/Range/回拖/EOS/中途重连） | 11 |
 | verify_web | multipart 解析逐字节一致 / 名字编码 / APK 扫描内核 / 上传页与安装页零外链 | 52 |
@@ -258,10 +258,13 @@ adb -s 192.168.1.8:5555 logcat -v time > /tmp/tv_session.log 2>&1
 
 ## 7. 当前状态指针
 
-- 版本 0.2.5（versionCode 20）—— modeName 补 pending 分支 + **构建版本硬闸**为小更新
-  （0.2.4 → 0.2.5）。0.2.4（versionCode 19）是批 3.9「视频蓝屏修复 F1/F2/占位层」；
-  0.2.3（versionCode 18）批 3.8 诊断日志、0.2.2（17）批 3.7、0.2.1（16）批 3.6、
-  0.2.0（15）批 3.5 中等更新。历史版本已全部推送 GitHub（main）。
+- 版本 0.2.8（versionCode 23）—— 设备信息卡加基础信息四格（系统 / 处理器 / 内存 /
+  存储，2×2 布局）为小更新。上一条时间线：0.2.7（22）二维码改右侧通高列 +
+  安装包页不信 POST 响应；0.2.6（21）网页上传/删除/投送以服务器列表复核为准、
+  文件夹入口移除；0.2.5（20）modeName 补 pending 分支 + **构建版本硬闸**；
+  0.2.4（19）批 3.9 视频蓝屏修复 F1/F2/占位层；0.2.3（18）批 3.8 诊断日志；
+  0.2.2（17）批 3.7、0.2.1（16）批 3.6、0.2.0（15）批 3.5 中等更新。
+  历史版本已全部推送 GitHub（main）。
 - **进行中：视频「先蓝屏约 30 秒」修复**（`.agent/video-bluescreen-plan.md`）。当前只落了
   **第 1 步 = 诊断日志**（批 3.8，零行为改动）：形态变化 / SurfaceView 显隐 + Surface
   生命周期 / `prepare 开始（带 surface=?）`·`结束（带耗时）`。**已定案分流**：真机

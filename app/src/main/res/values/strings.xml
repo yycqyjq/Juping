@@ -8,6 +8,13 @@
     <string name="label_network">网络</string>
     <string name="label_state">状态</string>
     <string name="label_version">版本</string>
+    <!-- 设备基础信息那 2×2 网格的四个格名。
+         值全部是运行时读出来的（Build / /proc / statfs），不写死 ——
+         写死就一定骗人（盒子换机型、系统升级后界面还印着旧值）。 -->
+    <string name="label_system">系统</string>
+    <string name="label_cpu">处理器</string>
+    <string name="label_mem">内存</string>
+    <string name="label_storage">存储</string>
     <string name="label_source">片源</string>
 
     <string name="guide_title">在手机上开始投屏</string>
