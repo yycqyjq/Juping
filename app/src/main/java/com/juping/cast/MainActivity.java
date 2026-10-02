@@ -1048,6 +1048,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         switch (mode) {
             case MODE_AUDIO: return "AUDIO";
             case MODE_VIDEO: return "VIDEO";
+            case MODE_VIDEO_PENDING: return "VIDEO_PENDING";
             case MODE_IMAGE: return "IMAGE";
             case MODE_IDLE: return "IDLE";
             default: return "MODE_" + mode;
