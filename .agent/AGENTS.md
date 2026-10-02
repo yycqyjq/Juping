@@ -124,7 +124,7 @@ tools/
 ├── apk_info.py           APK 包名/minSdk 解析
 ├── make_icon.py          位图资源生成（纯标准库）
 ├── protocol-test/        DLNA 协议一致性 245 项（桌面 JVM + 真实协议栈桩）
-├── policy-test/          播放策略 78 断言 + 397 源码级守卫
+├── policy-test/          播放策略 78 断言 + 400 源码级守卫
 ├── proxy-test/           MediaProxy 字节一致性 11 项
 └── web-test/             MultipartLite + sanitize + ApkScan 网页逻辑一致性（52 项）
 ```
@@ -140,7 +140,7 @@ tools/
 | verify_dex | R8 后框架回调/Thread 子类/协议常量存活 | 全量 |
 | verify_protocol | DLNA 协议一致性（drive.py，期望 245/245） | 245 |
 | ↳ 内含 probe | 控制点自检（**33 或 34 双态**：组播回退分支） | 33/34 |
-| verify_policy | 播放策略 78 断言 + 397 源码级守卫 | 78+ |
+| verify_policy | 播放策略 78 断言 + 400 源码级守卫 | 78+ |
 | ↳ 内含计数 | 文档里的用例总数 ↔ 闸门期望值（`check_gate_counts.py`，覆盖协议/代理/网页/probe/策略） | 一致性 |
 | verify_proxy | MediaProxy 字节一致性（全量/Range/回拖/EOS/中途重连） | 11 |
 | verify_web | multipart 解析逐字节一致 / 名字编码 / APK 扫描内核 / 上传页与安装页零外链 | 52 |
@@ -257,21 +257,28 @@ adb -s 192.168.1.8:5555 logcat -v time > /tmp/tv_session.log 2>&1
 
 ## 7. 当前状态指针
 
-- 版本 0.2.3（versionCode 18）—— 批 3.8「补形态 / Surface / prepare 诊断日志」为**小更新**
-  （修 bug 前的取证步，末位 +1），版本从 0.2.2 → 0.2.3。上一次 0.2.2（versionCode 17）是
-  批 3.7「修换歌闪面板 + 封面改流式落盘」的小更新（0.2.1 → 0.2.2）；再上一次 0.2.1
-  （versionCode 16）是批 3.6 的小更新、0.2.0（versionCode 15）是批 3.5 的中等更新。
-  历史版本已全部推送 GitHub（main）。
+- 版本 0.2.5（versionCode 20）—— modeName 补 pending 分支 + **构建版本硬闸**为小更新
+  （0.2.4 → 0.2.5）。0.2.4（versionCode 19）是批 3.9「视频蓝屏修复 F1/F2/占位层」；
+  0.2.3（versionCode 18）批 3.8 诊断日志、0.2.2（17）批 3.7、0.2.1（16）批 3.6、
+  0.2.0（15）批 3.5 中等更新。历史版本已全部推送 GitHub（main）。
 - **进行中：视频「先蓝屏约 30 秒」修复**（`.agent/video-bluescreen-plan.md`）。当前只落了
   **第 1 步 = 诊断日志**（批 3.8，零行为改动）：形态变化 / SurfaceView 显隐 + Surface
-  生命周期 / `prepare 开始（带 surface=?）`·`结束（带耗时）`。**下一步靠真机日志分流根因**：
-  `prepare 开始: surface=false` → 坐实「prepare 早于 Surface」（走 §3.1 闸门）；
-  `=true` → 转向 release/reset 竞态（§2.3）。治本闸门 + 治标占位层**尚未实现**。
-- **发版规则（用户定的，每次打包都要遵守）**：改 `app/build.gradle` 的
-  `versionName`，界面「版本」那一行读的就是它（不写死字面量）。
-  **小更新**（修 bug、小改进）→ 改最后一位（0.1.12 → 0.1.13）；
-  **中等更新**（新能力、行为变更）→ 改中间那位、末位归零（举例：0.2.1 → 0.3.0）。
+  生命周期 / `prepare 开始（带 surface=?）`·`结束（带耗时）`。**已定案分流**：真机
+  `surface=true` + 厂商 `already reset` 栈 → 坐实 release/reset 竞态（§2.3）。
+  **批 3.9 已落地治本 + 治标**（F1 去 reset / F2 阈值 10s / MODE_VIDEO_PENDING 占位层），
+  0.2.4 真机验收通过（prepare 422ms、无 already reset）；F3（SWITCH_SETTLE_MS 接线）
+  留作真机若复现再上。
+- **发版规则（用户定的，每次打包都要遵守）**：**每次构建（拿去装机的 dist 包）都必须
+  更新版本号** —— 现在有机械强制：`build.sh dist` 开头硬闸比对 `dist/.last-build-version`，
+  同版本号连出两包直接红。升版用 `./tools/build.sh version [patch|minor|major]`
+  （自动改 build.gradle 的 versionName + versionCode），别再手改。
+  规则本身不变：改 `app/build.gradle` 的 `versionName`，界面「版本」那一行读的就是它
+  （不写死字面量）。**小更新**（修 bug、小改进）→ 末位 +1（0.1.12 → 0.1.13）；
+  **中等更新**（新能力、行为变更）→ 中间位 +1、末位归零（0.2.1 → 0.3.0）；大更新 → 首位。
   `versionCode` 每次递增 1（只给系统比新旧用，**界面上不显示**）。
+  教训：0.2.4 曾连着出两个 dist 包（批 3.9 + modeName 修复），装机分不清跑的哪个 ——
+  这正是这条纪律存在的原因。README/AGENTS 引用版本号一律写 `<版本>` 占位，
+  避免每次升版都要 grep 修漂移。
 - **结束投屏只有一个入口：遥控器返回键**（`MainActivity.onKeyDown` → `service.onStop()`）。
   用户明确否掉了「播完 N 秒无控制指令就自动收尾」那种替用户猜意图的做法 ——
   别再往服务里加「自动回空闲」的判据。Auto-Stop（`checkAutoStop`）是另一回事：

@@ -16,6 +16,7 @@
 #   ./tools/build.sh policy       # 跑播放重连策略测试（纯逻辑 + 源码不变量守卫）
 #   ./tools/build.sh proxy        # 跑本地预取代理测试（字节一致性）
 #   ./tools/build.sh web          # 跑网页上传解析测试（multipart 逐字节一致 + 名字规整）
+#   ./tools/build.sh version      # 升版本号（patch 默认 / minor / major）——出包前跑这个
 #   ./tools/build.sh clean        # 清理构建产物
 #
 # 产物：
@@ -52,6 +53,7 @@ BT="$ANDROID_HOME/build-tools/33.0.0"
 case "${1:-debug}" in
     protocol|policy|proxy|web) NEED_JAVA=1; NEED_TOOLCHAIN=0 ;;
     secrets)                   NEED_JAVA=0; NEED_TOOLCHAIN=0 ;;
+    version)                   NEED_JAVA=0; NEED_TOOLCHAIN=0 ;;   # 只改 build.gradle 两行
     *)                         NEED_JAVA=1; NEED_TOOLCHAIN=1 ;;
 esac
 
@@ -86,6 +88,13 @@ EOF
 fi
 
 VER="$(grep -oE 'versionName "[^"]+"' app/build.gradle | head -1 | sed 's/.*"\(.*\)"/\1/')"
+
+# --- 版本纪律（二夜定的规矩：每次要拿去装机的构建，版本号必须更新）---
+# dist/ 记状态文件（dist/ 本身在 .gitignore 里，clean 会连它删掉 —— 删了
+# 就重新记，不影响判断）。build_version() 出包成功后写入本次版本；
+# dist 分支构建**前**对比：版本还等于上一包的 → 红，先跑
+# `./tools/build.sh version` 升号再来。
+VERSION_STATE="dist/.last-build-version"
 
 # 签名校验：以 API 15 为目标确认这个包在目标设备上装得上
 verify_apk() {
@@ -428,6 +437,15 @@ PY
         ;;
 
     dist)
+        # 版本纪律硬闸：同一个版本号不允许连出两包。
+        # 教训：0.2.4 落地后连着发了两个 dist 包（批 3.9 + modeName 修复），
+        # 装机上分不清跑的是哪个 —— 这正是 versionCode 存在的意义。
+        if [ -f "$VERSION_STATE" ] && [ "$(cat "$VERSION_STATE")" = "$VER" ]; then
+            echo "!! 版本号没更新：上一包就是 ${VER}（状态文件 ${VERSION_STATE}）。" >&2
+            echo "   每次要拿去装机的构建必须升版 —— 跑 ./tools/build.sh version" >&2
+            echo "   （小更新 patch / 新能力 minor / 大更新 major，自动改 build.gradle）" >&2
+            exit 1
+        fi
         if [ ! -f keystore.properties ]; then
             echo "!! 缺少 keystore.properties，跳过 release 构建。" >&2
             "$GRADLE_BIN" assembleDebug
@@ -458,6 +476,9 @@ PY
         echo
         echo "=== 密钥核查（这个仓库要公开）==="
         verify_secrets
+        # 全绿到这里才算「这个版本真出了个能装的包」—— 状态文件在闸门之后写，
+        # 半途红掉的构建不占用版本号（否则失败了还得手动升一次才能重试）。
+        echo "$VER" > "$VERSION_STATE"
         echo
         echo "装机 + 真机验收（一条命令）："
         echo "  ./tools/verify-on-device.sh              # USB 连接的盒子"
@@ -465,6 +486,36 @@ PY
         echo
         echo "  它会安装、拉起服务、从日志里读出真实地址，再跑控制点自检。"
         echo "  手工装：$ANDROID_HOME/platform-tools/adb install -r dist/juping-$VER-release.apk"
+        ;;
+
+    version)
+        # 升版本号 —— 每次要装机的构建前跑这个，dist 硬闸盯着没升的。
+        # 规则（build.gradle 注释里二夜定的）：
+        #   patch（默认）末位 +1；minor 中间位 +1、末位归零；major 首位 +1、后归零。
+        #   versionCode 恒 +1（它只随「拿去装机的包」递增，不参与语义化）。
+        LEVEL="${2:-patch}"
+        python3 - "$LEVEL" <<'PY'
+import re, sys
+level = sys.argv[1]
+if level not in ('patch', 'minor', 'major'):
+    sys.exit("未知级别 %r（可用 patch/minor/major）" % level)
+p = 'app/build.gradle'
+t = open(p, encoding='utf-8').read()
+m = re.search(r'versionName "(\d+)\.(\d+)\.(\d+)"', t)
+c = re.search(r'versionCode (\d+)', t)
+if not m or not c:
+    sys.exit('build.gradle 里找不到 versionName/versionCode —— 格式变了，脚本没跟上')
+a, b, d = map(int, m.groups())
+if level == 'patch': a, b, d = a, b, d + 1
+elif level == 'minor': a, b, d = a, b + 1, 0
+else: a, b, d = a + 1, 0, 0
+t = t.replace(m.group(0), 'versionName "%d.%d.%d"' % (a, b, d))
+t = re.sub(r'versionCode \d+', 'versionCode %d' % (int(c.group(1)) + 1), t)
+open(p, 'w', encoding='utf-8').write(t)
+print('版本已升（%s）：0.x.y → %d.%d.%d，versionCode → %d'
+      % (level, a, b, d, int(c.group(1)) + 1))
+print('记得把这一行改动纳入本次提交。')
+PY
         ;;
 
     debug|*)

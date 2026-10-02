@@ -3079,6 +3079,29 @@ report('strings.xml 有「正在准备视频」占位文案',
        '布局里 @string/video_wait 引用它，缺了会编译期红 —— 钉这条是为了'
        '让「删文案」这种回退在闸门而不是装机时暴露')
 
+# ---- 版本纪律（二夜定的规矩：每次 dist 构建必须升版本）----
+build_sh = pathlib.Path('tools/build.sh').read_text(encoding='utf-8')
+report('build.sh dist 有版本硬闸（同版本连出两包直接红）',
+       'VERSION_STATE="dist/.last-build-version"' in build_sh
+       and '[ -f "$VERSION_STATE" ] && [ "$(cat "$VERSION_STATE")" = "$VER" ]'
+           in build_sh
+       and '版本号没更新' in build_sh,
+       '0.2.4 曾连出两个 dist 包（批 3.9 + modeName 修复），装机上分不清跑的'
+       '哪个 —— 硬闸删掉的话这条纪律就只剩口头约定，必然再犯')
+_gw = build_sh.find('verify_secrets', build_sh.find('    dist)'))
+_ws = build_sh.find('echo "$VER" > "$VERSION_STATE"', build_sh.find('    dist)'))
+report('版本状态文件在密钥核查之后才写（失败构建不占版本号）',
+       _gw != -1 and _ws != -1 and _ws > _gw,
+       'collect 后就写的话，一次中途红掉的构建会把这个版本号烧掉 —— '
+       '修好重跑会被自己的闸门拦下，逼人手动升版，纪律变成惩罚')
+report('build.sh 有 version 子命令（patch/minor/major 自动升，免手改两行）',
+       'version)                   NEED_JAVA=0' in build_sh
+       and 'LEVEL="${2:-patch}"' in build_sh
+       and 'versionName "%d.%d.%d"' in build_sh
+       and 'versionCode %d' in build_sh,
+       '硬闸只堵不疏的话，每次升版都得手改 build.gradle 两行（改漏一边就是'
+       ' versionName 没动 / versionCode 没 +1）—— 子命令让升版是一步动作')
+
 sys.exit(1 if failed else 0)
 PY
 
