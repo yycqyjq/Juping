@@ -506,14 +506,15 @@ c = re.search(r'versionCode (\d+)', t)
 if not m or not c:
     sys.exit('build.gradle 里找不到 versionName/versionCode —— 格式变了，脚本没跟上')
 a, b, d = map(int, m.groups())
+old = '%d.%d.%d' % (a, b, d)
 if level == 'patch': a, b, d = a, b, d + 1
 elif level == 'minor': a, b, d = a, b + 1, 0
 else: a, b, d = a + 1, 0, 0
 t = t.replace(m.group(0), 'versionName "%d.%d.%d"' % (a, b, d))
 t = re.sub(r'versionCode \d+', 'versionCode %d' % (int(c.group(1)) + 1), t)
 open(p, 'w', encoding='utf-8').write(t)
-print('版本已升（%s）：0.x.y → %d.%d.%d，versionCode → %d'
-      % (level, a, b, d, int(c.group(1)) + 1))
+print('版本已升（%s）：%s → %d.%d.%d，versionCode → %d'
+      % (level, old, a, b, d, int(c.group(1)) + 1))
 print('记得把这一行改动纳入本次提交。')
 PY
         ;;

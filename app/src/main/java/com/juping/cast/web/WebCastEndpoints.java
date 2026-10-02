@@ -615,9 +615,11 @@ public final class WebCastEndpoints implements UpnpHttpServer.WebEndpoints {
      *   <li><b>逐个文件单独请求</b>：一个请求里塞多个文件，浏览器只能给整个请求一个进度，
      *       中途失败还会连已经传成功的部分一起丢；逐个传才能显示"第 3/8 个"，
      *       失败的也只影响那一个；</li>
-     *   <li><b>文件夹上传必须特性检测</b>：{@code webkitdirectory} 在 iOS Safari 上要到
-     *       18.4 才完整支持。不支持时**收起入口并说明**，绝不留一个"点了没反应"的按钮
-     *       （那比没有这个功能更让人摸不着头脑）。</li>
+     *   <li><b>文件夹上传入口已按用户要求移除</b>（2026-10-02：只留「选择文件」，
+     *       多选已覆盖"一批照片/视频"，且目录选择在部分安卓浏览器上是特性检测误判——
+     *       属性存在、点开却选不了目录，反而留一个"点了没反应"的坑）。
+     *       历史结论留档：{@code webkitdirectory} 到 iOS Safari 18.4 才完整支持，
+     *       若日后恢复，必须特性检测、不支持就收起入口并说明。</li>
      * </ul>
      */
     private static final String PAGE =
@@ -634,7 +636,6 @@ public final class WebCastEndpoints implements UpnpHttpServer.WebEndpoints {
             + "#space{color:#9a9a9a;font-size:13px;margin:0 0 16px}\n"
             + ".box{border:1px dashed #444;border-radius:10px;padding:20px;text-align:center}\n"
             + "input[type=file]{color:#ccc;width:100%}\n"
-            + "#dirbox{margin-top:14px}\n"
             + ".hint{color:#8a8a8a;font-size:12px;margin:12px 0 0}\n"
             + "button{margin-top:12px;padding:10px 22px;font-size:16px;border:0;"
             + "border-radius:8px;background:#3d7eff;color:#fff}\n"
@@ -659,25 +660,18 @@ public final class WebCastEndpoints implements UpnpHttpServer.WebEndpoints {
             // 是两件事，混一屏会互相抢注意力（方案 §2 备选 B 的否决理由）。
             + "<p class=\"nav\"><a href=\"/apk\">安装包（U 盘里的 APK）→</a></p>\n"
             + "<div class=\"box\">\n"
-            // 两个入口都留，但必须各有一句说明 —— 否则手机上会看到两个
-            // 长得一样的「选择文件」按钮，不知道点哪个（实测反馈）。
-            // 而目录选择在部分安卓浏览器上是**特性检测误判**：属性存在、
-            // 点开却选不了目录，所以入口留着、说明也必须留着。
-            + "  <p class=\"hint\" style=\"margin:0 0 8px\">选文件：可一次多选照片、视频或音乐</p>\n"
+            // 只留「选择文件」一个入口（2026-10-02 二夜拍板）：文件夹入口在部分
+            // 安卓浏览器上是特性检测误判（属性存在、点开却选不了目录），两个长得
+            // 一样的按钮还会让人不知道点哪个。多选已覆盖「一批照片/视频」的需求。
+            + "  <p class=\"hint\" style=\"margin:0 0 8px\">选择文件：可一次多选照片、视频或音乐</p>\n"
             + "  <input type=\"file\" id=\"f\" multiple>\n"
-            + "  <div id=\"dirbox\" style=\"display:none\">\n"
-            + "    <p class=\"hint\" style=\"margin:16px 0 8px\">选文件夹：整个文件夹里的内容一起传</p>\n"
-            + "    <input type=\"file\" id=\"d\" webkitdirectory directory multiple>\n"
-            + "  </div>\n"
-            + "  <p class=\"hint\" id=\"hint\"></p>\n"
             + "  <button id=\"go\">上传</button>\n"
             + "</div>\n"
             + "<div id=\"bar\"><div id=\"fill\"></div></div>\n"
             + "<p id=\"msg\"></p>\n"
             + "<ul id=\"list\"></ul>\n"
             + "<script>\n"
-            + "var f=document.getElementById('f'),db=document.getElementById('d'),"
-            + "dirbox=document.getElementById('dirbox'),hint=document.getElementById('hint'),"
+            + "var f=document.getElementById('f'),"
             + "go=document.getElementById('go'),msg=document.getElementById('msg'),"
             + "bar=document.getElementById('bar'),fill=document.getElementById('fill'),"
             + "list=document.getElementById('list'),space=document.getElementById('space');\n"
@@ -685,10 +679,19 @@ public final class WebCastEndpoints implements UpnpHttpServer.WebEndpoints {
             + "while(n>=1024&&i<3){n/=1024;i++}return n.toFixed(i?1:0)+u[i]}\n"
             + "function say(t){msg.textContent=t}\n"
             + "function enc(n){return encodeURIComponent(n)}\n"
-            // 文件夹入口：能选就显示，不能选就说明为什么 —— 见类头"特性检测"那条
-            + "try{if(!('webkitdirectory' in document.createElement('input')))"
-            + "throw 0;dirbox.style.display='block';hint.textContent='也可以选中一整个文件夹一起传'}"
-            + "catch(e){hint.textContent='当前浏览器不支持选文件夹，请一次多选文件'}\n"
+            // 以服务器真实列表为准的复核。某些手机浏览器（自带广告/隐私拦截）会把
+            // 局域网 POST 的**响应**吞掉或改写成错误页，于是 status 与 responseText
+            // 都对不上，可服务端的删除其实已经生效（真机实测：文件确实没了、投屏
+            // 确实投上了，POST 却回非 200、且 body 不是 JSON）。删除后用一次 GET /files
+            // 看最终结果，比信那个被浏览器污染的 POST 响应可靠得多。
+            + "function inList(cb){\n"
+            + "  var x=new XMLHttpRequest();x.open('GET','/files');\n"
+            + "  x.onload=function(){var d;try{d=JSON.parse(x.responseText)}catch(e){cb({});return}"
+            + "var a=d.files||[],o={},k;for(k=0;k<a.length;k++){o[a[k]]=1}cb(o)};\n"
+            + "  x.onerror=function(){cb({})};x.send();\n"
+            + "}\n"
+            // 删除是否生效 = 名字是否已从服务器列表消失（上传复核用 inList 直接查存在）
+            + "function gone(n,cb){inList(function(o){cb(!o[n])})}\n"
             + "function load(){\n"
             + "  var x=new XMLHttpRequest();x.open('GET','/files');\n"
             + "  x.onload=function(){\n"
@@ -720,31 +723,43 @@ public final class WebCastEndpoints implements UpnpHttpServer.WebEndpoints {
             + "function cast(n,b){\n"
             + "  b.disabled=true;b.textContent='投送中';\n"
             + "  post('/cast','name='+enc(n),function(x){\n"
-            + "    var d;try{d=JSON.parse(x.responseText)}catch(e){d={message:'响应异常'}}\n"
-            + "    say(x.status===200?('已投送 '+n):('投送失败：'+(d.message||x.status)));\n"
+            + "    // 投屏是 fire-and-forget：SetURI+Play 服务端已执行，画面出不出来在电视上看得到。"
+            + "POST 回 200 就报成功；回非 200（多半是浏览器吞/改了响应）时不武断说失败，"
+            + "而是让用户看电视 —— 免得把已经投上的操作误报成失败（真机踩过这个坑）。\n"
+            + "    say(x.status===200?('已投送 '+n):('已发出投送 '+n+'，请看电视；没画面再点一次'));\n"
             + "    b.disabled=false;b.textContent='投到电视';\n"
-            + "  },function(){say('投送请求发不出去');b.disabled=false;b.textContent='投到电视'});\n"
+            + "  },function(){say('投送已发出，请看电视；没画面再点一次');b.disabled=false;b.textContent='投到电视'});\n"
             + "}\n"
             + "function del(n,c){\n"
             + "  if(!confirm('删除「'+n+'」？删了就没了'))return;\n"
             + "  c.disabled=true;c.textContent='删除中';\n"
             + "  post('/delete','name='+enc(n),function(x){\n"
-            + "    var d;try{d=JSON.parse(x.responseText)}catch(e){d={message:'响应异常'}}\n"
-            + "    say(x.status===200?('已删除 '+n):('删除失败：'+(d.message||x.status)));\n"
-            + "    load();\n"
-            + "  },function(){say('删除请求发不出去');c.disabled=false;c.textContent='删除'});\n"
+            + "    var d;try{d=JSON.parse(x.responseText)}catch(e){d={}}\n"
+            + "    // 成功与否以服务器真实列表为准：POST 响应可能被浏览器吞掉但删除已生效。\n"
+            + "    gone(n,function(yes){\n"
+            + "      if(yes){say('已删除 '+n)}\n"
+            + "      else{say('删除失败：'+(d.message||x.status||'未知'))}\n"
+            + "      c.disabled=false;c.textContent='删除';load();\n"
+            + "    });\n"
+            + "  },function(){\n"
+            + "    gone(n,function(yes){say(yes?('已删除 '+n):'删除请求发不出去');"
+            + "c.disabled=false;c.textContent='删除';if(yes)load();});\n"
+            + "  });\n"
             + "}\n"
             + "function picked(){\n"
             + "  var a=[],i;\n"
             + "  for(i=0;i<f.files.length;i++)a.push(f.files[i]);\n"
-            + "  for(i=0;i<db.files.length;i++)a.push(db.files[i]);\n"
             + "  return a;\n"
             + "}\n"
             + "go.onclick=function(){\n"
             + "  var files=picked();\n"
-            + "  if(!files.length){say('先选文件或文件夹');return}\n"
+            + "  if(!files.length){say('先选文件');return}\n"
             + "  go.disabled=true;bar.style.display='block';fill.style.width='0';\n"
-            + "  var i=0,ok=0,bad=0;\n"
+            // 上传成败以服务器列表增量为准（和删除复核同一道理）：手机浏览器会
+            // 吞掉/改写 POST 响应，状态码不可信；uniqueFileFor 不覆盖，每次成功
+            // 必然多出一个新名字。先取基线，传一个比一次增量。
+            + "  var i=0,ok=0,bad=0,have={};\n"
+            + "  inList(function(o){have=o;next()});\n"
             + "  function next(){\n"
             + "    if(i>=files.length){\n"
             + "      go.disabled=false;bar.style.display='none';\n"
@@ -756,20 +771,21 @@ public final class WebCastEndpoints implements UpnpHttpServer.WebEndpoints {
             + "    var x=new XMLHttpRequest();x.open('POST','/upload');\n"
             + "    x.upload.onprogress=function(e){if(e.lengthComputable)"
             + "fill.style.width=Math.round(e.loaded/e.total*100)+'%'};\n"
-            + "    x.onload=function(){\n"
-            + "      var d;try{d=JSON.parse(x.responseText)}catch(e){"
-            + "d={message:'响应异常（'+x.status+'）',saved:[],failed:[]}}\n"
-            + "      if(x.status!==200){bad++;say('第 '+(i+1)+' 个上传失败：'"
-            + "+(d.message||x.status));i++;next();return}\n"
-            + "      ok+=((d.saved&&d.saved.length)?d.saved.length:0);\n"
-            + "      bad+=((d.failed&&d.failed.length)?d.failed.length:0);\n"
-            + "      say('已上传 '+(i+1)+'/'+files.length+'：'+((d.saved||[]).join('、')||'（无）'));\n"
-            + "      i++;fill.style.width='0';next();\n"
-            + "    };\n"
-            + "    x.onerror=function(){bad++;say('第 '+(i+1)+' 个上传中断');i++;next()};\n"
+            + "    x.onload=function(){fin(x.status)};\n"
+            + "    x.onerror=function(){fin(0)};\n"
             + "    x.send(fd);\n"
             + "  }\n"
-            + "  next();\n"
+            + "  function fin(st){\n"
+            + "    inList(function(o){\n"
+            + "      var k,added=0,first='';\n"
+            + "      for(k in o){if(o[k]&&!have[k]){added++;if(!first)first=k}}\n"
+            + "      if(added){ok+=added;for(k in o)have[k]=1;\n"
+            + "        say('已上传 '+(i+1)+'/'+files.length+'：'+first)}\n"
+            + "      else{bad++;say('第 '+(i+1)+' 个上传失败'"
+            + "+(st?('（服务器回 '+st+'）'):'（连接中断）')+'，服务器列表里没有它')}\n"
+            + "      i++;fill.style.width='0';next();\n"
+            + "    });\n"
+            + "  }\n"
             + "};\n"
             + "load();\n"
             + "</script>\n"

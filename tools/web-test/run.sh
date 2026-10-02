@@ -84,6 +84,44 @@ routes = ['"/upload".equals(path)', '"/files".equals(path)',
 missing = [r for r in routes if r not in src]
 report('上传页用到的四个端点都有路由', not missing, '缺：%s' % missing)
 
+# ③ 删除/投送的成败判据（2026-10-02 真机取证）：用户的 Vivo 浏览器会把局域网
+#    POST 的响应吞掉或改写（服务端日志铁证：已回 200、文件确实删掉了，前端却报
+#    「响应异常」）。所以删除必须以 GET /files 复核为准，投送失败话术必须
+#    引导用户看电视而不是谎报失败。
+#    JS 段 = <script> 与 </script> 之间。不能切到文件尾 —— PAGE 之后还有
+#    别的 Java 方法，花括号计数会被它们的闭合括号带偏（第一版就栽在这）。
+_m = re.search(r'<script>([\s\S]*?)</script>', page)
+pg_js = _m.group(1) if _m else ''
+report('删除以 GET /files 复核为准（浏览器吞 POST 响应也不误报）',
+       'function gone(n,cb)' in pg_js
+       and "x.open('GET','/files')" in pg_js
+       and re.search(r"function del\(n,c\)\{[\s\S]{0,900}?gone\(n,function\(yes\)", pg_js) is not None,
+       '真机踩过：删除实际成功、前端却弹「删除失败：响应异常」—— '
+       '信被浏览器污染的 POST 响应就是错的，最终状态必须以服务器列表为准')
+report('投送的非确定失败话术引导用户看电视（不许谎报失败）',
+       '已发出投送' in pg_js
+       and ("say(x.status===200?('已投送 '+n):('投送失败" not in pg_js),
+       '投屏是 fire-and-forget，画面在电视上看得见；把已投上的操作报成失败，'
+       '用户就会反复重投（这次工单就是这么来的）')
+report('文件夹上传入口已移除且不许悄悄回来',
+       'webkitdirectory' not in page.replace('18.4 才完整支持', '')
+       or page.count('webkitdirectory') == 0,
+       '二夜拍板只留「选择文件」；目录特性检测在部分浏览器上是误判，'
+       '留着就是"点了没反应"的坑')
+report('上传页 JS 保持 ES5 且括号闭合（老浏览器语法级报错=整页白屏）',
+       '=>' not in pg_js and 'const ' not in pg_js and 'let ' not in pg_js
+       and pg_js.count('{') == pg_js.count('}')
+       and pg_js.count('(') == pg_js.count(')'),
+       '类头纪律：这页要跑在手机老浏览器上，一个箭头符号就白屏 —— '
+       '而白屏在服务端日志里看不出任何异常')
+report('上传以 GET /files 列表增量为准（不许信 POST /upload 的状态码）',
+       'inList' in pg_js and "if(added)" in pg_js
+       and "'响应异常（'" not in pg_js
+       and "x.status!==200" not in pg_js,
+       '真机工单：上传其实落盘成功，浏览器却把 POST 响应改写（用户截图'
+       '「投送失败：响应异常」），前端信状态码就谎报失败 —— 与删除复核同'
+       '一条机理，服务端 uniqueFileFor 保证成功必多一个新名字，比列表最可靠')
+
 if failed:
     sys.exit(1)
 PY

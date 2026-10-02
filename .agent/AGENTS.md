@@ -177,6 +177,7 @@ tools/
 | screencap 截不到视频层 | 只截应用 UI | 配合 GetPositionInfo 判真实播放 |
 | 蓝屏（视频层无内容） | MTK 硬件输出蓝色 | 空闲时藏 SurfaceView；退后台延迟 2.5s |
 | release→prepare 异步竞态 | 厂商 reset 是异步的（reset_nosync），mReseted 跨实例共享：旧实例 teardown 砸中新实例 prepareAsync →「already reset」空操作 → 投视频先蓝屏 30s | releasePlayer 不再 reset()（守卫钉着）；prepare 卡死阈值 30s→10s 作安全网；准备窗口 MODE_VIDEO_PENDING 藏层+占位。见 `.agent/video-bluescreen-plan.md` |
+| 手机浏览器吞 POST 响应 | Vivo/自带浏览器会把局域网 POST 的**响应**吞掉或改写成错误页（服务端日志铁证：已回 200、操作确实生效，前端却报「响应异常」失败） | 网页端成败一律以 `GET /files` 服务器复核为准（上传=列表增量、删除=名字消失、投送=非200引导看电视），不信 POST 状态码。守卫钉在 web-test |
 | macOS zsh 无 setsid | 后台服务起不来 | 用受管后台任务（run_in_background） |
 | Mac 全局代理 | 局域网 curl 被 58199 拦 | curl 加 --noproxy '*' |
 
