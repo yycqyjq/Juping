@@ -598,6 +598,24 @@ report('MainActivity 在 idle 时把地址喂给二维码',
        '二维码地址必须和服务报出来的本机地址同源（与 device.xml 的 '
        'presentationURL 是同一对来源），否则"扫码打开的"和"控制点打开的"会分叉')
 
+# ⑱-b 二维码右列（2026-10-02 二夜拍板）：码单独占右侧通高一列，带使用说明。
+#    守的是「改回卡片内」的回归 —— 那种改法编译过、运行无报错，只是面板被
+#    一张 196dp 的码撑满屏、说明文字没了，而没人会为"布局丑"报 bug。
+qr_el = by_id.get('@+id/qr_box')
+report('二维码在右侧独立列（qr_box 高度通高）',
+       qr_el is not None and qr_el.get(AND + 'layout_height') == 'match_parent',
+       '实际：%r —— 包在引导卡片里（wrap_content）会把整块撑高顶满屏，'
+       '这是 2026-10-02 重构的起因' % (qr_el.get(AND + 'layout_height') if qr_el is not None else 'qr_box 不存在'))
+report('二维码列自带使用说明（上标题 + 操作步骤）',
+       '@string/qr_top' in layout_src and '@string/qr_body' in layout_src,
+       '远看要知道"这是给手机扫的"，走近要看步骤 —— '
+       '光秃一个码没人知道往哪扫、扫了能干嘛')
+report('使用说明文案真实（同 Wi-Fi + 两条路径都提）',
+       (lambda s: bool(re.search(r'<string name="qr_top">[^<]*扫码[^<]*</string>', s))
+                   and bool(re.search(r'<string name="qr_body">[\s\S]*?同一个 Wi-Fi[\s\S]*?投屏功能[\s\S]*?</string>', s)))(
+           pathlib.Path('app/src/main/res/values/strings.xml').read_text(encoding='utf-8')),
+       '文案要与实际能力一致：扫码传文件、手机自带投屏选设备名，两条路都存在才写')
+
 # 图片层（批 3）：MediaPlayer 解不了静态图，所以图片有自己的一层。
 # 这几条守的是「照片投上去，电视全黑」——布局把这一层漏了 / 藏反了，
 # 代码全都照常编译运行，只是照片永远显示不出来。

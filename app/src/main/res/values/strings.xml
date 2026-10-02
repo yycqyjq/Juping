@@ -18,6 +18,13 @@
     <string name="qr_hint">手机扫码\n传文件播放</string>
     <string name="qr_desc">上传页二维码</string>
 
+    <!-- 通高二维码列（右列）：上标题 + 下说明。
+         远距离先读到标题知道"这是给手机扫的"；走近才看下半段的
+         操作步骤与功能范围。文案只写**真的做得到**的事：
+         扫码传文件，或直接用手机自带投屏。 -->
+    <string name="qr_top">手机扫码投屏</string>
+    <string name="qr_body">① 手机与电视连同一个 Wi-Fi\n② 扫码打开上传页，选照片/视频/音乐\n③ 传完一键投放到电视\n\n手机自带的投屏功能里\n选本设备名，也能直接投</string>
+
     <string name="btn_restart">重启服务</string>
 
     <string name="state_starting">启动中…</string>

@@ -150,17 +150,31 @@
          它底下压着 SurfaceView，而停止播放之后那个 Surface 可能残留一层
          平台特有的底色（老 MTK 上是蓝的）。面板透明的话底色会直接透出来，
          看起来就像"停止投屏把电视搞坏了"。 -->
+    <!-- 空闲面板：左列是状态与引导，右列是**通高的二维码区**。
+
+         为什么二维码单独一列（2026-10-02 二夜拍板）：它原先嵌在引导卡片里，
+         196dp 的码把整张卡片撑高，面板内容总高度顶到屏幕边缘；而它是电视上
+         唯一的"入口"，缩在一角反而没人扫。通高独立列 + 功能说明，远看就知道
+         这一步该干什么。二维码尺寸不变 —— 10:1 规则（3~5 米外要 30cm 以上）
+         已经贴着这台电视的观看距离。 -->
     <LinearLayout
         android:id="@+id/panel"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:background="@color/bg"
-        android:orientation="vertical"
-        android:gravity="center_vertical"
+        android:orientation="horizontal"
         android:paddingLeft="48dp"
         android:paddingRight="48dp"
         android:paddingTop="40dp"
         android:paddingBottom="40dp">
+
+        <!-- 左列：标题、引导、设备信息、按钮，整体垂直居中 -->
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:gravity="center_vertical">
 
         <!-- 标题行 -->
         <LinearLayout
@@ -194,78 +208,32 @@
                 android:textSize="15sp" />
         </LinearLayout>
 
-        <!-- 引导卡片：左边是文字引导，右边是二维码 ——
-             扫码这条路径比"在手机 App 里找投屏按钮"短得多：扫完就是上传页，
-             传完一键播。所以码要够大（10:1 规则：3~5 米外要 30cm 以上）。 -->
+        <!-- 引导卡片：纯文字引导 —— 二维码已挪到右侧独立列，这里只说
+             "两条路怎么走"，不再为一张码留半张卡片的宽度。 -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="32dp"
-            android:orientation="horizontal"
-            android:gravity="center_vertical"
+            android:orientation="vertical"
             android:background="@drawable/bg_card"
             android:padding="24dp">
 
-            <LinearLayout
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:orientation="vertical">
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="@string/guide_title"
-                    android:textColor="@color/accent"
-                    android:textSize="20sp"
-                    android:textStyle="bold" />
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="12dp"
-                    android:lineSpacingExtra="6dp"
-                    android:text="@string/guide_body"
-                    android:textColor="@color/text_secondary"
-                    android:textSize="17sp" />
-            </LinearLayout>
-
-            <!-- 二维码整块（码 + 一行小字）。
-
-                 整块有个 id 是为了能**整块隐藏**：位图是异步/按需生成的，
-                 生成不出来时留一个空的白色方块在深色卡片上，看着像界面坏了。
-
-                 白底是必须的（@color/qr_bg，见那边的注释）；码四周还留了
-                 6dp 的 padding —— QrRenderer 里已经内建了 4 个模块的静区，
-                 这一圈白边是第二道保险：静区被卡片底色吃掉，码就扫不出来了。 -->
-            <LinearLayout
-                android:id="@+id/qr_box"
+            <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_marginLeft="28dp"
-                android:gravity="center_horizontal"
-                android:orientation="vertical"
-                android:visibility="gone">
+                android:text="@string/guide_title"
+                android:textColor="@color/accent"
+                android:textSize="20sp"
+                android:textStyle="bold" />
 
-                <ImageView
-                    android:id="@+id/qr_image"
-                    android:layout_width="196dp"
-                    android:layout_height="196dp"
-                    android:background="@color/qr_bg"
-                    android:contentDescription="@string/qr_desc"
-                    android:padding="6dp"
-                    android:scaleType="fitCenter" />
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="10dp"
-                    android:gravity="center"
-                    android:lineSpacingExtra="2dp"
-                    android:text="@string/qr_hint"
-                    android:textColor="@color/text_hint"
-                    android:textSize="14sp" />
-            </LinearLayout>
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:lineSpacingExtra="6dp"
+                android:text="@string/guide_body"
+                android:textColor="@color/text_secondary"
+                android:textSize="17sp" />
         </LinearLayout>
 
         <!-- 设备信息卡片 -->
@@ -439,6 +407,62 @@
                 android:text="@string/btn_restart"
                 android:textColor="@color/text_primary"
                 android:textSize="16sp" />
+        </LinearLayout>
+        </LinearLayout>
+        <!-- 左列结束 -->
+
+        <!-- 右列：通高的二维码区。
+
+             整块（qr_box）有个 id 是为了能**整块隐藏**：位图是异步/按需生成的，
+             生成不出来时留一个空的白色方块在深色底上，看着像界面坏了。
+
+             白底是必须的（@color/qr_bg，见那边的注释）；码四周还留了
+             6dp 的 padding —— QrRenderer 里已经内建了 4 个模块的静区，
+             这一圈白边是第二道保险：静区被底色吃掉，码就扫不出来了。
+
+             上下各贴一句说明（qr_top/qr_body）：站远处时先看到「手机扫码
+             投屏」知道这是什么，走近了才需要下面的操作细节。 -->
+        <LinearLayout
+            android:id="@+id/qr_box"
+            android:layout_width="wrap_content"
+            android:layout_height="match_parent"
+            android:layout_marginLeft="36dp"
+            android:background="@drawable/bg_card"
+            android:gravity="center"
+            android:orientation="vertical"
+            android:paddingLeft="28dp"
+            android:paddingRight="28dp"
+            android:paddingTop="28dp"
+            android:paddingBottom="28dp"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/qr_top"
+                android:textColor="@color/accent"
+                android:textSize="20sp"
+                android:textStyle="bold" />
+
+            <ImageView
+                android:id="@+id/qr_image"
+                android:layout_width="196dp"
+                android:layout_height="196dp"
+                android:layout_marginTop="18dp"
+                android:layout_marginBottom="18dp"
+                android:background="@color/qr_bg"
+                android:contentDescription="@string/qr_desc"
+                android:padding="6dp"
+                android:scaleType="fitCenter" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:lineSpacingExtra="5dp"
+                android:text="@string/qr_body"
+                android:textColor="@color/text_secondary"
+                android:textSize="15sp" />
         </LinearLayout>
     </LinearLayout>
 

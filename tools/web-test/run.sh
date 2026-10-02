@@ -188,6 +188,22 @@ report('截断判据来自内核停因（ApkScanner 引用 timedOut）', 'timedO
 report('不再用「纯条数」判截断（r.size() >= ApkScan.MAX_RESULTS 已删）',
        'r.size() >= ApkScan.MAX_RESULTS' not in scnr)
 
+# ⑥ 安装包页的成败判据（2026-10-02 真机工单，与上传页同源病）：手机浏览器会
+#    吞掉/改写局域网 POST 的响应 —— 服务端「刷新」其实已经生效，前端解析
+#    响应体失败就甩「响应异常」。刷新/安装都是 fire-and-forget，结果从
+#    GET /apk/list 轮询与电视屏幕拿，POST 响应体一律不解析。
+report('刷新不解析 POST 响应体（发出去就开始轮询列表）',
+       "post('/apk/refresh','',function(){refresh.disabled=false;load()}" in endp
+       and "d={message:'响应异常'}" not in endp,
+       '刷新到达服务器重扫就已开始，结果在 /apk/list 里 —— 拿被改写的响应体'
+       '判成败，成功的操作会被报成「响应异常」（用户这次的工单）')
+report('安装失败话术引导看电视（请求其实已送达）',
+       '安装请求已发出，请看电视机上的安装提示' in endp,
+       'ACTION_VIEW 发出去安装界面就在电视上了，浏览器把响应吞了不代表失败')
+report('列表读取失败自动重试而不是甩错误（GET 也可能被改写）',
+       "say('列表暂时读不到，正在重试…');setTimeout(function(){load()},2000)" in endp,
+       '一次坏响应就停在错误页，用户会以为电视挂了')
+
 if failed:
     sys.exit(1)
 PY

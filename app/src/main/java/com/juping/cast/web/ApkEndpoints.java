@@ -400,11 +400,14 @@ public final class ApkEndpoints implements UpnpHttpServer.WebEndpoints {
             + "function load(){\n"
             + "  var x=new XMLHttpRequest();x.open('GET','/apk/list');\n"
             + "  x.onload=function(){\n"
-            + "    var d;try{d=JSON.parse(x.responseText)}catch(e){say('响应异常');return}\n"
+            // GET 响应也可能是坏的（手机浏览器同样会改写局域网响应体）—— 但列表读
+            // 不到不等于出了事，2 秒后自己再读一次，比甩一个「响应异常」吓人好。
+            + "    var d;try{d=JSON.parse(x.responseText)}catch(e){\n"
+            + "      say('列表暂时读不到，正在重试…');setTimeout(function(){load()},2000);return}\n"
             + "    render(d);\n"
             + "    if(d.scanning){setTimeout(function(){load()},700)}\n"
             + "  };\n"
-            + "  x.onerror=function(){say('读取失败，请重试')};\n"
+            + "  x.onerror=function(){say('读取失败，正在重试…');setTimeout(function(){load()},2000)};\n"
             + "  x.send();\n"
             + "}\n"
             + "function post(url,body,onload,onerror){\n"
@@ -415,19 +418,24 @@ public final class ApkEndpoints implements UpnpHttpServer.WebEndpoints {
             + "function install(path,b){\n"
             + "  b.disabled=true;b.textContent='…';\n"
             + "  post('/apk/install','name='+enc(path),function(x){\n"
-            + "    var d;try{d=JSON.parse(x.responseText)}catch(e){d={message:'响应异常'}}\n"
-            + "    say(d.message||('HTTP '+x.status));\n"
+            // 安装是 fire-and-forget：ACTION_VIEW 发出去就完事，装没装成看电视上的
+            // 系统安装界面 —— 响应体可能被浏览器改写（同上传页踩的坑），
+            // 解析不出来就不武断说失败，引导看电视。
+            + "    var d;try{d=JSON.parse(x.responseText)}catch(e){d=null}\n"
+            + "    say(d&&d.message?d.message:'安装请求已发出，请看电视机上的安装提示');\n"
             + "    b.disabled=false;b.textContent='安装';\n"
-            + "  },function(){say('请求发不出去');b.disabled=false;b.textContent='安装'});\n"
+            + "  },function(){say('安装请求已发出，请看电视机上的安装提示');"
+            + "b.disabled=false;b.textContent='安装'});\n"
             + "}\n"
             + "function rescan(){\n"
             + "  refresh.disabled=true;\n"
-            + "  post('/apk/refresh','',function(x){\n"
-            + "    refresh.disabled=false;\n"
-            + "    var d;try{d=JSON.parse(x.responseText)}catch(e){say('响应异常');return}\n"
-            + "    render(d);\n"
-            + "    if(d.scanning){setTimeout(function(){load()},700)}\n"
-            + "  },function(){refresh.disabled=false;say('刷新请求发不出去')});\n"
+            // 刷新是 fire-and-forget：POST 到达服务器，重扫就已开始，结果从
+            // GET /apk/list 轮询拿（见 load()）。**绝不解析 POST 的响应体** ——
+            // 手机浏览器会吞/改写局域网 POST 响应（上传页真机工单同款），
+            // 解析不出来就甩「响应异常」，刷新本身其实早就生效了。
+            + "  post('/apk/refresh','',function(){refresh.disabled=false;load()},\n"
+            + "    function(){refresh.disabled=false;load()});\n"
+            + "  setTimeout(function(){refresh.disabled=false},4000);\n"
             + "}\n"
             + "refresh.onclick=rescan;\n"
             + "load();\n"
