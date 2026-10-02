@@ -91,6 +91,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final int MODE_AUDIO = 1;
     private static final int MODE_VIDEO = 2;
     private static final int MODE_IMAGE = 3;
+    /**
+     * 视频准备中的瞬态：投的是视频，但 prepare 还挂着（首帧没来）。
+     *
+     * <p>为什么要有第五态：老 MTK 上「没有内容的视频层」硬件输出的是一屏蓝。
+     * 正常 VIDEO 态藏不住它（马上就有画面），而准备窗口里必须把 SurfaceView
+     * 藏掉、盖一层不透明占位 —— 表现从「蓝屏 30 秒」变成「正在准备视频…」。
+     * 它**不是**一种播放形态（lastPlayingMode 仍是 MODE_VIDEO），只是
+     * VIDEO 就绪前那两三秒的壳。见 `.agent/video-bluescreen-plan.md` §4。
+     */
+    private static final int MODE_VIDEO_PENDING = 4;
 
     private SurfaceView surfaceView;
     /**
@@ -101,6 +111,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * {@code BitmapFactory} + ImageView 这条完全独立的通道。
      */
     private ImageView imageView;
+    /** 视频准备中的不透明占位层（盖住「藏掉 SurfaceView 后的黑底」，见 MODE_VIDEO_PENDING）。 */
+    private LinearLayout videoWait;
     private LinearLayout panel;
     private LinearLayout overlay;
     private LinearLayout rowSource;
@@ -277,6 +289,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         surfaceView = (SurfaceView) findViewById(R.id.surface);
         imageView = (ImageView) findViewById(R.id.image);
+        videoWait = (LinearLayout) findViewById(R.id.video_wait);
         panel = (LinearLayout) findViewById(R.id.panel);
         overlay = (LinearLayout) findViewById(R.id.overlay);
         rowSource = (LinearLayout) findViewById(R.id.row_source);
@@ -996,6 +1009,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             staleHeld = false;
             // 新歌到来，清掉「用户主动停止」标志 —— 免得误伤下一次控制点 Stop 的宽限。
             userInitiatedStop = false;
+            // 视频且 prepare 还挂着 → 瞬态「视频准备中」：applyMode 会藏掉
+            // SurfaceView（空视频层在老 MTK 上输出蓝色）并盖不透明占位。
+            // lastPlayingMode 保持 MODE_VIDEO 不变 —— 它是宽限/退后台判据的
+            // 输入，pending 本质就是「还没就绪的视频」，不是一种新的播放形态。
+            if (lastPlayingMode == MODE_VIDEO && service.isVideoPending()) {
+                return MODE_VIDEO_PENDING;
+            }
             return lastPlayingMode;
         }
         // 非播放：若刚在放**音频**、且不是用户主动停止、且还在宽限期内 → 继续保持
@@ -1019,11 +1039,31 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return MODE_IDLE;
     }
 
+    /**
+     * 形态名（只给日志用）：数字对不上人眼，名字才对得上「形态机」的叙述。
+     *
+     * <p>诊断（视频蓝屏取证）用 —— 见 `.agent/video-bluescreen-plan.md` §5 组 A。
+     */
+    private static String modeName(int mode) {
+        switch (mode) {
+            case MODE_AUDIO: return "AUDIO";
+            case MODE_VIDEO: return "VIDEO";
+            case MODE_IMAGE: return "IMAGE";
+            case MODE_IDLE: return "IDLE";
+            default: return "MODE_" + mode;
+        }
+    }
+
     /** 形态真的变了才动 View —— 每 1.5 秒重设一次 visibility 会触发无谓的重新布局 */
     private void applyModeIfChanged(int mode) {
         if (mode == lastMode) {
             return;
         }
+        // 诊断（视频蓝屏取证）：只在形态**真的变化**时打一条（不是每拍）——
+        // 用来确认形态机是否按 IDLE→VIDEO 走、中间有没有闪一下 IDLE，
+        // 以及它与下面「SurfaceView 显隐」「Surface created」的先后。
+        // 见 `.agent/video-bluescreen-plan.md` §5 组 A。
+        Log.i(TAG, "形态: " + modeName(lastMode) + " → " + modeName(mode));
         // 「播放 → 空闲」且这轮界面是投屏自动唤起的：**延迟**退回后台，
         // 电视回到投屏之前的样子（launcher / 上一个应用）。
         //
@@ -1036,6 +1076,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // 期间重新投屏（mode 离开 IDLE）会自动取消退避；
         // 手动打开的界面（标志位 false）不动 —— 不能把人踢出他自己开的页面。
         boolean wasPlaying = (lastMode == MODE_AUDIO || lastMode == MODE_VIDEO
+                || lastMode == MODE_VIDEO_PENDING
                 || lastMode == MODE_IMAGE);
         if (mode == MODE_IDLE && wasPlaying && service != null) {
             if (service.hasAutoFrontFlag()) {
@@ -1074,11 +1115,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private void applyMode(int mode) {
         boolean idle = (mode == MODE_IDLE);
         boolean image = (mode == MODE_IMAGE);
+        // 准备中：藏 SurfaceView（移除视频层）+ 盖不透明占位，杜绝老 MTK 的空层蓝屏。
+        boolean videoPending = (mode == MODE_VIDEO_PENDING);
         panel.setVisibility(idle ? View.VISIBLE : View.GONE);
         // 音乐层与画面层互斥。两者同时可见时，不透明的那层会盖住另一层，
         // 表面看"正常"，但底下还在渲染 —— 0.6GB 的盒子上不该浪费这份开销。
         music.setVisibility(mode == MODE_AUDIO ? View.VISIBLE : View.GONE);
         imageView.setVisibility(image ? View.VISIBLE : View.GONE);
+        videoWait.setVisibility(videoPending ? View.VISIBLE : View.GONE);
         // 离开图片形态就把那张位图放掉：一张降采样后的图仍有好几 MB，
         // 接下来要放视频时它白占着内存 —— 而这台盒子总共才 0.6GB。
         if (!image) {
@@ -1102,7 +1146,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         //
         // 图片态同理：图片不经过视频层，那个 Surface 上什么都没有，
         // 留着它只会露出一屏蓝底，把刚画上去的照片盖住。
-        surfaceView.setVisibility((idle || image) ? View.GONE : View.VISIBLE);
+        // 诊断（视频蓝屏取证）：只在可见性**真的变化**时打一条 —— 用来对齐
+        // 「SurfaceView 变可见」与「Surface created」的时刻（见
+        // `.agent/video-bluescreen-plan.md` §5 组 B）。先读后设，原表达式一字不动。
+        int svVisBefore = surfaceView.getVisibility();
+        surfaceView.setVisibility((idle || image || videoPending) ? View.GONE : View.VISIBLE);
+        if (surfaceView.getVisibility() != svVisBefore) {
+            Log.i(TAG, "SurfaceView 显隐: "
+                    + (surfaceView.getVisibility() == View.VISIBLE ? "VISIBLE" : "GONE")
+                    + "（形态 " + modeName(mode) + "）");
+        }
         applyTopBar(mode);
 
         String label = currentLabel();
@@ -1321,11 +1374,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
+        // 诊断（视频蓝屏取证）：Surface 生命周期的关键节点（非每拍）——
+        // 用来确认「SurfaceView 变可见 → Surface 真正创建」之间隔了多久，
+        // 以及空闲态是否真的销毁了 Surface（见 `.agent/video-bluescreen-plan.md` §5 组 B）。
+        Log.i(TAG, "Surface created");
         bindSurfaceIfReady();
     }
 
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+        Log.i(TAG, "Surface changed: " + width + "x" + height);
         // 分辨率切换时 Surface 会重建，必须重新绑定，
         // 否则出现「有声音没画面」—— 老设备上的典型现象
         bindSurfaceIfReady();
@@ -1333,6 +1391,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
+        Log.i(TAG, "Surface destroyed");
         if (service != null && service.getPlayer() != null) {
             service.getPlayer().setSurface(null);
         }

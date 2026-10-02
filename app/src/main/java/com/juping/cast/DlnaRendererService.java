@@ -1449,6 +1449,24 @@ public class DlnaRendererService extends Service
         return kindFromMetadata == KIND_IMAGE;
     }
 
+    /**
+     * 「投的是视频，但画面还没准备好」—— 界面据此盖一层不透明占位、并藏起
+     * SurfaceView，避免未就绪的空视频层露出老 MTK 平台的那屏蓝。
+     *
+     * <p>判据权威在服务（与 {@link #isAudioOnly()} / {@link #isImage()} 同一
+     * 纪律，界面不自己猜）。刻意用「prepare 还挂着」（{@code isPreparing()}）
+     * 而不是「时长为 0」—— HLS 直播的时长恒为 0，拿它当判据会把正常播放的
+     * 直播永远判成准备中，占位层就再也撤不掉了（铁律：判据必须会终结）。
+     */
+    public boolean isVideoPending() {
+        MediaPlayerController p = player;
+        return p != null
+                && kindFromMetadata == KIND_VIDEO
+                && !isAudioOnly()
+                && p.isPreparing()
+                && currentUri != null && currentUri.length() > 0;
+    }
+
     // ------------------------------------------- EventDispatcher.EventSource
 
     /**

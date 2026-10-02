@@ -147,8 +147,16 @@ public class MediaPlayerController {
      *
      * <p>合成一个布尔值就区分不出「准备中」和「还没开始」，于是 prepare 期间的
      * Play 会把正在准备的实例掐掉重建 —— 见 {@link #resume} 里的详细说明。
+     *
+     * <p>volatile：{@link #isPreparing()} 在界面刷新线程上读（「视频准备中」判据），
+     * 置位却发生在控制点线程的 startInternal 里 —— 不加的话界面可能一直看不见
+     * 翻假的值，占位层赖着不走。
      */
-    private boolean preparing;
+    private volatile boolean preparing;
+
+    /** 上一次 releasePlayer() 完成 release 的时刻（0 = 从未释放过）。
+     *  只为取证日志量「teardown → prepare」间隔用，见 startInternal。 */
+    private volatile long lastReleaseAtMs;
 
     private boolean userPaused;
     private int retryCount;
@@ -396,6 +404,10 @@ public class MediaPlayerController {
             }
             prepareStartedAt = System.currentTimeMillis();
             player.setDataSource(playUrl);
+            // 取证（视频蓝屏 F1/F3 决策）：setDataSource 完成时刻 —— 与
+            // 「释放播放器: release 结束」的时差就是 teardown→prepare 的实际间隔。
+            Log.i(TAG, "setDataSource 完成: t=" + prepareStartedAt
+                    + "，距释放 " + (prepareStartedAt - lastReleaseAtMs) + "ms");
             player.setScreenOnWhilePlaying(true);
 
             player.setOnPreparedListener(new MediaPlayer.OnPreparedListener() {
@@ -416,6 +428,11 @@ public class MediaPlayerController {
                     // 位置前进反复刷新，这个起点不动 —— 见字段说明与 checkStall 的判据。
                     playStartedAtMs = lastProgressAt;
                     hasVideo = detectVideo(mp);
+                    // 诊断（视频蓝屏取证）：prepare 成功返回时的耗时 —— 用来确认
+                    // 闸门/看门狗是否把「30 秒」降了下来（见 `.agent/video-bluescreen-plan.md` §5 组 C）。
+                    Log.i(TAG, "prepare 结束: 耗时 "
+                            + (System.currentTimeMillis() - prepareStartedAt)
+                            + "ms（成功），hasVideo=" + hasVideo);
 
                     // 视频尺寸延迟复查：部分老芯片（MTK 5880 实测）在 onPrepared
                     // 时 getVideoWidth() 仍返回 0 —— 视频要等首帧解码才有尺寸。
@@ -574,6 +591,12 @@ public class MediaPlayerController {
                 public boolean onError(MediaPlayer mp, int what, int extra) {
                     // 返回 true 表示「已处理」，避免系统弹出错误对话框
                     Log.w(TAG, "播放错误 what=" + what + " extra=" + extra + " url=" + currentUrl);
+                    // 诊断（视频蓝屏取证）：把「从 prepare 开始到出错」的耗时留下来 ——
+                    // 与成功路径的「prepare 结束」配对，用于分流根因与计时
+                    // （见 `.agent/video-bluescreen-plan.md` §5 组 C）。
+                    Log.w(TAG, "prepare 结束（错误）: 耗时 "
+                            + (System.currentTimeMillis() - prepareStartedAt)
+                            + "ms，what=" + what + " extra=" + extra);
                     // prepare 失败也要复位，否则重连之后 Play 会被误判成
                     // "准备中"而永远不生效 —— 表现是投不上去，而且点播放键没反应。
                     preparing = false;
@@ -608,6 +631,11 @@ public class MediaPlayerController {
                 }
             });
 
+            // 诊断（视频蓝屏取证）：prepare 发出这一刻，输出面在不在。
+            // 注：A/B 对照后「Surface 顺序」假设已被证伪（根因是 release→prepare
+            // 异步竞态，见 `.agent/video-bluescreen-plan.md` §2.2），这条日志保留
+            // 作可观测性用，不再是根因判据。不打 URL（带签名，属敏感）。
+            Log.i(TAG, "prepare 开始: surface=" + (surface != null));
             // 置位必须在 prepareAsync **之前**。onPrepared 是异步回调，
             // 放在后面虽然大概率也来得及，但那是在赌时序 —— 而这条路径
             // 本来就只在"prepare 快慢"这个边界上出问题，赌不起。
@@ -1336,6 +1364,14 @@ public class MediaPlayerController {
     }
 
     /**
+     * prepare 是否还挂着（prepareAsync 已发出、onPrepared/onError 未到）。
+     * 服务层的「视频准备中」判据用它 —— 界面不自己猜播放进度。
+     */
+    public boolean isPreparing() {
+        return preparing;
+    }
+
+    /**
      * 把「音量 + 静音」这两个状态一起下发给播放器。
      *
      * <p>只留这一个出口：任何一处单独调 {@code player.setVolume()} 都会漏掉静音，
@@ -1415,12 +1451,28 @@ public class MediaPlayerController {
         // 否则过期复查会对着已释放的实例跑 —— 判定套到新片源上。
         cancelVideoRecheck();
         if (player != null) {
+            // 视频蓝屏修复 F1：这里**不再** player.reset()。
+            //
+            // 真机 A/B 日志（`.agent/video-bluescreen-plan.md` §1）定案：厂商栈
+            // （海信 CmpbPlayer / MTK）的 reset 是**异步**的（reset_nosync），
+            // 旧实例这次 teardown 会落到紧接着 new MediaPlayer() 的 prepareAsync
+            // 头上 —— mReseted 标志跨实例共享，于是新实例的 prepare 被判成
+            // "already reset" 成空操作（无回调），直到看门狗重建才出画面：
+            // 表现就是「投视频先蓝屏 30 秒」。
+            //
+            // reset() 的唯一语义是「复位实例以便复用」，而这里 player 随即置
+            // null、下一轮永远 new 一个 —— 它既多余又是竞态源头。直接 release()
+            // 是官方推荐的释放方式。取证日志量「teardown → prepare」的实际间隔。
+            long teardownAt = System.currentTimeMillis();
+            Log.i(TAG, "释放播放器: release 开始（reset 已移除）");
             try {
-                player.reset();
                 player.release();
             } catch (Exception e) {
                 Log.w(TAG, "释放 MediaPlayer 出错", e);
             }
+            lastReleaseAtMs = System.currentTimeMillis();
+            Log.i(TAG, "释放播放器: release 结束，耗时 "
+                    + (lastReleaseAtMs - teardownAt) + "ms");
             player = null;
         }
     }

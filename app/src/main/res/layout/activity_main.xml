@@ -124,6 +124,27 @@
         android:scaleType="fitCenter"
         android:visibility="gone" />
 
+    <!-- 视频准备中占位层（MODE_VIDEO_PENDING）。
+         prepare 期间 SurfaceView 被藏起来 —— 老 MTK 上没内容的视频层会输出
+         一屏蓝，藏掉它又只剩窗口底色，中间那两三秒看起来像坏了。
+         这层不透明底 + 一句话把窗口期接住。背景必须不透明：理由和 panel 一样。 -->
+    <LinearLayout
+        android:id="@+id/video_wait"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@color/bg"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/video_wait"
+            android:textColor="@color/text_hint"
+            android:textSize="22sp" />
+    </LinearLayout>
+
     <!-- 主面板：等待投屏时显示。
          这里的 background 必须**不透明**，和上面 music 层是同一个道理：
          它底下压着 SurfaceView，而停止播放之后那个 Surface 可能残留一层

@@ -3013,6 +3013,72 @@ report('dex 核查表收录 OnInfoListener（否则闸门报「没被核到」�
        'R8 会改实现类的名字，不列入核查表就核不到这个方法 —— '
        '而它一旦被裁掉，厂商事件永远送不过来')
 
+# ---- (13) 视频蓝屏修复（F1 去 reset / F2 阈值 / MODE_VIDEO_PENDING 占位层）----
+# 真机 A/B 定案：releasePlayer 的 reset() 触发厂商异步 reset_nosync，污染新实例
+# 的 prepareAsync（"already reset" 空操作）→ 投视频先蓝屏 30 秒。
+# 这组守卫钉的是「修好的东西别被改回去」—— 设计见 `.agent/video-bluescreen-plan.md`。
+rlp = body_of(ctrl, 'private void releasePlayer()')
+report('releasePlayer 已找到且不含 player.reset()（F1 的直接回归判据）',
+       rlp is not None and 'player.reset(' not in rlp,
+       '锚点：private void releasePlayer()。reset() 一旦被加回来，换片必现'
+       '「prepareAsync 空操作 → 蓝屏到看门狗重建」—— 这是本 bug 的竞态源头，'
+       '实例释放后从不复用，reset() 没有任何留存理由')
+report('releasePlayer 仍然 release 并置空（去 reset 不等于不释放）',
+       rlp is not None and 'player.release()' in rlp and 'player = null' in rlp,
+       '只防「加回 reset」不防「顺手删 release」的话，实例泄漏在 0.6GB 盒子上'
+       '比蓝屏更糟')
+report('prepare 卡死阈值已降到 10s（F2 安全网，不再是 30s）',
+       re.search(r'PREPARE_STUCK_REBUILD_MS\s*=\s*10000L', pol) is not None
+       and re.search(r'SWITCH_SETTLE_MS\s*=\s*500L', pol) is not None,
+       '确认的失败模式是 prepareAsync 空操作（0ms 真实工作）—— 10s 足够宽；'
+       '改回 30s 等于把中招时的用户等待再放大 3 倍。SWITCH_SETTLE_MS 是 F3 '
+       '备用常量（真机验收前刻意不接线），漂移即红')
+report('控制器暴露 isPreparing()（判据的原料在服务之外不可见）',
+       re.search(r'public boolean isPreparing\(\)\s*\{[^}]*return preparing;',
+                 ctrl) is not None,
+       '界面的「视频准备中」全靠它；被裁掉的话占位层永不出现，蓝屏直接露出来')
+vp = body_of(svc, 'public boolean isVideoPending()')
+report('服务侧「视频准备中」判据用 isPreparing()，且绝不拿 getDuration()==0 凑',
+       vp is not None and 'isPreparing()' in vp and 'getDuration' not in vp
+       and 'isAudioOnly()' in vp and 'isImage' not in vp,
+       'HLS 直播的时长恒为 0 —— 用它当判据会把正常播放的直播永远判成准备中，'
+       '占位层再也撤不掉（铁律：判据必须会终结）。isImage 不在判据里是因为'
+       'pending 只在「判成视频」之后才会被问到，但反向依赖 audioOnly 必须显式排除')
+cm = body_of(main_act, 'private int currentMode()')
+report('形态机：视频且准备中 → MODE_VIDEO_PENDING，图片优先判仍在',
+       cm is not None and 'MODE_VIDEO_PENDING' in cm
+       and re.search(r'lastPlayingMode\s*==\s*MODE_VIDEO\s*&&\s*'
+                     r'service\.isVideoPending\(\)', cm) is not None
+       and 'isImage()' in cm,
+       'pending 分支必须排在 lastPlayingMode 赋值**之后**（宽限/退后台判据'
+       '仍按 MODE_VIDEO 记账）；图片判据一旦被它吃掉，投图会显示'
+       '「正在准备视频…）」')
+am = body_of(main_act, 'private void applyMode(int mode)')
+report('占位层接线：pending 藏 SurfaceView + 亮 video_wait',
+       am is not None and 'videoWait.setVisibility(' in am
+       and 'MODE_VIDEO_PENDING' in am
+       and re.search(r'boolean videoPending\s*=\s*\(mode == MODE_VIDEO_PENDING\)',
+                     am) is not None
+       and re.search(r'surfaceView\.setVisibility\(\s*\(\s*idle \|\| image'
+                     r'\s*\|\| videoPending\s*\)', am) is not None,
+       '可见性表达式少了 videoPending：准备窗口 SurfaceView 保持可见，'
+       '空视频层在老 MTK 上直接输出蓝 —— 整套修复只剩占位层被压在蓝底下')
+wsp = re.search(r'boolean wasPlaying\s*=([\s\S]{0,200}?\);)', main_act)
+report('退后台宽限把 VIDEO_PENDING 计入 wasPlaying（§8.4 的坑）',
+       wsp is not None and 'MODE_VIDEO_PENDING' in wsp.group(1),
+       'pending 期间投屏失败回 IDLE 时，漏计会跳过 2.5s 延迟退后台 —— '
+       '同一帧切后台把蓝色视频帧粘在 launcher 上（MTK 实测老坑）')
+lay = pathlib.Path('app/src/main/res/layout/activity_main.xml').read_text(encoding='utf-8')
+vw = re.search(r'android:id="@\+id/video_wait"([\s\S]{0,600}?)>', lay)
+report('占位层存在且背景不透明（@color/bg）',
+       vw is not None and '@color/bg' in vw.group(1),
+       '透明的占位层等于没盖 —— 老 MTK 的空视频层蓝色会直接透出来，'
+       '这是 music/panel/image 三层同一纪律（布局注释里写了三遍）')
+report('strings.xml 有「正在准备视频」占位文案',
+       'name="video_wait"' in strings,
+       '布局里 @string/video_wait 引用它，缺了会编译期红 —— 钉这条是为了'
+       '让「删文案」这种回退在闸门而不是装机时暴露')
+
 sys.exit(1 if failed else 0)
 PY
 

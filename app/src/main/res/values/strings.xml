@@ -59,6 +59,11 @@
          BitmapFactory 解码后画在 ImageView 上，这条无障碍描述就属于那一层。 -->
     <string name="image_desc">正在展示的图片</string>
 
+    <!-- 视频准备中的占位文案（MODE_VIDEO_PENDING）。
+         老 MTK 平台上「没有内容的视频层」输出的是一屏蓝 —— prepare 窗口
+         必须既藏掉 SurfaceView、又有一层不透明底替它说话。 -->
+    <string name="video_wait">正在准备视频…</string>
+
     <!-- 音乐投屏。
          纯音频流在 SurfaceView 上什么都没有，电视就是一片黑 —— 声音明明在放，
          看着却像投屏坏了。所以纯音频时必须换成音乐形态，把这件事说清楚。

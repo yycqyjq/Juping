@@ -92,7 +92,7 @@ Juping/
     │   ├── verify-device-selftest.sh  用假 adb 验 verify-on-device.sh 的管道
     │   └── android/util/Log.java    android.util.Log 的桌面替身
     ├── policy-test/          播放重连策略测试（纯逻辑，不需要真机）
-    │   ├── run.sh            编译 + 78 项断言 + 387 条源码级守卫
+    │   ├── run.sh            编译 + 78 项断言 + 397 条源码级守卫
     │   └── PolicyTest.java   78 项断言 + 「卡死→重连→又卡死」循环模拟
     ├── proxy-test/           本地预取代理字节一致性测试（11 项）
     │   ├── run.sh            编译 → 起源站 → 全量/Range/回拖/EOS/中途重连 逐字节比对
@@ -127,8 +127,8 @@ Juping/
 产物：
 
 ```
-dist/juping-0.2.1-release.apk   ← 装机用这个（已签名）
-dist/juping-0.2.1-debug.apk     ← 排障用（带 debuggable 标记）
+dist/juping-0.2.3-release.apk   ← 装机用这个（已签名）
+dist/juping-0.2.3-debug.apk     ← 排障用（带 debuggable 标记）
 ```
 
 `dist` 目标会在归集后**自动跑八道闸**，任何一道不过就报错退出 —— 免得把一个装不上的、点开就崩的、投不进来的、断联后恢复不了的、字节被传坏了、或者带着签名密钥的包交出去：
@@ -192,7 +192,7 @@ release 密钥在 `keystore/juping-release.jks`，密码在 `keystore.properties
 可以用这个命令确认：
 
 ```bash
-unzip -p dist/juping-0.2.1-release.apk META-INF/MANIFEST.MF | grep Digest
+unzip -p dist/juping-0.2.3-release.apk META-INF/MANIFEST.MF | grep Digest
 # 应该看到 SHA1-Digest: ...，而不是 SHA-256-Digest
 ```
 
@@ -212,7 +212,7 @@ unzip -p dist/juping-0.2.1-release.apk META-INF/MANIFEST.MF | grep Digest
 
 ```bash
 adb connect <盒子IP>:5555        # 或 USB 连接
-adb install -r dist/juping-0.2.1-release.apk
+adb install -r dist/juping-0.2.3-release.apk
 ```
 
 局域网 adb 需要盒子侧已经开着网络调试并在监听 5555 —— 零售盒子默认是关的，
@@ -220,7 +220,7 @@ adb install -r dist/juping-0.2.1-release.apk
 
 ### 路径 B：U 盘（最通用，不依赖任何调试通道）
 
-1. 把 `dist/juping-0.2.1-release.apk` 拷到 U 盘。**用 FAT32** ——
+1. 把 `dist/juping-0.2.3-release.apk` 拷到 U 盘。**用 FAT32** ——
    老盒子对 exFAT / NTFS 的支持看 ROM 心情，FAT32 是唯一稳的
 2. U 盘插上盒子，用盒子自带的「文件管理 / 本地媒体 / USB 设备」找到这个文件
 3. 点它安装
@@ -234,7 +234,7 @@ adb install -r dist/juping-0.2.1-release.apk
   和源文件比一下大小，不一致就重拷一遍：
 
   ```bash
-  ls -l dist/juping-0.2.1-release.apk   # 记下这个字节数，再和 U 盘里那个比
+  ls -l dist/juping-0.2.3-release.apk   # 记下这个字节数，再和 U 盘里那个比
   # 两个数一致就说明拷完整了。
   # 刻意不写死具体数字 —— 每次重新构建都会变，写死的那份迟早对不上，
   # 反而会让人以为文件拷坏了（这里原来就写着一个过期的字节数）。
@@ -282,7 +282,7 @@ Android 4.0 上在 **设置 → 安全 → 未知来源** 打勾。不打勾安�
 | **LOCATION 由绑定网卡算出**     | 组播绑 A 网卡、却告诉手机去 B 网卡取描述（搜到了却投不了屏）   |
 | **请求体 / 订阅表 / 连接数上限** | 畸形或恶意请求把 0.6GB 内存吃光，连累整个进程（SSDP 一起死）   |
 | **看门狗**                      | 播放卡死不动 —— 点播 20s、直播 60s 两档阈值                    |
-| **prepare 卡死看门狗**          | prepareAsync 发出后 30s 无任何回调（媒体服务卡死，手机端表现为永久「加载中」）→ 重建播放器自救，连续 2 次到顶即如实报错 |
+| **prepare 卡死看门狗**          | prepareAsync 发出后 10s 无任何回调（媒体服务卡死，手机端表现为永久「加载中」）→ 重建播放器自救，连续 2 次到顶即如实报错。原为 30s，视频蓝屏修复（releasePlayer 去 reset 竞态）后降为安全网 |
 | **指数退避重连**                | 1s → 2s → 4s → 8s → 16s，最多 5 次                             |
 | **卡死熔断**                    | 连续卡死 3 次就停手，避免无限重连反而打断播放                  |
 | **旧重连可取消**                | 换新视频时掐掉上一个视频排期的重连，免得把新画面顶掉           |
@@ -474,8 +474,8 @@ API 14 / API 15 的 `android.jar` 里查（含 extends / implements 继承链递
 当前结果：
 
 ```
-被引用的平台类 107 个 · 方法 401 个 · 字段 18 个
-结论：419 个平台引用全部命中，无 API 越界。
+被引用的平台类 107 个 · 方法 402 个 · 字段 18 个
+结论：420 个平台引用全部命中，无 API 越界。
 ```
 
 为什么要两道：lint 依赖内置数据库，而且本项目关掉了 8 项检查 ——
@@ -1434,7 +1434,7 @@ SCPD 如实声明、控制点发的动作如实响应 —— 做不到的如实�
   死循环、切歌后媒体服务卡死（全部见「排障」一节）。
   桌面核验现在是十六项全绿：编译 / lint `NewApi` 零命中 /
   API 引用 412 项（release 419 项）全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
-  DLNA 协议 245 项通过 / 播放策略 78 项断言 + 387 条源码级守卫通过 /
+  DLNA 协议 245 项通过 / 播放策略 78 项断言 + 397 条源码级守卫通过 /
   断言/守卫计数与 README、AGENTS 文档一致（`check_gate_counts.py`，覆盖协议/代理/网页/probe/策略五道）/
   本地预取代理字节一致性 11 项通过 / 网页逻辑一致性 52 项通过 / R8 dex 入口点 47 项通过 /
   控制点自检脚本 33 或 34 项通过（组播回退分支所致，均为合法值）/
@@ -1627,6 +1627,14 @@ adb logcat | grep -E "MediaPlayerController|DlnaRendererService"
   超过 30 秒无任何回调（媒体服务卡死），自动释放并重建播放器自救。
   连续 2 次重建仍卡死会打 `prepare 连续 2 次重建仍卡死 —— 疑似电视
   媒体服务异常，建议重启电视后重试`：那是**诚实边界**，重启电视即可恢复。
+- **`形态: IDLE → VIDEO`** · **`SurfaceView 显隐: VISIBLE（形态 VIDEO）`** ·
+  **`Surface created` / `Surface changed: WxH` / `Surface destroyed`** ·
+  **`prepare 开始: surface=true|false`** · **`prepare 结束: 耗时 X ms（成功）`** ——
+  批 3.8 新增的**诊断日志**（「视频投屏先蓝屏约 30 秒」取证用，**零行为改动**）。
+  形态变化只在形态真的变时打一条、SurfaceView 显隐只在可见性真的变时打一条
+  （都不是每拍）。**`prepare 开始: surface=false` 是关键判据**：说明 prepare 发出
+  那一刻输出面还不存在 —— 坐实「prepare 早于 Surface」（厂商栈对没有输出面的视频
+  prepare 不返回，直到 30s 看门狗重建才成功）。日志里**不打 URL**（带签名，属敏感）。
 - **`控制点已离开（无订阅者，最后指令 Ns 前），自动停止投屏`** ——
   Auto-Stop 生效：最后一个订阅者过期且 120 秒内无任何控制指令，
   电视自动停止。这是特性不是故障；纯投放型控制点（从不订阅）不会触发。

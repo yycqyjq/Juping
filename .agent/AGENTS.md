@@ -124,7 +124,7 @@ tools/
 ├── apk_info.py           APK 包名/minSdk 解析
 ├── make_icon.py          位图资源生成（纯标准库）
 ├── protocol-test/        DLNA 协议一致性 245 项（桌面 JVM + 真实协议栈桩）
-├── policy-test/          播放策略 78 断言 + 387 源码级守卫
+├── policy-test/          播放策略 78 断言 + 397 源码级守卫
 ├── proxy-test/           MediaProxy 字节一致性 11 项
 └── web-test/             MultipartLite + sanitize + ApkScan 网页逻辑一致性（52 项）
 ```
@@ -140,7 +140,7 @@ tools/
 | verify_dex | R8 后框架回调/Thread 子类/协议常量存活 | 全量 |
 | verify_protocol | DLNA 协议一致性（drive.py，期望 245/245） | 245 |
 | ↳ 内含 probe | 控制点自检（**33 或 34 双态**：组播回退分支） | 33/34 |
-| verify_policy | 播放策略 78 断言 + 387 源码级守卫 | 78+ |
+| verify_policy | 播放策略 78 断言 + 397 源码级守卫 | 78+ |
 | ↳ 内含计数 | 文档里的用例总数 ↔ 闸门期望值（`check_gate_counts.py`，覆盖协议/代理/网页/probe/策略） | 一致性 |
 | verify_proxy | MediaProxy 字节一致性（全量/Range/回拖/EOS/中途重连） | 11 |
 | verify_web | multipart 解析逐字节一致 / 名字编码 / APK 扫描内核 / 上传页与安装页零外链 | 52 |
@@ -176,6 +176,7 @@ tools/
 | 时长解析错 | 个别 MP4 报短 | 无解，观察项 |
 | screencap 截不到视频层 | 只截应用 UI | 配合 GetPositionInfo 判真实播放 |
 | 蓝屏（视频层无内容） | MTK 硬件输出蓝色 | 空闲时藏 SurfaceView；退后台延迟 2.5s |
+| release→prepare 异步竞态 | 厂商 reset 是异步的（reset_nosync），mReseted 跨实例共享：旧实例 teardown 砸中新实例 prepareAsync →「already reset」空操作 → 投视频先蓝屏 30s | releasePlayer 不再 reset()（守卫钉着）；prepare 卡死阈值 30s→10s 作安全网；准备窗口 MODE_VIDEO_PENDING 藏层+占位。见 `.agent/video-bluescreen-plan.md` |
 | macOS zsh 无 setsid | 后台服务起不来 | 用受管后台任务（run_in_background） |
 | Mac 全局代理 | 局域网 curl 被 58199 拦 | curl 加 --noproxy '*' |
 
@@ -256,10 +257,16 @@ adb -s 192.168.1.8:5555 logcat -v time > /tmp/tv_session.log 2>&1
 
 ## 7. 当前状态指针
 
-- 版本 0.2.2（versionCode 17）—— 批 3.7「修换歌闪面板 + 封面改流式落盘」为**小更新**
-  （修 bug，末位 +1），版本从 0.2.1 → 0.2.2。上一次 0.2.1（versionCode 16）是批 3.6
-  「音乐投屏界面优化（歌名放大 + 封面 + 歌词）」的小更新（0.2.0 → 0.2.1）；再上一次
-  0.2.0（versionCode 15）是批 3.5 的中等更新。历史版本已全部推送 GitHub（main）。
+- 版本 0.2.3（versionCode 18）—— 批 3.8「补形态 / Surface / prepare 诊断日志」为**小更新**
+  （修 bug 前的取证步，末位 +1），版本从 0.2.2 → 0.2.3。上一次 0.2.2（versionCode 17）是
+  批 3.7「修换歌闪面板 + 封面改流式落盘」的小更新（0.2.1 → 0.2.2）；再上一次 0.2.1
+  （versionCode 16）是批 3.6 的小更新、0.2.0（versionCode 15）是批 3.5 的中等更新。
+  历史版本已全部推送 GitHub（main）。
+- **进行中：视频「先蓝屏约 30 秒」修复**（`.agent/video-bluescreen-plan.md`）。当前只落了
+  **第 1 步 = 诊断日志**（批 3.8，零行为改动）：形态变化 / SurfaceView 显隐 + Surface
+  生命周期 / `prepare 开始（带 surface=?）`·`结束（带耗时）`。**下一步靠真机日志分流根因**：
+  `prepare 开始: surface=false` → 坐实「prepare 早于 Surface」（走 §3.1 闸门）；
+  `=true` → 转向 release/reset 竞态（§2.3）。治本闸门 + 治标占位层**尚未实现**。
 - **发版规则（用户定的，每次打包都要遵守）**：改 `app/build.gradle` 的
   `versionName`，界面「版本」那一行读的就是它（不写死字面量）。
   **小更新**（修 bug、小改进）→ 改最后一位（0.1.12 → 0.1.13）；

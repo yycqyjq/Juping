@@ -150,9 +150,23 @@ public final class PlaybackPolicy {
      * <p>海信 CmpbPlayer 实测：连续切歌后媒体服务可能卡死 —— 手机 Set+Play
      * 照发，电视端 prepare 永不完成（手机卡在加载、Stop 也没反应）。
      * 重建播放器会拿到全新的 CmpbPlayer 实例，多数情况能自救。
-     * 30 秒 = 正常 prepare（1-2 秒）的 15 倍余量，不误伤慢网络。
+     *
+     * <p><b>10 秒（原 30 秒）</b>：真机 A/B 日志确认「换片必卡满 30 秒再出画面」的
+     * 根因是旧实例 teardown 与新实例 prepare 的异步竞态（修复见
+     * `.agent/video-bluescreen-plan.md`，releasePlayer 已不再 reset()）。这个阈值
+     * 降级为纯安全网：万一仍中招，用户最多等 10 秒而不是 30 秒。
+     * 10 秒 = 正常 prepare（1-2 秒）的 5-10 倍余量；不建议再往下调 ——
+     * 窗口太窄会把大 HLS 首片 / 慢 CDN 的真慢 prepare 误杀成卡死。
      */
-    public static final long PREPARE_STUCK_REBUILD_MS = 30000L;
+    public static final long PREPARE_STUCK_REBUILD_MS = 10000L;
+
+    /**
+     * 换片时「旧实例 teardown → 新实例 prepare」之间的沉降等待（F3 备用，
+     * <b>当前未接线</b>）。真机实测厂商 reset_nosync 落在 ≈470ms，取 500ms 留余量。
+     * 是否启用取决于真机验收：F1 去掉 reset() 后若 `already reset` 仍出现，
+     * 再把它接进 startInternal（换片时 postDelayed，冷投零延迟）。
+     */
+    public static final long SWITCH_SETTLE_MS = 500L;
 
     /** prepare 卡死后最多重建几次；用完如实报 ERROR（提示重启电视） */
     public static final int PREPARE_STUCK_MAX_REBUILDS = 2;
