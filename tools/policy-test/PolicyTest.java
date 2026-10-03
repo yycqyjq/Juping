@@ -1,8 +1,21 @@
+import com.juping.cast.dlna.DlnaDescription;
 import com.juping.cast.player.Mp4Aspect;
 import com.juping.cast.player.PlaybackPolicy;
 import com.juping.cast.player.RenderState;
 
+import java.io.StringReader;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
+import java.util.TreeSet;
+
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
+import org.xml.sax.InputSource;
 
 /**
  * 播放重连策略的一致性测试。
@@ -678,6 +691,242 @@ public class PolicyTest {
                 "拿 duration==0 当判据的话，正常播放的直播会被永远判成准备中，"
                 + "占位层再也撤不掉（铁律：判据必须会终结）");
 
+        System.out.println("\n── 17. device.xml 与三份 SCPD 的真实结构（用 XML 解析器读，不是正则看字符串）──");
+        System.out.println("   这一节是 C 重构（2026-10-03）的直接收益：描述模板从 UpnpHttpServer");
+        System.out.println("   摘进 DlnaDescription 之后**零 Android 依赖**，于是桌面第一次能把它真的");
+        System.out.println("   解析一遍。在那之前只能拿正则看「某个字符串在不在源码里」——");
+        System.out.println("   那种守卫连「XML 是坏的」都看不出来。");
+        System.out.println("   要盯的红线只有一条：**声明了就要给得出，给不出就别声明**。");
+        System.out.println("   与协议闸门的分工：drive.py 也校验 device.xml / SCPD，但那是**走真实 HTTP");
+        System.out.println("   取回来的字节**（路由、响应头、charset 全在链路上）；这一节校验的是");
+        System.out.println("   **生成器本身** —— 不建包、不起 socket 就能跑，而且能覆盖链路上看不见的");
+        System.out.println("   东西（dataType 白名单、sendEvents 取值、knownActions 返回的是不是副本）。");
+        System.out.println("   两层不是重复：一层问「服务出来的对不对」，一层问「拼出来的对不对」。");
+
+        String[] svc = DlnaDescription.SERVICES;
+        Document[] docs = new Document[svc.length];
+        for (int i = 0; i < svc.length; i++) {
+            String xml = DlnaDescription.scpdFor(svc[i]);
+            check("SCPD[" + svc[i] + "] 给得出（SERVICES 里声明了，scpdFor 就必须兑现）",
+                    xml != null,
+                    "scpdFor(\"" + svc[i] + "\") 返回 null —— 控制点 GET 这个 SCPDURL 会拿到 404，"
+                            + "整个服务被判不可用");
+            docs[i] = xml == null ? null : parseXml(xml);
+            check("SCPD[" + svc[i] + "] 是合法 XML（标准解析器读得出）", docs[i] != null,
+                    "解析失败：" + XML_ERR);
+        }
+
+        for (int i = 0; i < svc.length; i++) {
+            if (docs[i] == null) {
+                continue;
+            }
+            Element root = docs[i].getDocumentElement();
+            check("SCPD[" + svc[i] + "] 根元素是 <scpd>，命名空间是 service-1-0",
+                    "scpd".equals(root.getNodeName())
+                            && "urn:schemas-upnp-org:service-1-0".equals(root.getNamespaceURI()),
+                    "得到 <" + root.getNodeName() + "> ns=" + root.getNamespaceURI());
+            check("SCPD[" + svc[i] + "] 的 specVersion 是 1.0",
+                    "1".equals(textOf(docs[i], "major")) && "0".equals(textOf(docs[i], "minor")),
+                    "major=" + textOf(docs[i], "major") + " minor=" + textOf(docs[i], "minor"));
+        }
+
+        // 最关键的一条：三份 SCPD 声明的 action 并集，必须与 action 白名单**集合相等**。
+        // 少一个 → 声明了却回 401（控制点认为设备撒谎）；
+        // 多一个 → 白名单里有、SCPD 里没有，控制点根本不会发，那段代码是死的。
+        TreeSet<String> declared = new TreeSet<String>();
+        int declaredCount = 0;
+        for (int i = 0; i < svc.length; i++) {
+            if (docs[i] == null) {
+                continue;
+            }
+            NodeList as = docs[i].getElementsByTagName("action");
+            for (int k = 0; k < as.getLength(); k++) {
+                declared.add(textOfChild((Element) as.item(k), "name"));
+                declaredCount++;
+            }
+        }
+        TreeSet<String> known = new TreeSet<String>(Arrays.asList(DlnaDescription.knownActions()));
+        check("SCPD 声明的 action 并集 == 白名单集合（声明了就要给得出，给不出就别声明）",
+                declared.equals(known), diff(declared, known));
+        check("同一个 action 不在两份 SCPD 里重复声明（并集大小 == 声明总数）",
+                declared.size() == declaredCount,
+                "并集 " + declared.size() + " 条 / 实际声明 " + declaredCount + " 条");
+
+        // 每个 relatedStateVariable 都要指向**本 SCPD 里真实存在**的 stateVariable。
+        // 历史 bug 正在这里：InstanceID 与 A_ARG_TYPE_InstanceID 一字之差，
+        // 宽松的控制点照用，严格的控制点（Cling / jUPnP 系）整份 SCPD 解析失败。
+        StringBuilder dangling = new StringBuilder();
+        for (int i = 0; i < svc.length; i++) {
+            if (docs[i] == null) {
+                continue;
+            }
+            TreeSet<String> vars = new TreeSet<String>();
+            NodeList vs = docs[i].getElementsByTagName("stateVariable");
+            for (int k = 0; k < vs.getLength(); k++) {
+                vars.add(textOfChild((Element) vs.item(k), "name"));
+            }
+            NodeList rel = docs[i].getElementsByTagName("relatedStateVariable");
+            for (int k = 0; k < rel.getLength(); k++) {
+                String v = rel.item(k).getTextContent().trim();
+                if (!vars.contains(v)) {
+                    dangling.append(svc[i]).append('/').append(v).append(' ');
+                }
+            }
+        }
+        check("每个 relatedStateVariable 都指向本 SCPD 里真实存在的 stateVariable",
+                dangling.length() == 0,
+                "悬空引用：" + dangling + "—— 严格的控制点会整份解析失败，设备在列表里变灰");
+
+        TreeSet<String> types = new TreeSet<String>();
+        StringBuilder badEvents = new StringBuilder();
+        for (int i = 0; i < svc.length; i++) {
+            if (docs[i] == null) {
+                continue;
+            }
+            NodeList ds = docs[i].getElementsByTagName("dataType");
+            for (int k = 0; k < ds.getLength(); k++) {
+                types.add(ds.item(k).getTextContent().trim());
+            }
+            NodeList vs = docs[i].getElementsByTagName("stateVariable");
+            for (int k = 0; k < vs.getLength(); k++) {
+                Element v = (Element) vs.item(k);
+                String se = v.getAttribute("sendEvents");
+                if (!"yes".equals(se) && !"no".equals(se)) {
+                    badEvents.append(svc[i]).append('/').append(textOfChild(v, "name"))
+                            .append('=').append(se).append(' ');
+                }
+            }
+        }
+        TreeSet<String> allowedTypes = new TreeSet<String>(Arrays.asList(
+                "string", "boolean", "i1", "i2", "i4", "int", "ui1", "ui2", "ui4", "uint",
+                "r4", "r8", "number", "fixed.14.4", "float", "char",
+                "date", "dateTime", "dateTime.tz", "time", "time.tz", "uri", "uuid",
+                "bin.base64", "bin.hex"));
+        TreeSet<String> strayTypes = new TreeSet<String>(types);
+        strayTypes.removeAll(allowedTypes);
+        check("所有 dataType 都在 UPnP 允许的类型表里", strayTypes.isEmpty(),
+                "越界类型：" + strayTypes + "（表外的类型控制点无法解析，同样整份失败）");
+        check("每个 stateVariable 的 sendEvents 只能是 yes / no", badEvents.length() == 0,
+                "异常：" + badEvents);
+
+        // 事件化的那三个变量必须是 yes —— 控制点靠订阅它们同步音量滑杆与静音键。
+        Document rcDoc = docs[indexOf(svc, "RenderingControl")];
+        if (rcDoc != null) {
+            check("RenderingControl 的 Volume / Mute 声明为可事件化（sendEvents=yes）",
+                    "yes".equals(eventsOf(rcDoc, "Volume"))
+                            && "yes".equals(eventsOf(rcDoc, "Mute")),
+                    "Volume=" + eventsOf(rcDoc, "Volume") + " Mute=" + eventsOf(rcDoc, "Mute")
+                            + " —— 不是 yes 的话，控制点订阅后收不到音量变化");
+        }
+
+        // ---------------------------------------------------------- device.xml
+        String uuid = "11111111-2222-3333-4444-555555555555";
+        Document dd = parseXml(DlnaDescription.deviceDescription(
+                uuid, "客厅盒子", "0.2.12", 50007, "192.168.1.7",
+                new byte[]{1, 2, 3}, 96, 96));
+        check("device.xml 是合法 XML（带图标的那条路径）", dd != null, "解析失败：" + XML_ERR);
+
+        if (dd != null) {
+            Element dev = (Element) dd.getElementsByTagName("device").item(0);
+            List<String> got = childNames(dev);
+            List<String> want = Arrays.asList(
+                    "deviceType", "friendlyName", "manufacturer", "manufacturerURL",
+                    "modelDescription", "modelName", "modelNumber", "modelURL",
+                    "serialNumber", "UDN", "iconList", "serviceList", "presentationURL",
+                    "dlna:X_DLNADOC");
+            check("<device> 子元素顺序符合 device-1-0 schema", got.equals(want),
+                    "得到   " + got + "\n      期望   " + want
+                            + "\n      顺序错的控制点整份解析失败 —— 不是「少读一个字段」");
+
+            check("device.xml 的 deviceType 与 SSDP 应答用的是同一个常量",
+                    DlnaDescription.DEVICE_TYPE.equals(textOf(dd, "deviceType")),
+                    "deviceType=" + textOf(dd, "deviceType") + " —— 与 SSDP 的 ST/USN 不一致时，"
+                            + "控制点搜得到却认为「这不是我要的渲染器」，表现为投不进去");
+            check("dlna:X_DLNADOC 声明为 DMR-1.50",
+                    "DMR-1.50".equals(textOf(dd, "dlna:X_DLNADOC")),
+                    "得到 " + textOf(dd, "dlna:X_DLNADOC"));
+
+            NodeList icons = dd.getElementsByTagName("icon");
+            check("有图标字节时 iconList 里恰好一个 <icon>，且子元素顺序 mimetype→width→height→depth→url",
+                    icons.getLength() == 1
+                            && childNames((Element) icons.item(0)).equals(Arrays.asList(
+                                    "mimetype", "width", "height", "depth", "url")),
+                    "图标数=" + icons.getLength() + " 子元素="
+                            + (icons.getLength() == 1 ? childNames((Element) icons.item(0)) : "-"));
+
+            // presentationURL 必须用**传进来的**端口与地址。
+            // 端口有 fallback（49152 被厂家自带的 DLNA 栈占了就往上移），
+            // 写死首选端口的话这个按钮会把浏览器指到一个没人监听的端口上。
+            check("presentationURL 用的是传进来的 IP 与端口（不是写死的）",
+                    "http://192.168.1.7:50007/".equals(textOf(dd, "presentationURL")),
+                    "得到 " + textOf(dd, "presentationURL") + "（传入的是 192.168.1.7:50007）");
+
+            NodeList svcs = dd.getElementsByTagName("service");
+            check("device.xml 的 <service> 条目数 == SERVICES.length",
+                    svcs.getLength() == DlnaDescription.SERVICES.length,
+                    "条目 " + svcs.getLength() + " / SERVICES " + DlnaDescription.SERVICES.length);
+            StringBuilder mismatch = new StringBuilder();
+            StringBuilder unfilled = new StringBuilder();
+            for (int i = 0; i < svcs.getLength(); i++) {
+                Element se = (Element) svcs.item(i);
+                String type = textOfChild(se, "serviceType");
+                if (!("urn:schemas-upnp-org:service:" + svc[i] + ":1").equals(type)) {
+                    mismatch.append(i).append(':').append(type).append(' ');
+                }
+                // 「声明了就要给得出」的**跨层**版本：device.xml 里写的 SCPDURL，
+                // scpdFor 必须真的兑现。改一处漏一处就是「设备是灰的」。
+                String url = textOfChild(se, "SCPDURL");
+                String shortName = url == null ? ""
+                        : url.replace("/upnp/", "").replace(".xml", "");
+                if (!DlnaDescription.isKnownService(shortName)
+                        || DlnaDescription.scpdFor(shortName) == null) {
+                    unfilled.append(url).append(' ');
+                }
+            }
+            check("device.xml 第 i 个 serviceType 与 SERVICES[i] 一一对应（顺序即声明）",
+                    mismatch.length() == 0, "错位：" + mismatch);
+            check("device.xml 里每个 SCPDURL 都能被 scpdFor 兑现（GET 不会 404）",
+                    unfilled.length() == 0, "兑现不了：" + unfilled);
+        }
+
+        // 拿不到可用地址时不声明 presentationURL —— 声明了控制点就会真去打开
+        // http://0.0.0.0/ ，那比没有按钮糟。
+        Document dd0 = parseXml(DlnaDescription.deviceDescription(
+                "u-0", "盒子", "1", 50007, "0.0.0.0", null, 0, 0));
+        check("地址不可用（0.0.0.0）时不声明 presentationURL",
+                dd0 != null && dd0.getElementsByTagName("presentationURL").getLength() == 0,
+                "声明了控制点会真的去打开 http://0.0.0.0/ —— 一个点开是错的按钮比没有按钮糟");
+        check("没有图标字节时不写 iconList",
+                dd0 != null && dd0.getElementsByTagName("iconList").getLength() == 0,
+                "iconList 存在但拿不到图标，控制点会显示一个破图");
+
+        // 转义往返：解析出来的文本必须与传入的原值逐字相等。
+        String tricky = "客厅 & 卧室 <A> \"引号\" '单引号'";
+        Document ddEsc = parseXml(DlnaDescription.deviceDescription(
+                "u-esc", tricky, "1.0&2", 50007, "10.0.0.1", null, 0, 0));
+        check("friendlyName / modelNumber 里的 & < > \" ' 被转义（解析后文本与原值相等）",
+                ddEsc != null && tricky.equals(textOf(ddEsc, "friendlyName"))
+                        && "1.0&2".equals(textOf(ddEsc, "modelNumber")),
+                "一个 & 就能让整份描述变成非法 XML —— 控制点不是「少读一个字段」"
+                        + "而是整条报文解析失败" + (ddEsc == null ? "（本次直接解析失败：" + XML_ERR + "）" : ""));
+        // 反向验证：证明上面那条不是恒真 —— 解析器真的会拒绝未转义的 &。
+        check("反向验证：未转义的 & 确实让解析器报错（证明上一条测的是真东西）",
+                parseXml("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<root><a>x&y</a></root>") == null,
+                "如果这个也能解析成功，说明解析器太宽松，上一条守卫等于没测");
+
+        // 白名单自身的两条不变量。
+        check("未知服务名：isKnownService=false 且 scpdFor=null（调用方据此回 404）",
+                !DlnaDescription.isKnownService("Bogus")
+                        && DlnaDescription.scpdFor("Bogus") == null,
+                "不校验的话控制点拼错服务名也能拿到 SID，然后永远收不到事件");
+        String[] copy = DlnaDescription.knownActions();
+        String firstAction = copy[0];
+        copy[0] = "Tampered";
+        check("knownActions() 返回副本（改它改不到生产用的白名单）",
+                DlnaDescription.isKnownAction(firstAction)
+                        && !DlnaDescription.isKnownAction("Tampered"),
+                "返回数组本身的话，断言代码能悄悄改掉生产用的白名单");
+
         System.out.println();
         System.out.println("=".repeat(62));
         System.out.println("播放策略：" + passed + " / " + total + " 通过");
@@ -1044,6 +1293,126 @@ public class PolicyTest {
     /** 只给失败信息用的可读格式。 */
     static String fmt(int[] size) {
         return size == null ? "null" : "{" + size[0] + "," + size[1] + "}";
+    }
+
+    // ------------------------------------------------- 第 17 节的 XML 辅助
+    //
+    // 为什么不用正则：正则只能回答「某个字符串在不在」。而 device.xml / SCPD
+    // 出问题的形态是**结构性的** —— 子元素顺序错、relatedStateVariable 悬空、
+    // 属性值不合法。这些在正则眼里全都"字符串都在啊"，只有真正的解析器
+    // 会当场拒绝。用解析器还顺带证明了「生成出来的确实是合法 XML」。
+
+    /** 最近一次解析失败的原因；断言详情直接引用它。 */
+    static String XML_ERR = "";
+
+    /**
+     * 用标准解析器读一段 XML。失败返回 {@code null} 并把原因写进 {@link #XML_ERR}。
+     *
+     * <p>显式关掉 DOCTYPE 与外部实体：这些 XML 全部由本项目自己生成，
+     * 一个 DOCTYPE 都不该有 —— 顺手把 XXE 那类问题挡在门外。
+     */
+    static Document parseXml(String xml) {
+        XML_ERR = "";
+        try {
+            DocumentBuilderFactory f = DocumentBuilderFactory.newInstance();
+            f.setNamespaceAware(true);
+            try {
+                f.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+            } catch (Exception ignore) {
+                // 换实现时这个 feature 名可能不认识 —— 不影响主流程。
+            }
+            try {
+                f.setFeature("http://xml.org/sax/features/external-general-entities", false);
+                f.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+            } catch (Exception ignore) {
+            }
+            DocumentBuilder b = f.newDocumentBuilder();
+            // 默认的 ErrorHandler 会把 [Fatal Error] 直接打到 stderr —— 而第 17 节
+            // 有一条**故意**喂坏 XML 的反向验证，那行噪声会夹在断言输出里让人以为出错了。
+            // 换成自己的处理器：warning/error 不吭声，fatalError 照抛（失败照样传上来）。
+            b.setErrorHandler(new org.xml.sax.ErrorHandler() {
+                public void warning(org.xml.sax.SAXParseException e) {
+                }
+
+                public void error(org.xml.sax.SAXParseException e) {
+                }
+
+                public void fatalError(org.xml.sax.SAXParseException e)
+                        throws org.xml.sax.SAXException {
+                    throw e;
+                }
+            });
+            return b.parse(new InputSource(new StringReader(xml)));
+        } catch (Exception e) {
+            XML_ERR = e.getClass().getSimpleName() + ": " + e.getMessage();
+            return null;
+        }
+    }
+
+    /** 第一个同名元素的文本（去空白）；没有则返回 null。 */
+    static String textOf(Document d, String tag) {
+        NodeList nl = d.getElementsByTagName(tag);
+        if (nl.getLength() == 0) {
+            return null;
+        }
+        return nl.item(0).getTextContent().trim();
+    }
+
+    /** 某个元素的**直接子元素**里第一个同名元素的文本；没有则返回 null。 */
+    static String textOfChild(Element e, String tag) {
+        NodeList kids = e.getChildNodes();
+        for (int i = 0; i < kids.getLength(); i++) {
+            Node n = kids.item(i);
+            if (n.getNodeType() == Node.ELEMENT_NODE && tag.equals(n.getNodeName())) {
+                return n.getTextContent().trim();
+            }
+        }
+        return null;
+    }
+
+    /** 直接子元素的名字，按出现顺序 —— 用来核对 schema 定死的顺序。 */
+    static List<String> childNames(Element e) {
+        List<String> out = new ArrayList<String>();
+        NodeList kids = e.getChildNodes();
+        for (int i = 0; i < kids.getLength(); i++) {
+            Node n = kids.item(i);
+            if (n.getNodeType() == Node.ELEMENT_NODE) {
+                out.add(n.getNodeName());
+            }
+        }
+        return out;
+    }
+
+    /** 某个 stateVariable 的 sendEvents 值；找不到则返回 null。 */
+    static String eventsOf(Document d, String varName) {
+        NodeList vs = d.getElementsByTagName("stateVariable");
+        for (int i = 0; i < vs.getLength(); i++) {
+            Element v = (Element) vs.item(i);
+            if (varName.equals(textOfChild(v, "name"))) {
+                return v.getAttribute("sendEvents");
+            }
+        }
+        return null;
+    }
+
+    /** 服务名在 {@link DlnaDescription#SERVICES} 里的下标；找不到返回 -1。 */
+    static int indexOf(String[] arr, String name) {
+        for (int i = 0; i < arr.length; i++) {
+            if (arr[i].equals(name)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** 两个集合的差异，给断言详情用。 */
+    static String diff(TreeSet<String> a, TreeSet<String> b) {
+        TreeSet<String> onlyA = new TreeSet<String>(a);
+        onlyA.removeAll(b);
+        TreeSet<String> onlyB = new TreeSet<String>(b);
+        onlyB.removeAll(a);
+        return "SCPD 声明了、白名单里没有（控制点会发，我们却回 401 —— 声明了却做不到）：" + onlyA
+                + "\n      白名单里有、SCPD 没声明（控制点根本不会发，那段代码是死的）：" + onlyB;
     }
 
     /**

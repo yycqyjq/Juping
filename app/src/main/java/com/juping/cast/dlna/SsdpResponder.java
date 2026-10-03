@@ -92,9 +92,6 @@ public class SsdpResponder extends Thread {
     private static final String SSDP_ADDR = "239.255.255.250";
     private static final int SSDP_PORT = 1900;
 
-    /** MediaRenderer 是所有 DLNA 控制点都会查找的标准设备类型 */
-    public static final String DEVICE_TYPE = "urn:schemas-upnp-org:device:MediaRenderer:1";
-
     /** 对外暴露的三个服务类型，SSDP 应答与设备描述必须一致 */
     public static final String[] SERVICE_TYPES = {
             "urn:schemas-upnp-org:service:AVTransport:1",
@@ -812,9 +809,9 @@ public class SsdpResponder extends Thread {
         if (st == null || st.length() == 0) {
             // 极少数控制点不写 ST 头。兜底：按老办法在全文里扫一遍，
             // 只要能看出它在找我们这类设备，就回一条设备类型的应答。
-            if (msg.contains("ssdp:all") || msg.contains(DEVICE_TYPE)
+            if (msg.contains("ssdp:all") || msg.contains(DlnaDescription.DEVICE_TYPE)
                     || msg.contains("urn:schemas-upnp-org:service:")) {
-                out.add(DEVICE_TYPE);
+                out.add(DlnaDescription.DEVICE_TYPE);
             }
             return out;
         }
@@ -823,7 +820,7 @@ public class SsdpResponder extends Thread {
             // 规范要求：对每个搜索目标各回一条，控制点靠 ST 区分它们。
             out.add("upnp:rootdevice");
             out.add("uuid:" + uuid);
-            out.add(DEVICE_TYPE);
+            out.add(DlnaDescription.DEVICE_TYPE);
             for (int i = 0; i < SERVICE_TYPES.length; i++) {
                 out.add(SERVICE_TYPES[i]);
             }
@@ -844,7 +841,7 @@ public class SsdpResponder extends Thread {
         if (("uuid:" + uuid).equalsIgnoreCase(st)) {
             return true;
         }
-        if (DEVICE_TYPE.equals(st)) {
+        if (DlnaDescription.DEVICE_TYPE.equals(st)) {
             return true;
         }
         for (int i = 0; i < SERVICE_TYPES.length; i++) {
@@ -961,7 +958,7 @@ public class SsdpResponder extends Thread {
         List<String> out = new ArrayList<String>();
         out.add("upnp:rootdevice");
         out.add("uuid:" + uuid);
-        out.add(DEVICE_TYPE);
+        out.add(DlnaDescription.DEVICE_TYPE);
         for (int i = 0; i < SERVICE_TYPES.length; i++) {
             out.add(SERVICE_TYPES[i]);
         }

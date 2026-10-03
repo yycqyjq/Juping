@@ -42,6 +42,8 @@ CTRL="app/src/main/java/com/juping/cast/player/MediaPlayerController.java"
 ASPECT="app/src/main/java/com/juping/cast/player/Mp4Aspect.java"
 PROBE="app/src/main/java/com/juping/cast/player/VideoAspectProbe.java"
 HTTP="app/src/main/java/com/juping/cast/dlna/UpnpHttpServer.java"
+# 设备描述 / SCPD 模板（2026-10-03 从 UpnpHttpServer 摘出，零 Android 依赖）
+DESC="app/src/main/java/com/juping/cast/dlna/DlnaDescription.java"
 ED="app/src/main/java/com/juping/cast/dlna/EventDispatcher.java"
 SVC="app/src/main/java/com/juping/cast/DlnaRendererService.java"
 ACT="app/src/main/java/com/juping/cast/MainActivity.java"
@@ -53,7 +55,7 @@ QR="app/src/main/java/com/juping/cast/QrRenderer.java"
 # ── 1. 编译（不需要 android.jar —— PlaybackPolicy 零 Android 依赖）──
 echo "── 编译播放策略（桌面 JVM，零 Android 依赖）──"
 if ! "$JAVAC" -nowarn -encoding UTF-8 -d "$OUT" \
-        "$POLICY" "$RSTATE" "$ASPECT" "$HERE/PolicyTest.java" 2>"$OUT/javac.err"; then
+        "$POLICY" "$RSTATE" "$ASPECT" "$DESC" "$HERE/PolicyTest.java" 2>"$OUT/javac.err"; then
     echo "编译失败：" >&2
     cat "$OUT/javac.err" >&2
     exit 2
@@ -1088,13 +1090,14 @@ PY
 #           手机轮询 GetPositionInfo 拿到旧位置，进度条被拉回去；
 #       (c) seek 未落地时位置本来就不动，看门狗会把它判成"卡死"并触发重连 ——
 #           而重连会把播放拉回开头。
-python3 - "$CTRL" "$HTTP" "$POLICY" "$SVC" <<'PY' || RC=1
+python3 - "$CTRL" "$HTTP" "$POLICY" "$SVC" "$DESC" <<'PY' || RC=1
 import re, sys, pathlib
-ctrl_path, http_path, policy_path, svc_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+ctrl_path, http_path, policy_path, svc_path, desc_path = sys.argv[1:6]
 ctrl = pathlib.Path(ctrl_path).read_text(encoding='utf-8')
 http = pathlib.Path(http_path).read_text(encoding='utf-8')
 pol_src = pathlib.Path(policy_path).read_text(encoding='utf-8')
 svc = pathlib.Path(svc_path).read_text(encoding='utf-8')
+desc = pathlib.Path(desc_path).read_text(encoding='utf-8')
 failed = []
 
 def report(name, ok, detail=''):
@@ -1154,6 +1157,7 @@ def body_of(src, marker):
 
 ctrl = strip_comments(ctrl)
 http = strip_comments(http)
+desc = strip_comments(desc)
 
 # ---- ① 重投：Play 到达时若仍在 prepare，绝不能重建播放器 ----
 resume = body_of(ctrl, 'public synchronized void resume()')
@@ -1245,7 +1249,7 @@ report('m3u8 不走代理',
 # dispatch 分支和 SCPD 声明里也出现，只查整个文件的话，从数组里删掉它
 # 守卫照样绿（破坏性证伪实测：删数组元素 → 红 0 条）。body_of 从数组声明处
 # 按大括号配对抠出初始化体，正好只覆盖那一段。
-ka = body_of(http, 'private static final String[] KNOWN_ACTIONS =')
+ka = body_of(desc, 'private static final String[] KNOWN_ACTIONS =')
 report('KNOWN_ACTIONS 数组已找到', ka is not None,
        '锚点：private static final String[] KNOWN_ACTIONS =')
 report('SetNextAVTransportURI 已在 KNOWN_ACTIONS（SCPD 同步）',
@@ -1609,9 +1613,9 @@ PY
 #     组播绑的是哪张网卡、LOCATION 里写哪个 IP，原来是两次独立选择 ——
 #     第一张候选网卡 joinGroup 失败时会分叉。现在 LOCATION 由实际绑定的
 #     那张网卡算出，两条链路不可能再不一致。
-python3 - "$CTRL" "$SVC" "$ACT" "$LAYOUT" "$HTTP" "$POLICY" "$ED" <<'PY' || RC=1
+python3 - "$CTRL" "$SVC" "$ACT" "$LAYOUT" "$HTTP" "$POLICY" "$ED" "$DESC" <<'PY' || RC=1
 import re, sys, pathlib
-ctrl_path, svc_path, act_path, layout_path, http_path, policy_path, ed_path = sys.argv[1:8]
+ctrl_path, svc_path, act_path, layout_path, http_path, policy_path, ed_path, desc_path = sys.argv[1:9]
 ctrl = pathlib.Path(ctrl_path).read_text(encoding='utf-8')
 svc = pathlib.Path(svc_path).read_text(encoding='utf-8')
 act = pathlib.Path(act_path).read_text(encoding='utf-8')
@@ -1619,6 +1623,7 @@ layout = pathlib.Path(layout_path).read_text(encoding='utf-8')
 http = pathlib.Path(http_path).read_text(encoding='utf-8')
 policy = pathlib.Path(policy_path).read_text(encoding='utf-8')
 ed = pathlib.Path(ed_path).read_text(encoding='utf-8')
+desc = pathlib.Path(desc_path).read_text(encoding='utf-8')
 ssdp = pathlib.Path('app/src/main/java/com/juping/cast/dlna/SsdpResponder.java'
                     ).read_text(encoding='utf-8')
 failed = []
@@ -1734,6 +1739,7 @@ ctrl_c = strip_comments(ctrl)
 svc_c = strip_comments(svc)
 act_c = strip_comments(act)
 http_c = strip_comments(http)
+desc_c = strip_comments(desc)
 ed_c = strip_comments(ed)
 
 # ---- ① 网易云搜不到：必须有**主动**广播，而不只是应答 ----
@@ -2083,10 +2089,11 @@ if ev:
     # hasTransportError 判据」两条共同覆盖。
 
 # SCPD 的声明形态（只事件化 LastChange）、事件文档的命名空间 / InstanceID /
-# 双层转义，都由协议测试**行为级**覆盖 —— SCPD 与 avtLastChange 都在
-# UpnpHttpServer 里，协议靶机编的就是这份源码。这里**刻意不重复**同一语义：
-# 两处各写一条，破坏一处会红两条，反而定位不出到底哪儿坏了。
-scpd = re.search(r'SCPD_AV_TRANSPORT =[\s\S]*?</scpd>', http_c)
+# 双层转义，都由协议测试**行为级**覆盖 —— 协议靶机编的就是这份源码
+# （SCPD 2026-10-03 起在 DlnaDescription，协议测试的编译清单已跟上）。
+# 这里**刻意不重复**同一语义：两处各写一条，破坏一处会红两条，
+# 反而定位不出到底哪儿坏了。
+scpd = re.search(r'SCPD_AV_TRANSPORT =[\s\S]*?</scpd>', desc_c)
 report('SCPD_AV_TRANSPORT 找得到', scpd is not None, '锚点：SCPD_AV_TRANSPORT =')
 
 lc = body_of(http_c, 'public static String avtLastChange(')
@@ -2359,13 +2366,14 @@ PY
 #   · 播放器音量绕过 applyVolume 单独下发 → 设了静音、改一下音量又有声音了
 echo
 echo "── 11. 照成熟 DMR 补齐的源码级不变量 ──"
-python3 - "$HTTP" "$CTRL" "$SVC" <<'PY' || RC=1
+python3 - "$HTTP" "$CTRL" "$SVC" "$DESC" <<'PY' || RC=1
 import re, sys, pathlib
 
-http_path, ctrl_path, svc_path = sys.argv[1], sys.argv[2], sys.argv[3]
+http_path, ctrl_path, svc_path, desc_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 http = pathlib.Path(http_path).read_text(encoding='utf-8')
 ctrl = pathlib.Path(ctrl_path).read_text(encoding='utf-8')
 svc = pathlib.Path(svc_path).read_text(encoding='utf-8')
+desc = pathlib.Path(desc_path).read_text(encoding='utf-8')
 ssdp = pathlib.Path('app/src/main/java/com/juping/cast/dlna/SsdpResponder.java'
                     ).read_text(encoding='utf-8')
 def strip_comments(src):
@@ -2476,6 +2484,7 @@ http = strip_comments(http)
 ctrl = strip_comments(ctrl)
 svc = strip_comments(svc)
 ssdp = strip_comments(ssdp)
+desc = strip_comments(desc)
 failed = []
 
 
@@ -2557,13 +2566,16 @@ def positive_if_else(src, cond):
 
 
 # ---- (1) 设备描述：DLNA 类别标记 ----
-bd = body_of(http, 'private String buildDeviceDescription()')
-report('buildDeviceDescription 方法体已找到', bd is not None,
-       '锚点：private String buildDeviceDescription()')
+# 设备描述 2026-10-03 搬进 DlnaDescription（纯 Java，零 Android 依赖）——
+# 锚点跟着搬。搬家的收益不在这条守卫，而在 PolicyTest 新增的那一节：
+# 描述现在**能编译**，于是可以用真正的 XML 解析器校验结构，而不只是"看字符串在不在"。
+bd = body_of(desc, 'public static String deviceDescription(')
+report('deviceDescription 方法体已找到', bd is not None,
+       '锚点：public static String deviceDescription(')
 if bd:
     report('设备描述里有 dlna:X_DLNADOC 且值为 DMR-1.50',
            'X_DLNADOC' in bd
-           and re.search(r'DLNA_DOC\s*=\s*"DMR-1\.50"', http) is not None,
+           and re.search(r'DLNA_DOC\s*=\s*"DMR-1\.50"', desc) is not None,
            '判据要看**实际拼进 XML 的那个值**：值在 DLNA_DOC 常量里、'
            '元素在方法体里，两边都要查（只查方法体会假阴性 —— '
            '这条守卫第一版就是这么写错的，拿真源码一试才发现）。\n'
@@ -2577,15 +2589,15 @@ if bd:
     # （端口单一真源）。谁自己再算一遍，就会在"第一张候选网卡 joinGroup
     # 失败、换到第二张"时分叉 —— 那时二维码里的地址能打开、
     # 控制点按钮打开的却打不开。
-    apu = body_of(http, 'private void appendPresentationUrl(StringBuilder sb)')
+    apu = body_of(desc, 'private static void appendPresentationUrl(StringBuilder sb, String localIp, int port)')
     report('appendPresentationUrl 方法体已找到', apu is not None,
-           '锚点：private void appendPresentationUrl(StringBuilder sb)')
+           '锚点：private static void appendPresentationUrl(StringBuilder sb, String localIp, int port)')
     if apu:
-        report('presentationURL 的地址取自 handler.getLocalIp()（与 LOCATION 同源）',
-               'handler.getLocalIp()' in apu,
+        report('presentationURL 的地址用的是**传进来的** localIp（不自己算）',
+               re.search(r'String\s+ip\s*=\s*localIp\s*;', apu) is not None,
                '自己算出本机地址 = 第二处真源。SSDP 换网卡时它和 LOCATION 就分叉了')
-        report('presentationURL 的端口取自 getPort()（端口单一真源）',
-               'getPort()' in apu and '49152' not in apu,
+        report('presentationURL 的端口用的是**传进来的** port（端口单一真源）',
+               re.search(r'append\(\s*port\s*\)', apu) is not None and '49152' not in apu,
                '自己拼端口号（或写死 49152）= 第二处真源。'
                'HTTP 端口会因占用而回退，写死的那份必然在回退时是错的')
         report('拿不到有效 IP 时不声明 presentationURL',
@@ -2593,15 +2605,25 @@ if bd:
                '空串 / 0.0.0.0 时若照写，device.xml 里就会出现'
                'http://0.0.0.0:49152/ 这种地址 —— 控制点照着点必然打不开。'
                '给不出就别声明（和 iconList 同一条纪律）')
-    report('buildDeviceDescription 真的调用了 appendPresentationUrl',
-           'appendPresentationUrl(sb)' in bd,
+    # 描述变成纯函数之后，「本机地址 / 端口从哪来」只剩调用点看得到 ——
+    # 不在这里补一条的话，handler.getLocalIp() 与 getPort() 这两个单一真源
+    # 就没人守了（原来靠 apu 方法体里的字面量守着，搬家后那两条必然失效）。
+    _i = http.find('DlnaDescription.deviceDescription(')
+    _dd = http[_i:_i + 320] if _i >= 0 else ''
+    report('UpnpHttpServer 把 handler.getLocalIp() 与 getPort() 传进设备描述',
+           'handler.getLocalIp()' in _dd and 'getPort()' in _dd,
+           '设备描述是纯函数之后，本机地址与端口的**唯一来源**就在这个调用点：'
+           '地址必须与 LOCATION 同源（handler.getLocalIp()），端口必须是 getPort()。'
+           '在这里自己算 = 第二处真源，换网卡 / 端口回退时必然分叉')
+    report('deviceDescription 真的调用了 appendPresentationUrl',
+           'appendPresentationUrl(sb, localIp, port)' in bd,
            '方法写好了不调用 = 白写。这条专门防"改一半"：'
            '新方法加进去、调用点忘了接')
 
 # ---- (2) 图标：声明了就必须给得出 ----
-ail = body_of(http, 'private void appendIconList(StringBuilder sb)')
+ail = body_of(desc, 'private static void appendIconList(StringBuilder sb, byte[] iconPng,')
 report('appendIconList 方法体已找到', ail is not None,
-       '锚点：private void appendIconList(StringBuilder sb)')
+       '锚点：private static void appendIconList(StringBuilder sb, byte[] iconPng,')
 if ail:
     report('没有图标时完全不声明 iconList（不留一个取不到的 URL）',
            'iconPng == null' in ail and 'return' in ail,
@@ -2631,29 +2653,42 @@ if ws:
            '图标的二进制字节就被毁掉 —— 头部走 UTF-8 没问题，body 不行')
 
 # ---- (3) SCPD 的 relatedStateVariable 不能由参数名推出来 ----
-report('SCPD 的 relatedStateVariable 不再拿参数名当变量名',
-       '.append(args[i]).append("</relatedStateVariable>")' not in http,
+# 2026-10-03 起这一整块都住在 DlnaDescription（模板从 UpnpHttpServer 摘出）。
+# 教训：锚点跟着搬家时，**不能只把 http 换成 desc 就完事** ——
+# 这两条原来是「整个文件里没有某个串」的**负向**判据，搬到新文件后不改方向
+# 就会**恒真**（那个串本来就不在新文件里，改坏了也照样绿）。
+# 所以这里一律改成对 action() 方法体的**正向**判据。
+act_body = body_of(desc, 'private static String action(String name, String... args)')
+report('action() 方法体已找到（SCPD 参数三段式的唯一生成点）', act_body is not None,
+       '锚点：private static String action(String name, String... args)')
+report('SCPD 的 relatedStateVariable 取的是第三段（不是拿参数名凑）',
+       act_body is not None
+       and '.append(p[2])' in act_body and 'append(args[i])' not in act_body,
        '参数名与变量名经常不一样（CurrentVolume → Volume、'
        'InstanceID → A_ARG_TYPE_InstanceID）。按参数名推就会生成悬空引用，'
        '严格校验 SCPD 的控制点会**整份解析失败** —— 不是少一个功能，'
-       '是这台设备在它眼里不存在')
+       '是这台设备在它眼里不存在。'
+       '（判据必须正向钉在 append(p[2]) 上：写成「文件里没有 args[i]」那种负向判据，'
+       '锚点一搬家就恒真）')
 report('SCPD 参数一律写成 方向:参数名:状态变量 三段式',
-       'p.length != 3' in http and 'IllegalArgumentException' in http,
+       act_body is not None and 'p.length != 3' in act_body
+       and 'IllegalArgumentException' in act_body,
        '少写一段会当场抛异常（而不是静默生成一份畸形 SCPD）。'
        '静态初始化失败声音很大，但好过只在部分控制点上表现为"设备是灰的"')
 # 上一条只证明"校验存在"，不证明"模板里的参数都合规"。这一条逐个调用点查：
 # 参数必须是字符串字面量、且恰好两个冒号（方向:参数名:状态变量）。
 # 少了第三个字段，action() 里那句 p[2] 就会越界 —— 而它跑在**静态初始化**里，
-# 结果是 UpnpHttpServer 类加载失败、整个服务起不来。
+# 结果是 DlnaDescription 类加载失败、UpnpHttpServer 跟着起不来、整个服务不响应。
 _bad_args = []
-for _parts in action_args(http):
+for _parts in action_args(desc):
     for _a in _parts[1:]:
         if not (_a.startswith('"') and _a.endswith('"')) or _a.count(':') != 2:
             _bad_args.append(_a)
 report('SCPD 每条 action 参数都是 方向:参数名:状态变量 三段式（逐个调用点查）',
        not _bad_args,
        '可疑参数: %s\n         （必须逐个调用点查，只查 action() 里有没有校验是不够的 ——'
-       '模板里少写一段照样会越界）' % _bad_args[:6])
+       '模板里少写一段照样会越界。锚点跟着模板走：查的是 desc，不是 http）'
+       % _bad_args[:6])
 
 # ---- (4) 静音：布尔解析与回读 ----
 pb = body_of(http, 'private static boolean parseBoolean(String s)')
