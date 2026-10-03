@@ -30,6 +30,7 @@ trap 'rm -rf "$OUT"' EXIT INT TERM
 
 if ! "$JAVA_HOME/bin/javac" -nowarn -encoding UTF-8 -d "$OUT" \
         app/src/main/java/com/juping/cast/player/PlaybackPolicy.java \
+        app/src/main/java/com/juping/cast/player/RenderState.java \
         app/src/main/java/com/juping/cast/player/MediaProxy.java \
         "$HERE/android/util/Log.java" \
         "$HERE/ProxyTest.java" 2>"$OUT/javac.err"; then

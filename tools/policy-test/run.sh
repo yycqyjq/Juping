@@ -37,6 +37,7 @@ OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT INT TERM
 
 POLICY="app/src/main/java/com/juping/cast/player/PlaybackPolicy.java"
+RSTATE="app/src/main/java/com/juping/cast/player/RenderState.java"
 CTRL="app/src/main/java/com/juping/cast/player/MediaPlayerController.java"
 ASPECT="app/src/main/java/com/juping/cast/player/Mp4Aspect.java"
 PROBE="app/src/main/java/com/juping/cast/player/VideoAspectProbe.java"
@@ -52,7 +53,7 @@ QR="app/src/main/java/com/juping/cast/QrRenderer.java"
 # ── 1. 编译（不需要 android.jar —— PlaybackPolicy 零 Android 依赖）──
 echo "── 编译播放策略（桌面 JVM，零 Android 依赖）──"
 if ! "$JAVAC" -nowarn -encoding UTF-8 -d "$OUT" \
-        "$POLICY" "$ASPECT" "$HERE/PolicyTest.java" 2>"$OUT/javac.err"; then
+        "$POLICY" "$RSTATE" "$ASPECT" "$HERE/PolicyTest.java" 2>"$OUT/javac.err"; then
     echo "编译失败：" >&2
     cat "$OUT/javac.err" >&2
     exit 2
@@ -72,7 +73,7 @@ if [ ! -f "$ANDROID_JAR" ]; then
 else
     mkdir -p "$OUT/ctrl"
     if "$JAVAC" -nowarn -encoding UTF-8 -cp "$ANDROID_JAR" -d "$OUT/ctrl" \
-            "$POLICY" "$CTRL" "$ASPECT" "$PROBE" "$MPROXY" 2>"$OUT/ctrl.err"; then
+            "$POLICY" "$RSTATE" "$CTRL" "$ASPECT" "$PROBE" "$MPROXY" 2>"$OUT/ctrl.err"; then
         echo "  通过（MediaPlayerController 语法与类型检查无误）"
     else
         echo "编译失败：" >&2
@@ -558,10 +559,22 @@ if rf:
            '只写在 applyMode 里的话，播放中途按暂停顶部条永远不出现 —— '
            '暂停是形态**内部**的变化，形态没切换就不会走到那段代码')
 
-# ⑮ 界面必须去问服务「这是不是纯音频」，而不是自己猜
-report('界面依据 service.isAudioOnly() 判形态',
-       'isAudioOnly()' in act_src,
-       '判据的权威来源在服务里（元数据 + 真实视频尺寸两个信号合并），界面不自己猜')
+# ⑮ 界面判形态必须走纯逻辑层 —— 而不是自己拿 getter 拼
+#
+# 这条守卫原来钉的是「界面调了 service.isAudioOnly()」。2026-10-03 重构后
+# 判据搬进了 PlaybackPolicy.modeOf（纯函数、桌面可穷举），界面只做两件事：
+# 取快照、把当前时刻传进去。所以守卫改成钉**接线形状**：
+#   界面**不许**再直接问 isAudioOnly / isVideoPending —— 那两个 getter
+#   出现在 UI 里，就是「形态语义漏回界面」的证据（正是重构前的病灶）。
+# 至于「必须委托 modeOf、且实参是 renderState() 的快照」这条形状，
+# 由第 (16) 节按**方法体**钉（body_of 取不到就判红，比整文件正则更严）。
+# 同一形状两处各写一条是刻意删掉的：改坏时它们会一起红，反而定位不出问题
+# —— 见 9dc806d 定下的纪律「同一语义不要在两处各写一条断言」。
+# 语义本身（图片优先、宽限、pending）由 PolicyTest 的桌面断言覆盖。
+report('界面不再直接问 isAudioOnly / isVideoPending（语义已搬走）',
+       'isAudioOnly()' not in act_src and 'isVideoPending()' not in act_src,
+       '这两个 getter 出现在 UI 里，说明形态语义又漏回界面了 —— '
+       '判据必须只有一份，在纯逻辑层（PlaybackPolicy.modeOf）')
 
 # ⑱ 二维码（批 2）：电视端唯一的"入口"，错了用户就进不来
 # 这几条守的都是「静默回归」：编译过、运行不报错、日志干净，
@@ -965,27 +978,36 @@ report('界面有 MODE_IMAGE（第四种形态）',
        'MODE_IMAGE' in act_code,
        '没有这一态，图片只能落进"视频"或"音频"，两种显示都是错的')
 
+# 形态机的**语义**已经搬到 PlaybackPolicy.modeOf（由 PolicyTest 的桌面断言穷举，
+# 见 §16：图片优先、宽限只对音频、宽限必然终结、pending 不进记账）。
+# 这里只钉两件**形状**上的事：界面必须委托，且不许再把状态自己存一份。
 cm = body_of(act_code, 'private int currentMode()')
 report('currentMode 方法体已找到（去注释后）', cm is not None,
        '锚点：private int currentMode()')
 if cm:
-    report('currentMode 先判 isImage（图片优先于音频/视频）',
-           'isImage()' in cm,
-           '图片不是音频，落到那个二选一里只会被判成"视频" —— 又是黑屏')
-    # ㉔ 换歌不闪面板：UI 侧宽限（批 3.7）。网易云换歌 = 先 Stop 再 SetAVTransportURI
-    # （相隔 ~230ms），而 IDLE 的刷新间隔是 1500ms —— 230ms 的瞬态被放大成 1.5s 的
-    # 待机面板。宽限只对音频（视频宽限会把「闪面板」换成「闪蓝屏」）。
-    report('currentMode 有宽限期（GRACE_MS）',
-           'GRACE_MS' in cm,
-           '没有宽限，换歌时 Stop→Set 的 230ms 窗口一旦落拍就闪面板（真机实测 1–2s）')
-    report('宽限只作用于 MODE_AUDIO（不推广到视频）',
-           'lastPlayingMode == MODE_AUDIO' in cm,
-           '视频态宽限会把「闪面板」换成「闪蓝屏」：player.stop() 后视频层无内容，'
-           '老 MTK 输出一屏蓝，宽限会把蓝屏多留 1.5s')
-    report('宽限有会终结的时间判据（lastPlayingAtMs 与 GRACE_MS 比较）',
-           'lastPlayingAtMs' in cm and 'GRACE_MS' in cm,
-           '宽限必须靠时间比较终结 —— 写成「只要 lastPlayingMode != IDLE 就维持」'
-           '会永不回 IDLE（用户按停止后卡在音乐卡片）')
+    report('currentMode 委托给 PlaybackPolicy.modeOf（不再自己算）',
+           re.search(r'PlaybackPolicy\.modeOf\(\s*service\.renderState\(\)', cm) is not None,
+           '方法体里若再出现 isImage() / isAudioOnly() / 宽限比较，'
+           '就说明形态机又被抄回界面了 —— 那是「同一事实存两份」的起点。'
+           '判据要钉**完整调用形式**（实参就是 renderState() 的快照），'
+           '只查「出现过 modeOf(」的话，把快照换成别的来源照样绿')
+    report('currentMode 不再引用形态记忆字段（已收进 ModeMemory）',
+           re.search(r'\b(lastPlayingMode|lastPlayingAtMs|staleHeld|userInitiatedStop)\b',
+                     cm) is None,
+           '这几个字段散在 Activity 上时，谁读、谁写根本看不清；'
+           '收进 PlaybackPolicy.ModeMemory 之后，判据的输入是显式的')
+    report('currentMode 把当前时刻作为参数传入（判据才能被穷举）',
+           'System.currentTimeMillis()' in cm,
+           '时间若在判据**内部**读，宽限边界就永远测不了 —— '
+           '这正是它以前只能靠「钉住源码里出现过某个字符串」来保护的原因')
+report('MainActivity 的 MODE_* 是对 PlaybackPolicy 的引用别名，不写字面量',
+       re.search(r'MODE_IDLE\s*=\s*PlaybackPolicy\.MODE_IDLE', act_code) is not None
+       and re.search(r'MODE_VIDEO_PENDING\s*=\s*PlaybackPolicy\.MODE_VIDEO_PENDING',
+                     act_code) is not None
+       and re.search(r'MODE_(IDLE|AUDIO|VIDEO|IMAGE|VIDEO_PENDING)\s*=\s*\d',
+                     act_code) is None,
+       '界面再写一遍 = 0 / = 1 就是「同一语义写两份」，改一处漏一处必然分叉；'
+       '值只能有一个来源（纯逻辑层）')
 
 # 冻结：宽限期内 refresh 不更新音乐字段（只加宽限不冻结 = 从「闪面板」变「闪空卡片」）
 _rfz = body_of(act_code, 'private void refresh()')
@@ -3168,15 +3190,36 @@ report('服务侧「视频准备中」判据用 isPreparing()，且绝不拿 get
        'HLS 直播的时长恒为 0 —— 用它当判据会把正常播放的直播永远判成准备中，'
        '占位层再也撤不掉（铁律：判据必须会终结）。isImage 不在判据里是因为'
        'pending 只在「判成视频」之后才会被问到，但反向依赖 audioOnly 必须显式排除')
-cm = body_of(main_act, 'private int currentMode()')
-report('形态机：视频且准备中 → MODE_VIDEO_PENDING，图片优先判仍在',
-       cm is not None and 'MODE_VIDEO_PENDING' in cm
-       and re.search(r'lastPlayingMode\s*==\s*MODE_VIDEO\s*&&\s*'
-                     r'service\.isVideoPending\(\)', cm) is not None
-       and 'isImage()' in cm,
-       'pending 分支必须排在 lastPlayingMode 赋值**之后**（宽限/退后台判据'
-       '仍按 MODE_VIDEO 记账）；图片判据一旦被它吃掉，投图会显示'
-       '「正在准备视频…）」')
+# 形态机的语义已搬到 PlaybackPolicy.modeOf —— 这里只钉「服务侧提供了快照原料」
+# 这一条形状：pending 判据要能在纯逻辑层算出来，就必须有 isPreparing() 与片源。
+# 语义（pending 分支排在记账之后、图片优先于它）由 PolicyTest §16 穷举覆盖。
+rs = strip_comments(
+    pathlib.Path('app/src/main/java/com/juping/cast/player/RenderState.java'
+                 ).read_text(encoding='utf-8'))
+report('RenderState 提供 pending 判据所需的全部原料',
+       re.search(r'\bpublic final boolean preparing;', rs) is not None
+       and re.search(r'\bpublic final boolean hasSource;', rs) is not None
+       and 'isVideoPending()' in rs and 'KIND_VIDEO' in rs,
+       'pending 要能在桌面上算出来（而不是钉住 MainActivity 里的字符串），'
+       '快照里就必须带 preparing / 片源 / 形态这三样。'
+       '这里用完整声明正则而不是子串匹配：子串匹配下把字段改名成 '
+       'preparingUnused 也照样命中，守卫恒真、形同虚设')
+rsm = body_of(svc, 'public RenderState renderState()')
+report('服务侧 renderState() 把片源 / 形态 / 音频位如实装进快照',
+       rsm is not None
+       and 'currentUri != null' in rsm
+       and 'kindFromMetadata' in rsm
+       and 'audioOnly' in rsm
+       and 'videoMissing' in rsm
+       and 'isPreparing()' in rsm,
+       '快照少装一项，形态机在桌面上就永远算不对 —— 片源恒 false 的话 '
+       'isVideoPending 恒 false，占位层永不出现，空视频层在老 MTK 上直接输出蓝；'
+       'preparing 恒 false 同理。原料在服务侧是唯一生产点，必须逐个钉住')
+report('RenderState.playingMode 把图片排在音频/视频之前',
+       re.search(r'public int playingMode\(\)\s*\{[^}]*isImage\(\)[^}]*MODE_IMAGE', rs,
+                 re.S) is not None,
+       '图片不是音频，落到「音频/视频」二选一里只会被判成视频 —— '
+       '界面去等一个永远不会来的视频帧，屏幕就是一块黑屏')
 am = body_of(main_act, 'private void applyMode(int mode)')
 report('占位层接线：pending 藏 SurfaceView + 亮 video_wait',
        am is not None and 'videoWait.setVisibility(' in am

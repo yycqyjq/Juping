@@ -26,6 +26,7 @@ import com.juping.cast.dlna.SsdpResponder;
 import com.juping.cast.dlna.UpnpHttpServer;
 import com.juping.cast.player.MediaPlayerController;
 import com.juping.cast.player.PlaybackPolicy;
+import com.juping.cast.player.RenderState;
 import com.juping.cast.web.ApkEndpoints;
 import com.juping.cast.web.ApkScanner;
 import com.juping.cast.web.LocalStore;
@@ -1668,6 +1669,49 @@ public class DlnaRendererService extends Service
 
     public MediaPlayerController getPlayer() {
         return player;
+    }
+
+    /**
+     * 「当前在放什么」的**唯一快照** —— 全项目组装它的地方只有这一处。
+     *
+     * <h3>为什么要有这个方法</h3>
+     * 在这个方法出现之前，「当前状态」有四份副本：播放控制器一份、本服务一份、
+     * {@code MainActivity.currentMode()} 拿 getter 又推一遍、{@code UpnpHttpServer}
+     * 再读一遍。四份靠手工同步 —— 改一处语义要动四个文件，漏一处就表现为
+     * 「修好 A、弄坏 B」（提交历史里 29% 的提交同时改「四大文件」中三个以上）。
+     *
+     * <p>本服务天然握着全部原料（播放器实例 + 元数据判定 + 错误态），所以组装点放这里。
+     * 界面、协议层、事件层从此读同一个对象，判据只剩一份。
+     *
+     * <h3>取值规则</h3>
+     * 每个字段都逐字对应原来某个 getter 或表达式，**行为等价**：
+     * <ul>
+     *   <li>{@code hasSource} = {@code currentUri} 非空；</li>
+     *   <li>{@code hasPlayer} = 播放器实例存在；</li>
+     *   <li>{@code preparing} = {@code player.isPreparing()}（拿不到实例时 false）；</li>
+     *   <li>{@code positionMs} / {@code durationMs} = 播放器的**采样缓存**
+     *       （不是 native 直调 —— 主线程直调 native 是 §7.20 那场 ANR 的成因）；</li>
+     *   <li>其余直接取本服务的对应字段。</li>
+     * </ul>
+     *
+     * <p>读的是字段快照，不保证与随后一秒内的变化一致 —— 界面每 0.5 秒重算一次，
+     * 这与原来的行为相同（原来也是各 getter 分别读，同样不构成原子快照）。
+     */
+    public RenderState renderState() {
+        MediaPlayerController p = player;
+        int[] aspect = p == null ? null : p.getVideoAspect();
+        return new RenderState(
+                p != null,
+                currentUri != null && currentUri.length() > 0,
+                kindFromMetadata,
+                audioOnly,
+                videoMissing,
+                p != null && p.isPreparing(),
+                lastErrorKind != PlaybackPolicy.ERR_NONE,
+                p == null ? 0L : p.getPosition(),
+                p == null ? 0L : p.getDuration(),
+                aspect == null ? 0 : aspect[0],
+                aspect == null ? 0 : aspect[1]);
     }
 
     /**

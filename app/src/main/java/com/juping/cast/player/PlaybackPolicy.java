@@ -684,4 +684,133 @@ public final class PlaybackPolicy {
     public static boolean canReplaySeekAfterRebuild(int replaysSoFar) {
         return replaysSoFar < MAX_SEEK_REPLAY;
     }
+
+    // ------------------------------------------------------------ 界面形态机
+
+    /*
+     * 下面这一节原来整个住在 MainActivity.currentMode() 里 —— 一个 UI 方法，
+     * 却用 4 个 service getter 重新推导了一遍「现在在放什么」，再配上 4 个
+     * MainActivity 本地字段和一个宽限计时器。
+     *
+     * 搬到这里有两个理由：
+     *   1. 「现在是什么形态」是**语义**，不是排版。按本项目已有的纪律
+     *      （见 9dc806d「语义归桌面断言、形状归源码守卫」），语义必须能在
+     *      桌面上穷举验证，而不是靠"钉住 MainActivity 里出现过某个字符串"。
+     *   2. 它同时消灭了「同一个事实存四份」里 UI 那一份 —— 界面从此只做渲染，
+     *      不再自己算。
+     *
+     * 搬迁**逐字保持行为**：同一个输入序列得到同一个输出序列。
+     * 唯一的差别是 `System.currentTimeMillis()` 改成显式传 `nowMs` ——
+     * 时间成为参数，判据才能被穷举（这正是宽限边界一直没被断言覆盖的原因）。
+     */
+
+    /** 空闲：没有在放的东西。 */
+    public static final int MODE_IDLE = 0;
+    /** 音乐投屏。 */
+    public static final int MODE_AUDIO = 1;
+    /** 视频投屏。 */
+    public static final int MODE_VIDEO = 2;
+    /** 图片投屏。 */
+    public static final int MODE_IMAGE = 3;
+    /**
+     * 视频准备中的瞬态：投的是视频，但 prepare 还挂着（首帧没来）。
+     *
+     * <p>界面据此藏掉 SurfaceView（未就绪的空视频层在老 MTK 上输出一屏蓝）
+     * 并盖一层不透明占位。**它不是一种新的播放形态** —— 记账仍按
+     * {@link #MODE_VIDEO}，否则宽限与退后台的判据会被它带偏。
+     */
+    public static final int MODE_VIDEO_PENDING = 4;
+
+    /**
+     * 换歌不闪面板的宽限期（毫秒）—— 「刚停止」之后仍保持音频形态多久。
+     *
+     * <p>控制点换歌是**先 Stop 再 SetAVTransportURI**（真机实测网易云相隔 ≈230ms）。
+     * Stop 一到，服务立刻清 {@code currentUri}（这是协议正确性，不能改）—— 界面那一拍
+     * 就判成空闲、闪出待机面板；而空闲态的下一拍要等 1500ms，于是 230ms 的瞬态被
+     * 放大成 1.5 秒的「先闪面板、再切回」。
+     *
+     * <p>取值 1.5s：实测 230ms 有 6 倍余量，能吸收控制点/网络抖动；同时把「控制点真停止」
+     * 时面板晚出现的延迟压在无感范围（遥控器返回键路径**不吃**宽限，用户主动停止是立即的）。
+     * 必须 ≥ 一拍播放态 tick（500ms），否则新 URI 可能在宽限过期后才被发现。
+     *
+     * <p><b>只对音频生效</b>：视频态 {@code player.stop()} 之后视频层没有内容，
+     * 老 MTK 会输出一屏蓝 —— 对视频宽限等于把「闪面板」换成「闪蓝屏」，
+     * 还把蓝屏多留 1.5 秒。图片态本无此问题，同样不纳入。
+     */
+    public static final long UI_GRACE_MS = 1500L;
+
+    /**
+     * 形态机的「上一次」记忆 —— 由调用方持有，判据本身保持无状态。
+     *
+     * <p>为什么需要记忆：形态不只取决于「现在」，还取决于「刚才」——
+     * 刚播完音频的那 1.5 秒要继续显示音乐卡片，而不是立刻闪回待机面板。
+     */
+    public static final class ModeMemory {
+        /** 上一次「在放」时的形态。宽限与退后台的判据都读它。 */
+        public int lastPlayingMode = MODE_IDLE;
+        /** 上一次「在放」的时刻。宽限的**终结判据**就是它与当前时间之差。 */
+        public long lastPlayingAtMs = 0L;
+        /**
+         * 是否正处在「宽限维持态」：刚停止、仍保持音频形态、卡片冻结显示上一首。
+         *
+         * <p>界面据此跳过音乐字段更新 —— 不跳过的话，服务里已被清空的
+         * title / artist / cover 会把卡片重绘成空白（从「闪面板」变成「闪空卡片」）。
+         */
+        public boolean staleHeld = false;
+        /**
+         * 用户是否刚按了遥控器返回键结束投屏。
+         *
+         * <p>返回键 = 用户明确要结束，不该等宽限。只有控制点发起的 Stop 才吃宽限。
+         */
+        public boolean userInitiatedStop = false;
+    }
+
+    /**
+     * 由当前快照与「上一次」记忆算出界面形态。
+     *
+     * <p>调用顺序有副作用：它会更新 {@code m} 里的记忆字段。这是刻意的 ——
+     * 记忆是**判据的输入**，把它显式放进一个可变对象里，比散在 Activity 的
+     * 字段上更难出错（也更容易在桌面上穷举）。
+     *
+     * @param s     当前状态快照（{@link RenderState}）
+     * @param m     上一次的记忆，会被就地更新
+     * @param nowMs 当前时刻（毫秒）。**作为参数传入**，判据才能被穷举测试
+     * @return {@link #MODE_IDLE} / {@link #MODE_AUDIO} / {@link #MODE_VIDEO} /
+     *         {@link #MODE_IMAGE} / {@link #MODE_VIDEO_PENDING}
+     */
+    public static int modeOf(RenderState s, ModeMemory m, long nowMs) {
+        if (s.hasContent()) {
+            // 正常播放：记下「上一次在放的形态」与时刻，供刚停止时的宽限判断使用。
+            m.lastPlayingMode = s.playingMode();
+            m.lastPlayingAtMs = nowMs;
+            m.staleHeld = false;
+            // 新内容到来，清掉「用户主动停止」标志 —— 免得误伤下一次控制点 Stop 的宽限。
+            m.userInitiatedStop = false;
+            // 视频且 prepare 还挂着 → 瞬态「视频准备中」。
+            // 注意 lastPlayingMode **保持 MODE_VIDEO 不变** —— pending 本质就是
+            // 「还没就绪的视频」，不是一种新的播放形态，不该进宽限/退后台的记账。
+            if (m.lastPlayingMode == MODE_VIDEO && s.isVideoPending()) {
+                return MODE_VIDEO_PENDING;
+            }
+            return m.lastPlayingMode;
+        }
+        // 非播放：若刚在放**音频**、且不是用户主动停止、且还在宽限期内 →
+        // 继续保持音频形态（面板一次都不出现），并标记「维持态」让界面冻结卡片。
+        //
+        // 宽限**只对音频**（理由见 UI_GRACE_MS）。终结判据是「时间比较」——
+        // 必然到点，**不是**「只要 lastPlayingMode != IDLE 就维持」，
+        // 后者会永不回空闲（用户按停止后卡在音乐卡片上）。
+        if (m.lastPlayingMode == MODE_AUDIO
+                && !m.userInitiatedStop
+                && nowMs - m.lastPlayingAtMs < UI_GRACE_MS) {
+            m.staleHeld = true;
+            return MODE_AUDIO;
+        }
+        // 到这里要么是用户主动停止、要么宽限已过：回空闲，并消费掉
+        // 「用户主动停止」标志（成对：置位在遥控器返回键，消费在这里 / hasContent 分支）。
+        m.userInitiatedStop = false;
+        m.lastPlayingMode = MODE_IDLE;
+        m.staleHeld = false;
+        return MODE_IDLE;
+    }
 }

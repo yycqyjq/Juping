@@ -79,40 +79,38 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final long REFRESH_INTERVAL_PLAYING_MS = 500L;
 
     /**
-     * 「刚停止」的宽限期（毫秒）—— 换歌时别闪待机面板。
+     * 「刚停止」的宽限期 —— 见 {@link PlaybackPolicy#UI_GRACE_MS}。
      *
-     * <p>控制点换歌是**先 Stop 再 SetAVTransportURI**（真机实测网易云相隔 ≈230ms）。
-     * Stop 一到，服务立刻清 {@code currentUri}（这是协议正确性，不能改）—— 界面这一拍
-     * 就判成空闲、闪出待机面板；而空闲态的下一拍要等 {@link #REFRESH_INTERVAL_IDLE_MS}
-     * （1500ms），于是 230ms 的瞬态被放大成 1.5 秒的「先闪面板、再切回」。
-     *
-     * <p>取值 1.5s：实测 230ms 有 6 倍余量，能吸收控制点/网络抖动；同时把「控制点真停止」
-     * 时面板晚出现的延迟压在无感范围（遥控器返回键路径**不吃**宽限，用户主动停止是立即的）。
-     * 必须 ≥ 一拍播放态 tick（500ms），否则新 URI 可能在宽限过期后才被发现。
+     * <p>取值与理由都在纯逻辑层（判据搬过去之后，这里不该再存第二份数字：
+     * 两处各写一个 1500 就是「同一语义写两份」，改一处漏一处必然分叉）。
      */
-    private static final long GRACE_MS = 1500L;
 
     /**
-     * 界面四态。
+     * 界面形态。取值定义在 {@link PlaybackPolicy}（判据的所在处）。
      *
-     * <p>用四态整数而不是「播放中 / 没播放」两个布尔，是因为音频、视频、图片
+     * <p>用形态整数而不是「播放中 / 没播放」两个布尔，是因为音频、视频、图片
      * **互斥**：写成几个布尔就允许出现"既是音频又是视频"这种非法组合，
      * 而它一旦出现，界面会同时显示画面和音符卡片 —— 排查起来非常费劲。
+     *
+     * <p><b>这里只留别名，不写字面量。</b> 值只有一个来源（纯逻辑层）——
+     * 界面再写一遍 {@code = 0} / {@code = 1}，就是「同一语义写两份」，
+     * 改一处漏一处必然分叉（本轮重构要消灭的正是这个模式）。
+     * 源码级守卫钉住「必须是引用、不许是字面量」，见 policy-test 第 (16) 节。
      */
-    private static final int MODE_IDLE = 0;
-    private static final int MODE_AUDIO = 1;
-    private static final int MODE_VIDEO = 2;
-    private static final int MODE_IMAGE = 3;
+    private static final int MODE_IDLE = PlaybackPolicy.MODE_IDLE;
+    private static final int MODE_AUDIO = PlaybackPolicy.MODE_AUDIO;
+    private static final int MODE_VIDEO = PlaybackPolicy.MODE_VIDEO;
+    private static final int MODE_IMAGE = PlaybackPolicy.MODE_IMAGE;
     /**
      * 视频准备中的瞬态：投的是视频，但 prepare 还挂着（首帧没来）。
      *
      * <p>为什么要有第五态：老 MTK 上「没有内容的视频层」硬件输出的是一屏蓝。
      * 正常 VIDEO 态藏不住它（马上就有画面），而准备窗口里必须把 SurfaceView
      * 藏掉、盖一层不透明占位 —— 表现从「蓝屏 30 秒」变成「正在准备视频…」。
-     * 它**不是**一种播放形态（lastPlayingMode 仍是 MODE_VIDEO），只是
+     * 它**不是**一种播放形态（记账仍是 MODE_VIDEO），只是
      * VIDEO 就绪前那两三秒的壳。见 `.agent/video-bluescreen-plan.md` §4。
      */
-    private static final int MODE_VIDEO_PENDING = 4;
+    private static final int MODE_VIDEO_PENDING = PlaybackPolicy.MODE_VIDEO_PENDING;
 
     private SurfaceView surfaceView;
     /**
@@ -183,24 +181,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private int appliedAspectW = 0;
     private int appliedAspectH = 0;
 
-    /** 上一次「在放」时的形态。宽限期内据此判断「刚才是不是在放音频」。 */
-    private int lastPlayingMode = MODE_IDLE;
-    /** 上一次「在放」的时刻（毫秒）。宽限的**终结判据**就是它与当前时间之差。 */
-    private long lastPlayingAtMs = 0L;
     /**
-     * 是否正处在「宽限维持态」：刚停止、仍保持音频形态、卡片冻结显示上一首。
+     * 形态机的「上一次」记忆。
      *
-     * <p>{@link #refresh()} 据此决定要不要跳过音乐字段更新 —— 不跳过的话，服务里已被
-     * 清空的 title/artist/cover 会把卡片重绘成空白（从「闪面板」变成「闪空卡片」）。
+     * <p>判据本身（{@link PlaybackPolicy#modeOf}）是纯函数，记忆由界面持有。
+     * 这几项原来是散在 Activity 上的四个字段（上一次形态 / 上一次时刻 /
+     * 宽限维持态 / 用户主动停止），现在收进一个对象 —— 它们本来就是**同一个
+     * 判据的四个输入**，散着放只会让「谁在读、谁在写」变得难以看清。
      */
-    private boolean staleHeld = false;
-    /**
-     * 用户是否刚按了遥控器返回键结束投屏。
-     *
-     * <p>返回键 = 用户明确要结束，不该等宽限 —— 置位后 {@link #currentMode()} 跳过宽限、
-     * 立即回空闲。只有控制点发起的 Stop 才吃宽限。
-     */
-    private boolean userInitiatedStop = false;
+    private final PlaybackPolicy.ModeMemory modeMem = new PlaybackPolicy.ModeMemory();
 
     /**
      * 当前二维码对应的地址 —— 同时也是「要不要重画」的缓存键。
@@ -495,7 +484,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             // 清空，更新会把卡片重绘成空白（歌名空、歌手/封面退回图标），从「闪面板」
             // 变成「闪空卡片」，仍是一次可见的闪。判据是「是否处于维持态」（staleHeld），
             // **不是**「服务字段是否为空」—— 新歌可能真的没封面，那时应当正常降级。
-            if (!staleHeld) {
+            if (!modeMem.staleHeld) {
                 musicSource.setText(currentLabel());
                 updateArtist(service.getCurrentArtist());
                 updateLyrics(service.getCurrentLyrics());
@@ -1050,68 +1039,34 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
     }
 
-    private boolean isPlaying() {
-        if (service == null || service.getPlayer() == null) {
-            return false;
-        }
-        // 读的是缓存时长（onPrepared 垫底、探针线程刷新），不是 native ——
-        // 这一句原来也在主线程上直调 native，同样是 ANR 的堵点之一。
-        if (service.getPlayer().getDuration() > 0) {
-            return true;
-        }
-        String uri = service.getCurrentUri();
-        return uri != null && uri.length() > 0;
-    }
-
     /**
      * 当前该用哪种形态。
      *
-     * <p>判据分三层：先看「有没有内容」（{@link #isPlaying()}），再看
-     * 「是不是一张静态图」（{@code service.isImage()}），最后才是
-     * 「内容有没有画面」（{@code service.isAudioOnly()}）。
-     * 后两层的权威来源在服务里 —— 由元数据里的 {@code upnp:class} 与
-     * MediaPlayer 报的真实视频尺寸两个信号合并得出，界面不自己猜。
+     * <p><b>判据已经搬走了。</b> 原来这个方法体里塞着整套形态机 —— 4 个 service
+     * getter 重新推导一遍「现在在放什么」，再配上 4 个 MainActivity 本地字段
+     * （上一次形态 / 上一次时刻 / 宽限维持态 / 用户主动停止）和一个宽限计时器。
+     * 那是「同一个事实存四份」里的 UI 那一份：改一处状态语义要动四个文件，
+     * 漏一处就表现为「修好 A、弄坏 B」。
+     *
+     * <p>现在：
+     * <ul>
+     *   <li><b>状态</b>只有一个来源 —— {@link DlnaRendererService#renderState()}；</li>
+     *   <li><b>判据</b>是纯函数 —— {@link PlaybackPolicy#modeOf}，
+     *       能在桌面上穷举宽限边界（时间成了参数，这是以前测不了的原因）；</li>
+     *   <li><b>记忆</b>由界面持有（{@link #modeMem}），判据本身保持无状态。</li>
+     * </ul>
+     *
+     * <p>本方法只剩两件事：取快照、把当前时刻传进去。**界面不再自己算形态。**
+     *
+     * <p>开头的 {@code service == null} 是**防御性**的：三个调用点
+     * （{@code refresh()}、返回键、退后台判定）都先判过 {@code service != null}
+     * 才调进来，旧实现里这一格本来就到不了 —— 所以这次搬迁没有改变任何**可达**行为。
      */
     private int currentMode() {
-        if (isPlaying()) {
-            // 正常播放：记下「上一次在放的形态」与时刻，供刚停止时的宽限判断使用。
-            // 图片要**先于**音频判（它不是音频，却同样没有 MediaPlayer 画面 —— 落到
-            // 下面那个 isAudioOnly() 二选一里只会被判成"视频"，界面去等一个永远
-            // 不会来的视频帧，屏幕就是一块黑屏）。
-            lastPlayingMode = service.isImage() ? MODE_IMAGE
-                    : (service.isAudioOnly() ? MODE_AUDIO : MODE_VIDEO);
-            lastPlayingAtMs = System.currentTimeMillis();
-            staleHeld = false;
-            // 新歌到来，清掉「用户主动停止」标志 —— 免得误伤下一次控制点 Stop 的宽限。
-            userInitiatedStop = false;
-            // 视频且 prepare 还挂着 → 瞬态「视频准备中」：applyMode 会藏掉
-            // SurfaceView（空视频层在老 MTK 上输出蓝色）并盖不透明占位。
-            // lastPlayingMode 保持 MODE_VIDEO 不变 —— 它是宽限/退后台判据的
-            // 输入，pending 本质就是「还没就绪的视频」，不是一种新的播放形态。
-            if (lastPlayingMode == MODE_VIDEO && service.isVideoPending()) {
-                return MODE_VIDEO_PENDING;
-            }
-            return lastPlayingMode;
+        if (service == null) {
+            return MODE_IDLE;
         }
-        // 非播放：若刚在放**音频**、且不是用户主动停止、且还在宽限期内 → 继续保持
-        // 音频形态（面板一次都不出现），并标记「维持态」让 refresh 冻结卡片。
-        //
-        // 宽限**只对音频**：视频态 player.stop() 后视频层无内容，老 MTK 会输出一屏
-        // 蓝 —— 对视频宽限会把「闪面板」换成「闪蓝屏」，还把蓝屏多留 1.5s。图片态
-        // 本无此 bug，同样不纳入。终结判据是「时间比较」（必然到点），**不是**
-        // 「只要 lastPlayingMode != IDLE 就维持」—— 后者会永不回空闲。
-        if (lastPlayingMode == MODE_AUDIO
-                && !userInitiatedStop
-                && System.currentTimeMillis() - lastPlayingAtMs < GRACE_MS) {
-            staleHeld = true;
-            return MODE_AUDIO;
-        }
-        // 到这里要么是用户主动停止、要么宽限已过：回空闲，并消费掉「用户主动停止」
-        // 标志（成对：置位在 onKeyDown，消费在这里 / isPlaying() 分支）。
-        userInitiatedStop = false;
-        lastPlayingMode = MODE_IDLE;
-        staleHeld = false;
-        return MODE_IDLE;
+        return PlaybackPolicy.modeOf(service.renderState(), modeMem, System.currentTimeMillis());
     }
 
     /**
@@ -1777,7 +1732,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             // 用户明确要结束：置位跳过宽限。必须在 service.onStop() **之前** ——
             // onStop() 会清 currentUri，下一拍 currentMode() 见到这个标志就立即回
             // 空闲、不等 1.5s（比现状还快）。只有控制点发起的 Stop 才吃宽限。
-            userInitiatedStop = true;
+            modeMem.userInitiatedStop = true;
             service.onStop();
             return true;
         }

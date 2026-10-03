@@ -1,5 +1,6 @@
 import com.juping.cast.player.Mp4Aspect;
 import com.juping.cast.player.PlaybackPolicy;
+import com.juping.cast.player.RenderState;
 
 import java.util.Arrays;
 
@@ -547,6 +548,136 @@ public class PolicyTest {
                         PlaybackPolicy.MAX_SEEK_REPLAY),
                 "再重建就是死循环（真机连续 51 轮）");
 
+        // ---------------------------------------------------------------- 16
+        System.out.println("\n── 16. 界面形态机（原来住在 MainActivity.currentMode 里）──");
+        System.out.println("   这一节是 2026-10-03 结构重构的产物：形态判据从 UI 搬进纯逻辑层，");
+        System.out.println("   于是宽限边界、图片优先、pending 记账这些**语义**第一次能被穷举。");
+        System.out.println("   以前它们只能靠「钉住 MainActivity 源码里出现过某个字符串」来保护 ——");
+        System.out.println("   那种守卫看不出逻辑错，只看得出代码被删。");
+
+        // 无内容 → 空闲
+        check("没有内容 → MODE_IDLE",
+                PlaybackPolicy.modeOf(RenderState.empty(), new PlaybackPolicy.ModeMemory(), 0L)
+                        == PlaybackPolicy.MODE_IDLE, "空快照");
+
+        // 三种形态各自对上
+        check("有内容 + 纯音频 → MODE_AUDIO",
+                PlaybackPolicy.modeOf(snap(RenderState.KIND_AUDIO, true, false, 180000L),
+                        new PlaybackPolicy.ModeMemory(), 0L) == PlaybackPolicy.MODE_AUDIO, "音频");
+        check("有内容 + 有画面 → MODE_VIDEO",
+                PlaybackPolicy.modeOf(snap(RenderState.KIND_VIDEO, false, false, 180000L),
+                        new PlaybackPolicy.ModeMemory(), 0L) == PlaybackPolicy.MODE_VIDEO, "视频");
+        check("有内容 + 静态图 → MODE_IMAGE",
+                PlaybackPolicy.modeOf(snap(RenderState.KIND_IMAGE, false, false, 0L),
+                        new PlaybackPolicy.ModeMemory(), 0L) == PlaybackPolicy.MODE_IMAGE, "图片");
+
+        // 图片优先于音频/视频 —— 图片既不是音频也没有 MediaPlayer 画面，
+        // 落到那个二选一里只会被判成"视频"，界面去等一个永远不来的视频帧。
+        check("图片优先：kind=IMAGE 且 audioOnly=true 时仍判图片（不被音频吃掉）",
+                PlaybackPolicy.modeOf(snap(RenderState.KIND_IMAGE, true, false, 0L),
+                        new PlaybackPolicy.ModeMemory(), 0L) == PlaybackPolicy.MODE_IMAGE,
+                "图片先于音频判，否则投图会显示音乐卡片");
+        check("图片优先：kind=IMAGE 且 preparing 时仍是图片（pending 不吃图片）",
+                PlaybackPolicy.modeOf(snap(RenderState.KIND_IMAGE, false, true, 0L),
+                        new PlaybackPolicy.ModeMemory(), 0L) == PlaybackPolicy.MODE_IMAGE,
+                "否则投图会显示「正在准备视频…」");
+
+        // 视频准备中 → 瞬态 pending，但**记账仍是 VIDEO**
+        PlaybackPolicy.ModeMemory mPending = new PlaybackPolicy.ModeMemory();
+        int pending = PlaybackPolicy.modeOf(snap(RenderState.KIND_VIDEO, false, true, 0L),
+                mPending, 0L);
+        check("视频 + prepare 挂着 → MODE_VIDEO_PENDING", pending == PlaybackPolicy.MODE_VIDEO_PENDING,
+                "占位层据此藏 SurfaceView（空视频层在老 MTK 上是一屏蓝）");
+        check("pending 的记账仍是 MODE_VIDEO（它不是一种新的播放形态）",
+                mPending.lastPlayingMode == PlaybackPolicy.MODE_VIDEO,
+                "记账被改成 PENDING 的话，宽限与退后台的判据会一起被带偏");
+
+        // 宽限：音频播完的 1.5 秒内继续显示音乐卡片
+        PlaybackPolicy.ModeMemory mGrace = new PlaybackPolicy.ModeMemory();
+        PlaybackPolicy.modeOf(snap(RenderState.KIND_AUDIO, true, false, 180000L), mGrace, 1000L);
+        int held = PlaybackPolicy.modeOf(RenderState.empty(), mGrace, 1000L + 1499L);
+        check("音频刚停止 + 宽限内（1499ms）→ 继续 MODE_AUDIO",
+                held == PlaybackPolicy.MODE_AUDIO, "换歌不闪面板靠它");
+        check("宽限期内 staleHeld 置位（界面据此冻结卡片）", mGrace.staleHeld,
+                "不冻结的话卡片会被服务里已清空的字段重绘成空白");
+
+        PlaybackPolicy.ModeMemory mEdge = new PlaybackPolicy.ModeMemory();
+        PlaybackPolicy.modeOf(snap(RenderState.KIND_AUDIO, true, false, 180000L), mEdge, 0L);
+        check("宽限边界：恰好 1500ms → 不维持（判据用严格小于）",
+                PlaybackPolicy.modeOf(RenderState.empty(), mEdge,
+                        0L + PlaybackPolicy.UI_GRACE_MS) == PlaybackPolicy.MODE_IDLE,
+                "差一毫秒是分水岭，必须钉住");
+
+        // 宽限只对音频：视频/图片播完立刻回空闲
+        // （视频态宽限会把「闪面板」换成「闪蓝屏」，还把蓝屏多留 1.5 秒）
+        PlaybackPolicy.ModeMemory mVid = new PlaybackPolicy.ModeMemory();
+        PlaybackPolicy.modeOf(snap(RenderState.KIND_VIDEO, false, false, 180000L), mVid, 0L);
+        check("宽限只对音频：视频播完 + 宽限内 → MODE_IDLE（不维持）",
+                PlaybackPolicy.modeOf(RenderState.empty(), mVid, 100L) == PlaybackPolicy.MODE_IDLE,
+                "视频宽限会把「闪面板」换成「闪蓝屏」");
+        PlaybackPolicy.ModeMemory mImg = new PlaybackPolicy.ModeMemory();
+        PlaybackPolicy.modeOf(snap(RenderState.KIND_IMAGE, false, false, 0L), mImg, 0L);
+        check("宽限只对音频：图片播完 + 宽限内 → MODE_IDLE（不维持）",
+                PlaybackPolicy.modeOf(RenderState.empty(), mImg, 100L) == PlaybackPolicy.MODE_IDLE,
+                "图片态本无闪蓝问题，不纳入宽限");
+
+        // 宽限必须**会终结** —— 这是「判据必须会终结」铁律在 UI 侧的那一份
+        PlaybackPolicy.ModeMemory mTerm = new PlaybackPolicy.ModeMemory();
+        PlaybackPolicy.modeOf(snap(RenderState.KIND_AUDIO, true, false, 180000L), mTerm, 0L);
+        int rounds = 0;
+        while (rounds < 1000
+                && PlaybackPolicy.modeOf(RenderState.empty(), mTerm,
+                        0L + (long) (rounds + 1) * 500L) != PlaybackPolicy.MODE_IDLE) {
+            rounds++;
+        }
+        check("宽限必然终结：按 500ms 一拍推进，有限拍内回 MODE_IDLE",
+                rounds < 1000 && rounds <= 3,
+                "实际用了 " + (rounds + 1) + " 拍（1500ms / 500ms = 3）—— "
+                        + "写成「只要 lastPlayingMode != IDLE 就维持」会永不回空闲");
+
+        // 遥控器返回键 = 用户明确要结束，不吃宽限
+        PlaybackPolicy.ModeMemory mUser = new PlaybackPolicy.ModeMemory();
+        PlaybackPolicy.modeOf(snap(RenderState.KIND_AUDIO, true, false, 180000L), mUser, 0L);
+        mUser.userInitiatedStop = true;
+        check("用户主动停止 → 立即 MODE_IDLE（不吃宽限）",
+                PlaybackPolicy.modeOf(RenderState.empty(), mUser, 10L) == PlaybackPolicy.MODE_IDLE,
+                "遥控器返回是明确的结束意图，不该等 1.5 秒");
+        check("「用户主动停止」标志被消费掉（不会误伤下一次）", !mUser.userInitiatedStop,
+                "不消费的话，下一次控制点 Stop 也享受不到宽限");
+
+        // hasContent 的兜底：时长已知但地址一时为空，仍算有内容
+        check("hasContent 兜底：时长已知 + 无地址 → 仍算有内容（与旧 isPlaying 等价）",
+                PlaybackPolicy.modeOf(
+                        new RenderState(true, false, RenderState.KIND_VIDEO, false, false,
+                                false, false, 0L, 180000L, 0, 0),
+                        new PlaybackPolicy.ModeMemory(), 0L) == PlaybackPolicy.MODE_VIDEO,
+                "只看 URI 的话，收尾与重新投屏之间会闪一下空闲面板");
+        check("没有播放器实例 → 不算有内容（哪怕有地址）",
+                PlaybackPolicy.modeOf(
+                        new RenderState(false, true, RenderState.KIND_VIDEO, false, false,
+                                false, false, 0L, 0L, 0, 0),
+                        new PlaybackPolicy.ModeMemory(), 0L) == PlaybackPolicy.MODE_IDLE,
+                "服务未就绪时界面必须回空闲");
+
+        // pending 的判据是「prepare 挂着」，不是「时长为 0」
+        // —— 直播时长恒为 0，拿它当判据会把正常直播永远判成准备中
+        check("pending 判据用 preparing，不用 duration==0（直播时长恒 0）",
+                new RenderState(true, true, RenderState.KIND_VIDEO, false, false,
+                        true, false, 0L, 0L, 0, 0).isVideoPending(),
+                "拿时长为 0 当判据，占位层在直播上再也撤不掉");
+        check("没有片源时不算 pending（地址已清 = 收尾了）",
+                !new RenderState(true, false, RenderState.KIND_VIDEO, false, false,
+                        true, false, 0L, 0L, 0, 0).isVideoPending(),
+                "与旧实现的 currentUri 非空判据逐字对应");
+        // 上一条的夹具里 preparing 与 duration==0 同时为真，两种判据都成立 ——
+        // 区分不开。这一条才是「判据只看 preparing」的判别式：直播时长恒 0，
+        // 但它 prepare 早就过了，绝不能被判成准备中。
+        check("直播时长恒 0 但 prepare 已过 → 不算 pending（判据只看 preparing）",
+                !new RenderState(true, true, RenderState.KIND_VIDEO, false, false,
+                        false, false, 0L, 0L, 0, 0).isVideoPending(),
+                "拿 duration==0 当判据的话，正常播放的直播会被永远判成准备中，"
+                + "占位层再也撤不掉（铁律：判据必须会终结）");
+
         System.out.println();
         System.out.println("=".repeat(62));
         System.out.println("播放策略：" + passed + " / " + total + " 通过");
@@ -948,5 +1079,17 @@ public class PolicyTest {
             lastProgressAt = now;               // 重连后重新计时
         }
         return -1;                              // 从未停手
+    }
+
+    /**
+     * 造一个「有播放器、有片源、无错误、无宽高」的快照 —— 形态机断言的最常用形态。
+     *
+     * <p>只暴露会改变形态判定的那几项，其余（videoMissing / 错误 / 位置 / 宽高）
+     * 对形态机没有影响，固定成中性值即可 —— 夹具越小，读断言的人越容易一眼看出
+     * 「这个输入到底在测什么」。
+     */
+    static RenderState snap(int kind, boolean audioOnly, boolean preparing, long durationMs) {
+        return new RenderState(true, true, kind, audioOnly, false, preparing, false,
+                0L, durationMs, 0, 0);
     }
 }
