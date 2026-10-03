@@ -15,9 +15,13 @@ import android.os.IBinder;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.Display;
+import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
+import android.view.ViewParent;
 import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
@@ -25,6 +29,7 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import com.juping.cast.player.Mp4Aspect;
 import com.juping.cast.player.PlaybackPolicy;
 
 import java.io.BufferedReader;
@@ -164,7 +169,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private int lastMode = MODE_IDLE;
 
     /**
-     * 已经应用到 SurfaceView 的比例宽高（0 = 当前是全屏）。
+     * 已经应用到 SurfaceView 的**盒子**宽高（0 = 当前是全屏）。
+     *
+     * <p>注意存的是 {@link Mp4Aspect#fitInside} 缩放<b>之后</b>的盒子，
+     * 不是视频原始像素 —— 去重要去在「真正落到 LayoutParams 上的那对数」，
+     * 存原始像素的话，同一像素在不同面板下会摆出不同盒子，去重就漏了。
      *
      * <p>用来做「变了才动」的去重：{@link #refresh()} 每 0.5 秒跑一次，而
      * {@code setLayoutParams} 会触发重新布局 —— 没变还每拍设一次是白烧 CPU
@@ -1256,25 +1265,39 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * 触发无谓的重排。
      */
     private void applyVideoAspect(int mode) {
-        int w = 0;
-        int h = 0;
+        int rawW = 0;
+        int rawH = 0;
+        int boxW = 0;
+        int boxH = 0;
         if (mode == MODE_VIDEO && service != null) {
             int[] size = service.getVideoAspect();
             if (size != null && size.length >= 2) {
-                w = size[0];
-                h = size[1];
+                rawW = size[0];
+                rawH = size[1];
+                // 按**面板**尺寸把原始像素缩成装得下的盒子。直接拿原始像素摆，
+                // 竖屏 720×1280 在 1920×1080 面板上会超出被裁 —— 用户看到的是
+                // 切头切尾而不是黑边，正是本功能要修的场景（QA 复审①）。
+                int[] panel = panelSizePx();
+                int[] box = Mp4Aspect.fitInside(rawW, rawH, panel[0], panel[1]);
+                if (box != null) {
+                    boxW = box[0];
+                    boxH = box[1];
+                }
+                // fitInside 返 null（面板尺寸也拿不到）→ 盒子留 0 → 走复位全屏，
+                // 下个 tick 有面板尺寸了再摆 —— 探测与布局都是异步到的，不着急。
             }
         }
         // 没变就别动 View：setLayoutParams 会触发重新布局。
-        if (w == appliedAspectW && h == appliedAspectH) {
+        // 比的是**缩放后的盒子**（真正落到 LayoutParams 上的那对数）。
+        if (boxW == appliedAspectW && boxH == appliedAspectH) {
             return;
         }
-        appliedAspectW = w;
-        appliedAspectH = h;
+        appliedAspectW = boxW;
+        appliedAspectH = boxH;
         FrameLayout.LayoutParams lp;
-        if (w > 0 && h > 0) {
-            // 有比例 → 居中摆真实宽高，露出的近黑背景就是软件信箱。
-            lp = new FrameLayout.LayoutParams(w, h, Gravity.CENTER);
+        if (boxW > 0 && boxH > 0) {
+            // 有比例 → 居中摆缩放后的盒子，露出的近黑背景就是软件信箱。
+            lp = new FrameLayout.LayoutParams(boxW, boxH, Gravity.CENTER);
         } else {
             // 无比例 → 复位全屏（match_parent）。
             lp = new FrameLayout.LayoutParams(
@@ -1282,8 +1305,34 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     FrameLayout.LayoutParams.MATCH_PARENT);
         }
         surfaceView.setLayoutParams(lp);
-        Log.i(TAG, "视频比例: " + (w > 0 && h > 0 ? w + "x" + h : "全屏")
+        // 「原始像素 → 实际盒子」两个数一起打：只打盒子看不出探测值，
+        // 只打原始像素看不出缩放结果 —— 真机上判断"信箱摆没摆对"要对这一行。
+        Log.i(TAG, "视频比例: "
+                + (boxW > 0 ? rawW + "x" + rawH + " → " + boxW + "x" + boxH : "全屏")
                 + "（形态 " + modeName(mode) + "）");
+    }
+
+    /**
+     * 信箱面板（SurfaceView 的父容器）的像素尺寸。
+     *
+     * <p>取父 View 的实测宽高 —— 那才是"画面能摆多大"的权威（信箱是相对它算的）；
+     * 还没布局完（宽高为 0）时退到默认 Display 的宽高。两处都拿不到才返
+     * {@code {0,0}}，调用方按 fitInside 返 null 处理（复位全屏，下个 tick 再试）。
+     */
+    private int[] panelSizePx() {
+        int w = 0;
+        int h = 0;
+        ViewParent parent = surfaceView.getParent();
+        if (parent instanceof View) {
+            w = ((View) parent).getWidth();
+            h = ((View) parent).getHeight();
+        }
+        if (w <= 0 || h <= 0) {
+            Display display = getWindowManager().getDefaultDisplay();
+            w = display.getWidth();
+            h = display.getHeight();
+        }
+        return new int[] {w, h};
     }
 
     /**

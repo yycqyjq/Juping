@@ -68,7 +68,11 @@ public final class VideoAspectProbe {
         }
         // **红线**：HLS（.m3u8）走厂商自研的信箱链，比例本来就是对的 ——
         // 我们再去摆一次就是双重信箱。看到就立刻放弃，连请求都不发。
-        if (url.contains(".m3u8")) {
+        // toLowerCase 必须带 Locale.US：无参版在土耳其语环境里
+        // 'I' → 'ı'（无点 i），"M3U8" 会漏网（敏感大小写判断的教科书坑）。
+        // 实测 .M3U8 拿大写时无参版拦不住 —— 虽然后果只是白发一次请求
+        // （m3u8 是文本、looksLikeMp4 不匹配照样返 null），但红线就该是红线。
+        if (url.toLowerCase(java.util.Locale.US).contains(".m3u8")) {
             return null;
         }
         try {

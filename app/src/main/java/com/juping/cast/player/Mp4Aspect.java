@@ -29,6 +29,62 @@ public final class Mp4Aspect {
     public static final int WINDOW_BYTES = 64 * 1024;
 
     /**
+     * 把 {@code w×h} 的视频盒子按面板尺寸等比缩到「装得下」，返回
+     * {@code {boxW, boxH}}；参数不合法返回 {@code null}（调用方退回全屏）。
+     *
+     * <p><b>为什么必须缩放而不是按原始像素直接摆</b>：信箱的摆法曾经是
+     * {@code new LayoutParams(w, h, CENTER)} —— 拿<b>原始像素</b>当盒子。
+     * 竖屏 720×1280 投在 1920×1080 的面板上，高 1280 &gt; 1080，视图直接超出
+     * 父容器被裁掉 —— 用户看到的是画面被切头切尾，<b>而不是黑边</b>。这正是
+     * 本功能要修的场景，却被实现方式再伤了一遍。
+     *
+     * <p><b>判方向用交叉相乘，不用除法</b>：{@code w*panelH > h*panelW} 等价于
+     * {@code w/h > panelW/panelH}（宽比高更"宽" → 宽贴满），但全程没有除法，
+     * 不存在截断误差，也不用给除数为 0 单独开分支。
+     *
+     * <p><b>溢出</b>：四个入参都是屏幕量级（几千），乘积远在 int 范围内；
+     * 负数与 0 在入口就拒掉，不会绕进乘法里。
+     *
+     * <p>零 Android 依赖 —— 和这个类里所有其它函数一样，判据必须能在桌面上
+     * 被 {@code tools/policy-test/PolicyTest} 逐个断言，而不是只能上真机试。
+     *
+     * @param w       视频真实像素宽（&gt; 0）
+     * @param h       视频真实像素高（&gt; 0）
+     * @param panelW  面板（父容器）宽（&gt; 0）
+     * @param panelH  面板（父容器）高（&gt; 0）
+     * @return {@code {boxW, boxH}}（各钳在 {@code 1..panel} 内），或 {@code null}
+     */
+    public static int[] fitInside(int w, int h, int panelW, int panelH) {
+        if (w <= 0 || h <= 0 || panelW <= 0 || panelH <= 0) {
+            return null;
+        }
+        int boxW;
+        int boxH;
+        if ((long) w * panelH > (long) h * panelW) {
+            // 视频比面板更"宽" → 宽贴满，高等等比缩（上下留黑边）
+            // +w/2 再整除 = 四舍五入：截断会让 720×1280@1920×1080 摆成
+            // 607 宽的盒（半个像素的系统性右偏），信箱居中就歪半个像素。
+            boxW = panelW;
+            boxH = (int) (((long) h * panelW + (long) w / 2) / w);
+        } else {
+            // 视频比面板更"高"（或正好）→ 高贴满，宽等比缩（左右留黑边）
+            boxH = panelH;
+            boxW = (int) (((long) w * panelH + (long) h / 2) / h);
+        }
+        if (boxW < 1) {
+            boxW = 1;
+        } else if (boxW > panelW) {
+            boxW = panelW;
+        }
+        if (boxH < 1) {
+            boxH = 1;
+        } else if (boxH > panelH) {
+            boxH = panelH;
+        }
+        return new int[] {boxW, boxH};
+    }
+
+    /**
      * 解析一段 MP4 字节（头部窗口或尾部窗口），返回视频轨的显示宽高
      * {@code {width, height}}；解析不出返回 {@code null}。
      *
@@ -113,7 +169,12 @@ public final class Mp4Aspect {
         int p = tkhd[0];
         int size = tkhd[1];
         int limit = p + size;
-        if (p + 8 > b.length || limit > b.length) {
+        // 边界判据要盖住**将要读的那一字节**：下一行读 b[p+8]（version），
+        // 所以必须要求 p+9 ≤ b.length —— 写成 p+8 的话，size==8 且 box
+        // 恰好顶到窗口尾时，这里放行、下面 b[p+8] 抛 AIOOBE。
+        // （虽然被外层 catch 兜住不致崩，但越界就该在源头挡 ——
+        // 依赖"反正有人接"是把正确性押在别人的异常处理上。）
+        if (p + 9 > b.length || limit > b.length) {
             return null;
         }
         int version = b[p + 8] & 0xFF;
@@ -176,6 +237,13 @@ public final class Mp4Aspect {
         if (entry + 36 > entryEnd || entry + 36 > b.length) {
             return null;
         }
+        // 先验 fourcc：+32/+34 只在 **VisualSampleEntry** 上才是宽高。
+        // mp4a 这类音频 entry 的载荷布局完全不同 —— 那两个偏移读出来的是
+        // 毫不相干的字节（实测能读成 0x0500/0x02D0 = 1280×720 这种"合法值"），
+        // 区间闸（16~8192）根本挡不住"落在区间内的假值"，只能在源头认类型。
+        if (!isVisualEntry(typeAt(b, entry + 4))) {
+            return null;
+        }
         // SampleEntry 载荷 8 字节（reserved[6] + data_ref_index），
         // VisualSampleEntry 再 16 字节（pre_defined/reserved），之后才是 width/height
         // —— 各为 16 位无符号。即从 entry 起始算偏移 32 / 34。
@@ -185,6 +253,27 @@ public final class Mp4Aspect {
             return null;
         }
         return new int[] {w, h};
+    }
+
+    /**
+     * stsd 的第一个 sample entry 是不是**视觉轨**（视频编解码）。
+     *
+     * <p>白名单认这几类常见视频 fourcc：H.264（avc1/avc3）、H.265（hvc1/hev1）、
+     * AV1（av01）、VP9（vp09）、MPEG-4 视觉（mp4v）。不在名单上一律当非视频
+     * （音频 mp4a、文本 tx3g、元数据 …）→ 返 {@code null}，走"算不出就不猜"红线。
+     *
+     * <p>为什么白名单而不是黑名单：新编解码格式会不断出现，白名单最多是
+     * "遇到新格式退回全屏"（无害）；黑名单漏一个，就是把音频 entry 的垃圾
+     * 字节当尺寸摆上去（有害）。
+     */
+    private static boolean isVisualEntry(int fourcc) {
+        return fourcc == fourcc('a', 'v', 'c', '1')
+                || fourcc == fourcc('a', 'v', 'c', '3')
+                || fourcc == fourcc('h', 'v', 'c', '1')
+                || fourcc == fourcc('h', 'e', 'v', '1')
+                || fourcc == fourcc('a', 'v', '0', '1')
+                || fourcc == fourcc('v', 'p', '0', '9')
+                || fourcc == fourcc('m', 'p', '4', 'v');
     }
 
     // ------------------------------------------------------------------

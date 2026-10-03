@@ -379,6 +379,33 @@ public class PolicyTest {
                 Mp4Aspect.parse(trunc, trunc.length) == null,
                 "声明 " + full.length + " 字节、实际只有 " + trunc.length);
 
+        // ---- 信箱盒子：fitInside（QA 复审①，按面板缩放而不是按原始像素摆）----
+        int[] f1 = Mp4Aspect.fitInside(720, 1280, 1920, 1080);
+        check("fitInside 竖屏 720×1280 @1920×1080 → {608,1080}（缩进面板，不出框）",
+                f1 != null && f1[0] == 608 && f1[1] == 1080, "得到 " + fmt(f1));
+        int[] f2 = Mp4Aspect.fitInside(1920, 1080, 1920, 1080);
+        check("fitInside 横屏 1920×1080 @1920×1080 → {1920,1080}（正好铺满）",
+                f2 != null && f2[0] == 1920 && f2[1] == 1080, "得到 " + fmt(f2));
+        int[] f3 = Mp4Aspect.fitInside(320, 240, 1920, 1080);
+        check("fitInside 小视频 320×240 @1920×1080 → {1440,1080}（等比放大到贴边）",
+                f3 != null && f3[0] == 1440 && f3[1] == 1080, "得到 " + fmt(f3));
+        check("fitInside 入参 0 / 负数 → null（面板没量到就退回全屏，不猜值）",
+                Mp4Aspect.fitInside(0, 1280, 1920, 1080) == null
+                && Mp4Aspect.fitInside(720, -1, 1920, 1080) == null
+                && Mp4Aspect.fitInside(720, 1280, 0, 1080) == null
+                && Mp4Aspect.fitInside(720, 1280, 1920, -5) == null,
+                "某一路返回了非 null");
+
+        // ---- stsd 兜底的 fourcc 白名单（QA 复审④：音频 entry 不许当视觉尺寸）----
+        // mp4a 的 entry +32/+34 摆成 0x0500/0x02D0 正好读成 {1280,720} ——
+        // 落在合法区间内，MIN/MAX 闸挡不住，只有认 fourcc 才挡得住。
+        byte[] audioMoov = moovOf(box("trak", concat(
+                box("tkhd", tkhdPayload(0, 0, 0, false)),
+                box("mdia", box("minf", box("stbl", stsdBoxOfAudio(1280, 720)))))));
+        int[] rAudio = Mp4Aspect.parse(audioMoov, audioMoov.length);
+        check("stsd 音频 entry（mp4a，+32/+34 恰为 1280×720）→ null（fourcc 白名单拒收）",
+                rAudio == null, "得到 " + fmt(rAudio) + " —— 假尺寸混过了区间闸");
+
         System.out.println();
         System.out.println("=".repeat(62));
         System.out.println("播放策略：" + passed + " / " + total + " 通过");
@@ -528,6 +555,22 @@ public class PolicyTest {
         putInt(p, 4, 1);                                   // entry_count = 1
         System.arraycopy(entry, 0, p, 8, entry.length);
         return box("stsd", p);
+    }
+
+    /**
+     * 载荷布局同 {@link #stsdBox}，但第一个 entry 是 mp4a（音频），且把它的
+     * +32/+34 摆成 {@code w}/{@code h} —— 用来证明 fourcc 白名单挡得住
+     * 「假尺寸恰好落在合法区间」这种最难缠的假阳性。
+     */
+    static byte[] stsdBoxOfAudio(int w, int h) {
+        byte[] p = new byte[40];
+        putShort(p, 24, w);                                // entry +32
+        putShort(p, 26, h);                                // entry +34
+        byte[] entry = box("mp4a", p);
+        byte[] payload = new byte[8 + entry.length];
+        putInt(payload, 4, 1);                             // entry_count = 1
+        System.arraycopy(entry, 0, payload, 8, entry.length);
+        return box("stsd", payload);
     }
 
     /** avc1：VisualSampleEntry，宽高在 entry 起始 +32/+34（16 位无符号）。 */

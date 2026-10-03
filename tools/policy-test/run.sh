@@ -3225,6 +3225,82 @@ if av:
     report('applyVideoAspect 真的设了 SurfaceView 的 LayoutParams',
            'surfaceView.setLayoutParams(' in av,
            '不设 LayoutParams 的话比例只是个变量，画面还是被厂商铺满')
+    # ---- QA 复审①：盒子必须按面板缩放，不能拿原始像素直接摆 ----
+    _fit = av.find('Mp4Aspect.fitInside(')
+    _rawlp = re.search(r'new\s+FrameLayout\.LayoutParams\(\s*rawW\s*,\s*rawH', av)
+    report('信箱盒子走 Mp4Aspect.fitInside 缩放（不拿原始像素塞 LayoutParams）',
+           _fit >= 0 and _rawlp is None
+           and re.search(r'new\s+FrameLayout\.LayoutParams\(\s*boxW\s*,\s*boxH',
+                         av) is not None,
+           '竖屏 720×1280 在 1920×1080 面板上按原始像素摆会超框被裁 —— '
+           '用户看到切头切尾而不是黑边，正是本功能要修的场景（复审①）。'
+           '判据钉两头：必须调 fitInside，且塞进 LayoutParams 的必须是缩放后的 boxW/boxH')
+    _pn = body_of(main_act, 'private int[] panelSizePx()')
+    report('面板尺寸取父 View 宽高、为 0 退默认 Display（panelSizePx 存在）',
+           _pn is not None and 'getParent()' in _pn
+           and 'getWidth()' in _pn and 'getDefaultDisplay()' in _pn,
+           '信箱是相对面板算的 —— 父 View 的实测宽高才是权威；'
+           '还没布局完（宽高 0）才退 Display。两处都拿不到时 fitInside 返 null，'
+           '调用方复位全屏等下个 tick')
+# ---- QA 复审②：续播路径（不走 play()）也必须清宽高账 ----
+# 位置关系判据：auto-advance 线程体里 clearAspectUnless 必须排在 startInternal
+# 之前（先清账再重建，否则新实例探完前拿着上一部的宽高摆信箱）。
+# 用 find 比对而不是正则 —— 续播那段是多行匿名类，跨行结构正则写不动。
+_ca_all = [m.start() for m in re.finditer(r'clearAspectUnless\(', ctrl)]
+_first_ca = ctrl.find('private synchronized void clearAspectUnless')
+_adv_ca = [p for p in _ca_all if p != _first_ca]
+report('换片源清账判据只有一份（play/续播都调 clearAspectUnless）',
+       len(_adv_ca) >= 2 and 'private synchronized void clearAspectUnless' in ctrl,
+       '抽方法前清账只内联在 play() 里 —— 续播（onCompletion 接棒）直接 '
+       'currentUrl=u; startInternal();，视频→视频续播就用着上一部的宽高。'
+       '两个调用点加方法声明本体共 3 处出现，少一个就是有一处被改回内联/删掉')
+# 续播锚点用 currentUrl = u;（全文件唯一，续播线程体独有）
+_u_at = ctrl.find('currentUrl = u;')
+if _u_at >= 0:
+    _ca2 = ctrl.find('clearAspectUnless(', _u_at)
+    _st2 = ctrl.find('startInternal();', _u_at)
+    report('续播路径先 clearAspectUnless 再 startInternal（复审②的位置关系）',
+           _ca2 > _u_at and _st2 > _ca2,
+           '顺序反了（或漏调）新实例探完之前会拿着上一部宽高摆信箱 —— '
+           '黑边方向直接错')
+else:
+    report('续播路径先 clearAspectUnless 再 startInternal（复审②的位置关系）',
+           False, '锚点 currentUrl = u; 找不到 —— 续播逻辑被改名/搬走，'
+                  '这条守卫必须跟着改，不许悄悄缺')
+# ---- QA 复审③：探测落账的「校验 + 写入」必须与清账同锁 ----
+_pp = body_of(ctrl, 'private void maybeProbeAspect(final String url)')
+report('探测落账「校验+写入」整体进 synchronized（与清账同锁）',
+       _pp is not None
+       and re.search(r'synchronized\s*\(\s*MediaPlayerController\.this\s*\)', _pp)
+       is not None
+       and 'private synchronized void clearAspectUnless' in ctrl,
+       'posted Runnable 在主线程、play()/清账在 SOAP 线程，volatile 只给单字段'
+       '可见性，挡不住「校验通过 → 清账插进来 → 写入旧宽高」。两边必须同一把锁。'
+       '改成别的锁对象、或只锁一边，这条红 —— 这不是排版偏好，是 happens-before')
+# ---- QA 复审④：stsd 兜底必须认 fourcc，音频 entry 不许当视觉尺寸 ----
+as_src = strip_comments(
+    pathlib.Path('app/src/main/java/com/juping/cast/player/Mp4Aspect.java'
+                 ).read_text(encoding='utf-8'))
+_ss = body_of(as_src, 'public static int[] stsdSize(byte[] b, int off, int end)')
+report('stsdSize 读宽高前验 fourcc（白名单只认视觉轨）',
+       _ss is not None and 'isVisualEntry(' in _ss
+       and re.search(r'typeAt\(b,\s*entry\s*\+\s*4\)', _ss) is not None
+       and re.search(r"'a',\s*'v',\s*'c',\s*'1'", as_src) is not None
+       and re.search(r"'m',\s*'p',\s*'4',\s*'v'", as_src) is not None,
+       'mp4a 音频 entry 的 +32/+34 摆成 0x0500/0x02D0 就是 {1280,720} —— '
+       '「区间内的假值」MIN/MAX 闸挡不住，只有认类型才挡得住（复审④）')
+# ---- QA 复审①：fitInside 判方向用交叉相乘 + 结果钳进面板 ----
+_fi = body_of(as_src, 'public static int[] fitInside(int w, int h, int panelW, int panelH)')
+report('fitInside 判方向用交叉相乘且结果钳回面板（绝不超框）',
+       _fi is not None
+       and re.search(r'\(long\)\s*w\s*\*\s*panelH\s*>\s*\(long\)\s*h\s*\*\s*panelW',
+                     _fi) is not None
+       and re.search(r'>\s*panelW', _fi) is not None
+       and re.search(r'>\s*panelH', _fi) is not None
+       and re.search(r'public static int\[\] fitInside\(', as_src) is not None,
+       '交叉相乘没有除法 → 无截断误差、不用给除数 0 开分支；钳位保证四舍五入'
+       '与除法的舍入差不会把盒子算出面板 —— 超框就是被裁而不是黑边。'
+       '改成除法判方向就要重推边界（h/w 为 0 的分支极易漏）—— 这就是钉写法的理由')
 rf_aspect = body_of(main_act, 'private void refresh()')
 report('refresh 每 tick 调 applyVideoAspect（探测异步到达也要跟上）',
        rf_aspect is not None and 'applyVideoAspect(' in rf_aspect,
@@ -3235,7 +3311,10 @@ report('MediaPlayerController.play 方法体已找到', play_body is not None,
        '锚点：public synchronized boolean play(String url)')
 if play_body:
     _cur = play_body.find('currentUrl = url')
-    _clr = play_body.find('aspectUrl = null')
+    # 锚点重定向（QA 复审②）：内联清账被抽成 clearAspectUnless()，因为续播
+    # 路径（不走 play()）也要清 —— 判据只能有一份。原来找 'aspectUrl = null'
+    # 的话这里会静默变 -1 挡红 —— 抽方法与改签名同一类坑，锚点跟着方法名走。
+    _clr = play_body.find('clearAspectUnless(')
     _st = play_body.find('startInternal()')
     report('换片源按地址清账（清账在 currentUrl=url 之后、startInternal 之前）',
            _cur >= 0 and _clr > _cur and (_st < 0 or _clr < _st),

@@ -353,14 +353,9 @@ public class MediaPlayerController {
         // 把用户刚投上来的新视频顶掉。表现就是"投了新视频，画面跳回上一个"。
         cancelPendingRetry();
         currentUrl = url;
-        // 换了片源，按地址记的宽高账立刻作废：新片源在探完之前若还拿着上一部的
-        // 宽高去摆软件信箱，黑边方向直接错（横屏视频被摆成竖屏）。探测结果
-        // 是**按地址**成立的，地址一变就必须全清，等新地址探完再落账。
-        if (!url.equals(aspectUrl)) {
-            videoAspect = null;
-            aspectUrl = null;
-            aspectProbing = null;
-        }
+        // 换了片源，按地址记的宽高账立刻作废 —— 判据抽在 clearAspectUnless
+        // 里（play() 与续播两条路共用，见该方法注释）。
+        clearAspectUnless(url);
         retryCount = 0;
         stallCount = 0;
         userPaused = false;
@@ -562,6 +557,11 @@ public class MediaPlayerController {
                             @Override
                             public void run() {
                                 currentUrl = u;
+                                // 续播绕过了 play()（不经 SOAP、不重进那条幂等判定），
+                                // 但「换片源清宽高账」这一步**不能跟着被绕过**：
+                                // 视频→视频续播时不清账，新片探完之前会拿着上一部
+                                // 的宽高摆信箱 —— 黑边方向直接错（QA 复审②）。
+                                clearAspectUnless(u);
                                 startInternal();
                                 if (listener != null) {
                                     listener.onSourceChanged(u, m);
@@ -1444,6 +1444,35 @@ public class MediaPlayerController {
     }
 
     /**
+     * 换片源时作废「按地址记的宽高账」—— 除 {@code url} 之外三个字段全清。
+     *
+     * <p>新片源在探完之前若还拿着上一部的宽高去摆软件信箱，黑边方向直接错
+     * （横屏视频被摆成竖屏）。探测结果是**按地址**成立的，地址一变就必须全清，
+     * 等新地址探完再落账。
+     *
+     * <p><b>为什么抽成方法而不是内联在 {@link #play} 里</b>：清账这条路有**两个**
+     * 入口 —— SOAP 换片走 {@code play()}，播放列表续播（onCompletion 接棒）直接
+     * {@code currentUrl = u; startInternal();}，**不经过 play()**。当初就漏了后者：
+     * 视频→视频续播时上一部的宽高还挂在新片上（QA 复审②）。两个入口调同一个方法，
+     * 判据只有一份，不会再漂移。
+     *
+     * <p>判据用「不等于才清」：同一个地址重发 Set（拖拽进度条那类幂等路径）时
+     * {@code aspectUrl} 仍是它，清了会把已探到的宽高白白丢掉、再探一次。
+     *
+     * <p><b>必须和落账用同一把锁</b>（{@code MediaPlayerController.this}）：
+     * 清账与「校验 + 写入」是两对跨线程的读写，不进同一临界区就没有
+     * happens-before —— 旧宽高可能盖到新片源上。见 {@link #maybeProbeAspect}
+     * 纪律第 3 条。{@code play()} 本身是 synchronized，这里是可重入的。
+     */
+    private synchronized void clearAspectUnless(String url) {
+        if (!url.equals(aspectUrl)) {
+            videoAspect = null;
+            aspectUrl = null;
+            aspectProbing = null;
+        }
+    }
+
+    /**
      * 当前片源的真实视频宽高（软件信箱用）；{@code null} = 还没探到 / 探不到 / 不是直连 MP4。
      *
      * <p>界面据此按比例摆 SurfaceView —— 判据的权威在这里（探测与按地址记账都在
@@ -1463,11 +1492,13 @@ public class MediaPlayerController {
      *       （探测中）等于这个地址就早退 —— 同一个地址不重复探、不并发探。</li>
      *   <li><b>只对非 m3u8 有意义</b>：这里**不**重复挡 m3u8，交给
      *       {@link VideoAspectProbe#probe} 自己挡 —— 红线只留一处，两处判据迟早漂移。</li>
-     *   <li><b>结果切回主线程再落账</b>：{@code videoAspect} 等字段是 volatile，
-     *       跨线程直接写本身是安全的；但「排队期间是否已换片 / 停止」的一致性校验
-     *       必须和 {@link #currentUrl} 的读在同一时刻 —— 统一在 handler.post 里做，
-     *       避免「校验通过 → 换片 → 写入旧宽高」的竞态。而换片/停止都会清账
-     *       （见 {@link #play}），所以只要落账时地址对得上，写进去的就是当前片源的。</li>
+     *   <li><b>结果切回主线程再落账，且「校验 + 写入」整体持锁</b>：posted 的
+     *       Runnable 跑在主线程，而清账的 {@code play()} 跑在 SOAP 线程 ——
+     *       两边都是「先校验地址、再写字段」的两步操作，只靠 volatile **没有
+     *       happens-before**：清账可能恰好插在校验与写入之间，旧片源的宽高
+     *       就盖到了新片源头上（黑边方向反）。必须与清账用**同一把锁**
+     *       （{@code MediaPlayerController.this}）把两步捆成一个临界区 ——
+     *       换锁、或只锁其中一边，这个竞态就回来了。</li>
      *   <li><b>失败静默</b>：探到 {@code null} 也照样记 {@link #aspectUrl} ——
      *       表示"这个地址探过了、没有"，免得每个 tick 反复探。</li>
      * </ol>
@@ -1488,19 +1519,25 @@ public class MediaPlayerController {
                 handler.post(new Runnable() {
                     @Override
                     public void run() {
-                        // 排队期间可能已换片 / 停止：只有当前地址仍是它才落账。
-                        if (!url.equals(currentUrl)) {
-                            // 这次探测已过期。若占位仍是它，摘掉，免得这个地址
-                            // 以后再被当成"正在探"而永远不探（换片会清账，但
-                            // 停止→重投同一个地址这条路上要靠这里兜住）。
-                            if (url.equals(aspectProbing)) {
-                                aspectProbing = null;
+                        // 「校验 + 写入」整体进临界区 —— 与 play()（synchronized）、
+                        // clearAspectUnless（synchronized）同一把锁。
+                        // volatile 只保证单字段读写的可见性，挡不住
+                        // 「校验通过 → 清账插进来 → 写入」这种复合操作被切开。
+                        synchronized (MediaPlayerController.this) {
+                            // 排队期间可能已换片 / 停止：只有当前地址仍是它才落账。
+                            if (!url.equals(currentUrl)) {
+                                // 这次探测已过期。若占位仍是它，摘掉，免得这个地址
+                                // 以后再被当成"正在探"而永远不探（换片会清账，但
+                                // 停止→重投同一个地址这条路上要靠这里兜住）。
+                                if (url.equals(aspectProbing)) {
+                                    aspectProbing = null;
+                                }
+                                return;
                             }
-                            return;
+                            videoAspect = size;
+                            aspectUrl = url;
+                            aspectProbing = null;
                         }
-                        videoAspect = size;
-                        aspectUrl = url;
-                        aspectProbing = null;
                     }
                 });
             }
