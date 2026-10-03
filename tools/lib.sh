@@ -13,6 +13,25 @@
 #
 # 本文件只定义函数：不执行动作、不改 shell 选项，单独运行无副作用。
 
+# 选定工具链根目录并导出 TOOLCHAIN。
+#
+# 为什么单独抽出来：build.sh 与 policy-test/run.sh 都要这个路径。原先两处
+# 各推导一份，而 run.sh 那份**没导出**，于是单独跑 run.sh（不走 build.sh）
+# 时 `$TOOLCHAIN` 在 `set -u` 下炸成「TOOLCHAIN: unbound variable」——
+# 而且炸在脚本中段：它后面的检查全都没跑，输出看上去却像跑完了。
+# 谁 source 谁就有，从根上消掉这类「少跑一半还看着是绿的」。
+#
+# 注意：resolve_java_home 里「JAVA_HOME 已可用就直接 return」那条捷径
+# **不会**经过这里（CI 上 setup-java 设了 JAVA_HOME，走的就是那条），
+# 所以需要 TOOLCHAIN 的脚本必须显式调本函数，别指望 resolve_java_home
+# 顺手带出来。
+resolve_toolchain() {
+    if [ -n "${TOOLCHAIN:-}" ]; then
+        return 0
+    fi
+    export TOOLCHAIN="${ANDROID_BUILD_HOME:-$HOME/.android-build}"
+}
+
 # 选定一个可用的 JDK 并把 JAVA_HOME 导出。
 #
 # 顺序：
@@ -32,12 +51,12 @@ resolve_java_home() {
     if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/javac" ]; then
         return 0
     fi
-    local toolchain="${ANDROID_BUILD_HOME:-$HOME/.android-build}"
-    if [ -x "$toolchain/jdk/Contents/Home/bin/javac" ]; then
-        export JAVA_HOME="$toolchain/jdk/Contents/Home"
-    elif [ -x "$toolchain/jdk/bin/javac" ]; then
-        export JAVA_HOME="$toolchain/jdk"
+    resolve_toolchain
+    if [ -x "$TOOLCHAIN/jdk/Contents/Home/bin/javac" ]; then
+        export JAVA_HOME="$TOOLCHAIN/jdk/Contents/Home"
+    elif [ -x "$TOOLCHAIN/jdk/bin/javac" ]; then
+        export JAVA_HOME="$TOOLCHAIN/jdk"
     else
-        export JAVA_HOME="$toolchain/jdk/Contents/Home"
+        export JAVA_HOME="$TOOLCHAIN/jdk/Contents/Home"
     fi
 }

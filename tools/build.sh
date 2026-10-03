@@ -34,10 +34,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 # --- 工具链路径 ---
-TOOLCHAIN="${ANDROID_BUILD_HOME:-$HOME/.android-build}"
-# JDK 的定位逻辑已收敛到 tools/lib.sh（原先在本文件 + 四个 run.sh 里各有一份，
+# 推导已收敛到 tools/lib.sh 的 resolve_toolchain()（原先本文件与
+# policy-test/run.sh 各写一份，run.sh 那份还漏了导出 —— 单独跑会 unbound）。
+# JDK 的定位逻辑同样收敛在那里（原先在本文件 + 四个 run.sh 里各有一份，
 # 注释里自己写着「改一处要同步另一处」）。选择顺序与理由见该文件。
 . "$ROOT/tools/lib.sh"
+resolve_toolchain
 resolve_java_home
 export ANDROID_HOME="$TOOLCHAIN/sdk"
 export ANDROID_SDK_ROOT="$TOOLCHAIN/sdk"

@@ -23,13 +23,21 @@ import java.util.regex.Pattern;
  * 用户看到的是 {@code 6a3f9c2b.mp3} 而不是「夜曲」。
  *
  * <h3>为什么不上 XML 解析器</h3>
- * 目标设备只有 0.6GB 内存，而 {@code DocumentBuilderFactory} 在 Dalvik 上
- * 要为一次几百字节的解析拉起整套 SAX/DOM 基础设施 —— 代价和收益不成比例。
- * 元数据的结构是**控制点生成的、高度规整**的（就那么几个元素），
- * 用正则抠足够可靠。
+ * 先把话说准：这里说的是 {@code XmlPullParser}（流式，开销很小），
+ * **不是** {@code DocumentBuilderFactory}。后者确实会在 Dalvik 上为一次
+ * 几百字节的解析拉起整套 SAX/DOM 基础设施，但流式解析器没有这个问题 ——
+ * 所以「0.6GB 设备上性能不够」**不是**本类不用它的理由。
+ * （这段注释曾经就是这么写的，理由是错的，2026-10-03 改正。）
  *
- * <p>另一个好处：这个类是纯 Java，没有任何 Android 依赖，
- * 所以协议测试可以把它编进去、直接断言解析结果。
+ * 真正的理由：换成 {@code XmlPullParser} 会引入 {@code android.*} 依赖。
+ * 而本文件被 {@code tools/protocol-test/run.sh} 用 {@code javac} 直接编进
+ * 桌面测试，{@code ProtocolTestServer} 里有一组断言挂在协议闸门上
+ * （实体只转义一次、{@code dc:title} 与无前缀写法都认、封面多档位择优……）。
+ * 一旦绑死 Android，这些断言就只能上真机或模拟器才跑得了 ——
+ * 而它们值钱的地方恰恰是「不用真机，{@code javac} 一编就能红」。
+ *
+ * 元数据的结构是**控制点生成的、高度规整**的（就那么几个元素），
+ * 用正则抠足够可靠；畸形 XML 的容错不是本类的目标。
  */
 public final class DidlLite {
 

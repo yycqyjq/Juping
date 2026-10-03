@@ -20,6 +20,10 @@ cd "$ROOT"
 # JDK 的定位收敛到 tools/lib.sh（原先在 build.sh + 三个 run.sh 里各有一份，
 # 那段注释自己都写着「两处必须保持一致」—— 收敛掉这个隐患）。顺序见该文件。
 . "$HERE/../lib.sh"
+# TOOLCHAIN 也要显式要一次：下面第 2 步用它拼 android.jar 路径。
+# 不能只靠 resolve_java_home —— 它在「环境里已有可用 JAVA_HOME」时会
+# 提前 return（CI 上就是），根本走不到推导那一句，于是这里又变回 unbound。
+resolve_toolchain
 resolve_java_home
 JAVAC="$JAVA_HOME/bin/javac"
 JAVA="$JAVA_HOME/bin/java"
