@@ -1328,9 +1328,12 @@ if err:
            'prepare 失败时不复位，重连之后 Play 会被误判成"准备中"而永不生效')
 
 # ---- ② 进度同步：seek 待决期间的三处特殊处理 ----
-sk = body_of(ctrl, 'public synchronized void seekTo(int ms)')
+# 锚点用 `public void seekTo(int ms)`：seekTo **刻意不再是 synchronized**（修 A ①）——
+# 持锁调 native 的那一版会把实例锁交给一次挂起的 seek，7 个以上 upnp-conn 线程
+# 排在后面，「下一集 / 停止 / 换片源」全部无响应（真机 ANR 取证）。
+sk = body_of(ctrl, 'public void seekTo(int ms)')
 report('MediaPlayerController.seekTo 方法体已找到', sk is not None,
-       '锚点：public synchronized void seekTo(int ms)')
+       '锚点：public void seekTo(int ms)')
 if sk:
     report('seekTo 把水位线对齐到目标（防回拖误外推到片尾）',
            'hiRaw = ms' in sk,
@@ -1340,6 +1343,13 @@ if sk:
     report('seekTo 在未 prepare 时暂存目标，而不是丢弃',
            'pendingSeekMs' in sk,
            '丢弃的话，手机显示已经拖过去了、电视一动不动 —— 正是"不同步"')
+if sk:
+    # native 的 seekTo 必须落在 synchronized 块**外**：状态更新收在短临界区，
+    # 调用本身不持锁 —— 否则一次挂起的 seek 就把整个实例锁带走了。
+    report('seekTo 的 native 调用在锁外（挂起的 seek 不得占着实例锁）',
+           'synchronized' in sk and 'mp.seekTo(ms)' in sk
+           and sk.index('synchronized') < sk.index('mp.seekTo(ms)'),
+           '持锁调 native：一次不返回的 seek 会让同实例上所有控制指令一起排队等锁')
 
 gp = body_of(ctrl, 'public int getPosition()')
 report('MediaPlayerController.getPosition 方法体已找到', gp is not None,
@@ -1414,7 +1424,7 @@ if cs:
                '不排除的话，正常直播会被反复重建，从"不播"变成"不停重启"')
 
 for label, marker in [('stop()', 'public synchronized void stop()'),
-                      ('releasePlayer()', 'private void releasePlayer()')]:
+                      ('releasePlayer()', 'private boolean releasePlayer(Runnable onReleased)')]:
     b = body_of(ctrl, marker)
     report('%s 里清掉 seek 待决状态' % label,
            b is not None and re.search(r'pendingSeekMs\s*=\s*-1', b) is not None,
@@ -1508,7 +1518,7 @@ if oc:
                      oc) is not None,
            '只停止补发、不清 pendingSeekMs 的话，位置会被永久报成那个到不了的目标点，'
            '控制点的进度条冻死在那儿')
-    seek_body = body_of(ctrl, 'public synchronized void seekTo(int ms)')
+    seek_body = body_of(ctrl, 'public void seekTo(int ms)')
     report('seekTo 每次新拖拽都重置补发计数',
            seek_body is not None and 'seekReplayCount = 0' in seek_body,
            '不清的话，一次失败的 seek 会让"以后所有 seek"都被当成厂商做不到而直接放弃')
@@ -1526,7 +1536,7 @@ if gp:
     report('getPosition 采样「观察到的最远位置」',
            'maxPlayedMs' in gp,
            '控制点轮询是另一路采样点；两路必须都在，否则一条投屏路径上判据就失灵')
-rl = body_of(ctrl, 'private void releasePlayer()')
+rl = body_of(ctrl, 'private boolean releasePlayer(Runnable onReleased)')
 report('releasePlayer 复位「观察到的最远位置」',
        rl is not None and 'maxPlayedMs' in rl,
        '新实例是另一次播放（重连 / 换片 / 续播）—— 不复位的话，'
@@ -2001,9 +2011,14 @@ report('MediaPlayerController.stop 方法体已找到', st is not None,
        '锚点：public synchronized void stop()')
 if st:
     report('stop 里显式解绑 Surface，且在 releasePlayer 之前',
-           re.search(r'setSurface\(null\)[\s\S]*?releasePlayer\(\)', st) is not None,
+           re.search(r'setSurface\(null\)[\s\S]*?releasePlayer\(', st) is not None,
            '先交出输出面再释放，视频层才会立刻关闭；'
            '直接 release 的话某些平台上那一层会残留一段时间')
+    # 但 native 已挂起时要跳过 setSurface(null)：它同样是 native 调用，会排在
+    # 挂起的那次 seek 后面 —— 而 Stop 正是用户在卡死时最想按的那个键。
+    report('stop 在 native 挂起时跳过 setSurface(null)（别让 Stop 也堵住）',
+           'isProbeWedged()' in st,
+           '挂起态下 setSurface(null) 会跟着堵死调用线程 —— Stop 键失效')
 
 # ---- ④ 进度同步：状态映射 + 位置兜底 + 事件带位置 ----
 sc = body_of(svc_c, 'public void onStateChanged(String state)')
@@ -3120,14 +3135,15 @@ report('dex 核查表收录 OnInfoListener（否则闸门报「没被核到」�
 # 真机 A/B 定案：releasePlayer 的 reset() 触发厂商异步 reset_nosync，污染新实例
 # 的 prepareAsync（"already reset" 空操作）→ 投视频先蓝屏 30 秒。
 # 这组守卫钉的是「修好的东西别被改回去」—— 设计见 `.agent/video-bluescreen-plan.md`。
-rlp = body_of(ctrl, 'private void releasePlayer()')
+rlp = body_of(ctrl, 'private boolean releasePlayer(Runnable onReleased)')
 report('releasePlayer 已找到且不含 player.reset()（F1 的直接回归判据）',
        rlp is not None and 'player.reset(' not in rlp,
-       '锚点：private void releasePlayer()。reset() 一旦被加回来，换片必现'
+       '锚点：private boolean releasePlayer(Runnable onReleased)。reset() 一旦被加回来，换片必现'
        '「prepareAsync 空操作 → 蓝屏到看门狗重建」—— 这是本 bug 的竞态源头，'
        '实例释放后从不复用，reset() 没有任何留存理由')
 report('releasePlayer 仍然 release 并置空（去 reset 不等于不释放）',
-       rlp is not None and 'player.release()' in rlp and 'player = null' in rlp,
+       rlp is not None and re.search(r'\.release\(\)', rlp) is not None
+       and 'player = null' in rlp,
        '只防「加回 reset」不防「顺手删 release」的话，实例泄漏在 0.6GB 盒子上'
        '比蓝屏更糟')
 report('prepare 卡死阈值已降到 10s（F2 安全网，不再是 30s）',
@@ -3351,6 +3367,146 @@ report('build.sh 有 version 子命令（patch/minor/major 自动升，免手改
        and 'versionCode %d' in build_sh,
        '硬闸只堵不疏的话，每次升版都得手改 build.gradle 两行（改漏一边就是'
        ' versionName 没动 / versionCode 没 +1）—— 子命令让升版是一步动作')
+
+sys.exit(1 if failed else 0)
+PY
+
+# ── 12. native 采样层：主线程绝不直调 native（修 A）──
+# 守的是真机 ANR：厂商栈（海信 MTK）的 MediaPlayer.seekTo() 挂住不返回，握着实例的
+# native 串行锁 —— 同实例的 getCurrentPosition()/getDuration() 全部跟着堵死。
+# 原来主线程每 0.5 秒直调一次 native 查询，于是主线程被冻住：界面卡死、所有控制指令
+# （Seek / Stop / SetAVTransportURI）一起无响应，7 个以上 upnp-conn 线程排在同一个
+# 实例锁后面。取证：/data/anr/traces.txt（pid 1733）。
+#
+# 这一节的守卫有个共同点：**破坏它们之后，编译、运行、日志全都正常**，
+# 只是在某台盒子上某一天又卡一次 —— 那种回归只能钉在源码上。
+echo
+echo "── 12. native 采样层：主线程绝不直调 native（修 A）──"
+python3 - "$CTRL" "$ACT" "$POLICY" <<'PY' || RC=1
+import re, sys, pathlib
+
+ctrl_path, act_path, pol_path = sys.argv[1], sys.argv[2], sys.argv[3]
+ctrl = pathlib.Path(ctrl_path).read_text(encoding='utf-8')
+act = pathlib.Path(act_path).read_text(encoding='utf-8')
+pol = pathlib.Path(pol_path).read_text(encoding='utf-8')
+failed = []
+
+def report(name, ok, detail=''):
+    print('  [%s] %s%s' % ('PASS' if ok else 'FAIL', name,
+                           ('\n         ' + detail) if detail else ''))
+    if not ok:
+        failed.append(name)
+
+def body_of(src, marker):
+    i = src.find(marker)
+    if i < 0:
+        return None
+    j = src.find('{', i)
+    if j < 0:
+        return None
+    depth, k = 0, j
+    while k < len(src):
+        if src[k] == '{':
+            depth += 1
+        elif src[k] == '}':
+            depth -= 1
+            if depth == 0:
+                return src[j:k + 1]
+        k += 1
+    return None
+
+NATIVE_READS = ('player.getCurrentPosition()', 'player.getDuration()',
+                'player.isPlaying()')
+
+# ① 三个「谁都会调」的访问器里不许出现 native 读 —— 它们是 ANR 的三个堵点
+for label, marker in [('getPosition()', 'public int getPosition()'),
+                      ('getDuration()', 'public int getDuration()'),
+                      ('checkStall()', 'private void checkStall()')]:
+    b = body_of(ctrl, marker)
+    report('MediaPlayerController.%s 方法体已找到' % label, b is not None,
+           '锚点：%s' % marker)
+    if b:
+        bad = [x for x in NATIVE_READS if x in b]
+        report('%s 不直调 native（只读采样缓存）' % label, not bad,
+               ('仍出现：' + ' / '.join(bad)) if bad else
+               '走到这里的可能是主线程（界面 ticker / 看门狗）或 HTTP 线程'
+               '（控制点轮询）—— 而 native 可能正被一次挂起的 seek 占着')
+
+# ② 探针线程：全进程唯一的周期性 native 读者
+report('探针线程存在（startSampler / samplerLoop）',
+       'private void startSampler(MediaPlayer owner)' in ctrl
+       and 'private void samplerLoop()' in ctrl
+       and 'juping-native-probe' in ctrl,
+       '没有它，缓存就没人刷新 —— 进度条与看门狗一起失明')
+report('采样间隔取自 PlaybackPolicy（不许在控制器里再写一份字面量）',
+       'PlaybackPolicy.POSITION_SAMPLE_INTERVAL_MS' in ctrl,
+       '字面量散落两处，迟早一处改了另一处没改')
+report('onPrepared 垫一次时长并启动探针',
+       re.search(r'onPrepared\(MediaPlayer mp\)[\s\S]{0,5000}?cachedDurationMs\s*=',
+                 ctrl) is not None
+       and re.search(r'onPrepared\(MediaPlayer mp\)[\s\S]{0,5000}?startSampler\(mp\)',
+                     ctrl) is not None,
+       'onPrepared 是 native 刚回调上来的时刻 —— 那是整个生命周期里唯一'
+       '可以放心直调 getDuration() 的窗口')
+report('探针随实例重建（releasePlayer 里 stopSampler）',
+       body_of(ctrl, 'private boolean releasePlayer(Runnable onReleased)') is not None
+       and 'stopSampler()' in body_of(ctrl,
+                                      'private boolean releasePlayer(Runnable onReleased)'),
+       '不复位的话，新实例起来后读的还是旧实例的位置 —— 进度条永远不动')
+
+# ③ native 挂起时释放必须挪到后台：否则 ANR 只是从 ticker 搬到「重建播放器」
+rlp = body_of(ctrl, 'private boolean releasePlayer(Runnable onReleased)')
+report('releasePlayer 有「native 已挂起」分支', rlp is not None and 'isProbeWedged()' in rlp,
+       '少了它，release() 会排在挂起的 seek 后面 —— 主线程一碰又是 ANR')
+report('挂起分支把 release 交给后台线程，完成后回主线程继续',
+       rlp is not None and 'new Thread(' in rlp and 'handler.post(onReleased)' in rlp,
+       '主线程不能等：等的就是那次不返回的 native 调用')
+report('挂起分支在同步释放之前就 return（同步路径不得继续走）',
+       rlp is not None and re.search(
+           r'if \(wedged\)[\s\S]*?t\.start\(\)[\s\S]*?return false;', rlp) is not None,
+       '两条路都往下走的话，旧实例被释放两次')
+report('startInternal 尊重「释放已改到后台」的返回值',
+       'if (!releasePlayer(' in ctrl,
+       '不尊重的话，旧实例还没释放完就 new MediaPlayer() —— '
+       'teardown 落到新实例的 prepareAsync 头上（蓝屏 F1 那个竞态）')
+
+# ④ seek 落地看门狗：超时后重建，判据收在 PlaybackPolicy
+cs = body_of(ctrl, 'private void checkStall()')
+report('checkStall 用 shouldRebuildOnSeekTimeout 判「该不该重建」',
+       cs is not None and 'shouldRebuildOnSeekTimeout(' in cs,
+       '判据收在纯逻辑层，边界（在飞 / 超时 / 补发预算）才能在桌面上跑断言')
+report('seek 超时后确实重建（存 seekAfterRebuildMs 再 scheduleRetry）',
+       cs is not None and 'seekAfterRebuildMs = pending' in cs
+       and 'scheduleRetry()' in cs,
+       '只清 pendingSeekMs 不重建的话，那一次 seek 永远落不了地、播放器就此僵住')
+report('重建判定在清 pendingSeekMs **之前**（判据要的正是「还没落地」）',
+       cs is not None and re.search(
+           r'shouldRebuildOnSeekTimeout\([\s\S]*?pendingSeekMs\s*=\s*-1', cs) is not None,
+       '清完再判，seekInFlight 恒为假 —— 看门狗永远不重建')
+
+# ⑤ 挂起态下从主线程走进来的 native 调用一律跳过
+report('setSurface 在 native 挂起时跳过',
+       re.search(r'public void setSurface\(Surface surface\)[\s\S]{0,900}?isProbeWedged\(\)',
+                 ctrl) is not None,
+       '它由界面（SurfaceHolder 回调）在主线程上调用 —— 挂起态下就是一次现成的 ANR')
+report('pause 在 native 挂起时不下发',
+       re.search(r'public synchronized void pause\(\)[\s\S]{0,900}?isProbeWedged\(\)',
+                 ctrl) is not None,
+       'Pause 是用户在卡死时的第一反应，不能让它也堵在挂起的那次 native 后面')
+report('resume 在 native 挂起时不下发',
+       re.search(r'public synchronized void resume\(\)[\s\S]{0,1200}?isProbeWedged\(\)',
+                 ctrl) is not None,
+       '同 pause；挂起态下那个实例已经僵住，等看门狗重建')
+
+# ⑥ 判据与常量必须落在 PlaybackPolicy（可断言），不许写死在控制器里
+report('挂起阈值与采样间隔定义在 PlaybackPolicy',
+       'NATIVE_PROBE_STUCK_MS' in pol and 'POSITION_SAMPLE_INTERVAL_MS' in pol,
+       '写死在控制器里就没法在桌面上把边界跑一遍')
+
+# ⑦ 界面层不得自己绕过控制器去读 native
+report('MainActivity 读进度只经 service.getPlayer()（不自己 new 播放器）',
+       'getPlayer().getPosition()' in act and 'getPlayer().getDuration()' in act,
+       '界面拿到的必须是控制器那份缓存；自己持实例就绕过了采样层')
 
 sys.exit(1 if failed else 0)
 PY

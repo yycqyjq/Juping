@@ -469,6 +469,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (service.getPlayer() == null) {
             return;
         }
+        // 下面两句原来每 0.5 秒**直调 native**（getCurrentPosition / getDuration）。
+        // 真机 ANR 取证（/data/anr/traces.txt，pid 1733）里主线程正是冻在这两句上：
+        // 厂商栈的 MediaPlayer.seekTo() 挂住不返回，握着实例的 native 串行锁，
+        // 主线程这两句跟着一起堵 —— UI 卡死、所有控制指令无响应。
+        //
+        // 现在它们读的是 MediaPlayerController 里的采样缓存，native 只由那条探针线程读。
+        // 调用点**刻意不改**：改的是语义（缓存代替直读），不是调用方 ——
+        // 这样界面这一层不需要知道 native 会不会挂。
         int pos = service.getPlayer().getPosition() / 1000;
         int dur = service.getPlayer().getDuration() / 1000;
         // 位置可能短暂越过总时长 —— HTTP 流的分段时长估算是会浮动的，
@@ -1046,6 +1054,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (service == null || service.getPlayer() == null) {
             return false;
         }
+        // 读的是缓存时长（onPrepared 垫底、探针线程刷新），不是 native ——
+        // 这一句原来也在主线程上直调 native，同样是 ANR 的堵点之一。
         if (service.getPlayer().getDuration() > 0) {
             return true;
         }

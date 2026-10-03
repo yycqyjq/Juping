@@ -114,7 +114,14 @@ public class MediaPlayerController {
         this.context = context;
     }
 
-    private MediaPlayer player;
+    /**
+     * 当前播放器实例。
+     *
+     * <p>{@code volatile}：探针线程每 250ms 读它一次（判断「我负责的那个实例还在不在」），
+     * 而它由主线程与 HTTP 线程改写。原来只有主线程碰它，加探针之后必须补上可见性 ——
+     * 否则探针可能拿着一个已经释放的旧实例继续问位置。
+     */
+    private volatile MediaPlayer player;
     private Surface surface;
 
     /**
@@ -137,6 +144,61 @@ public class MediaPlayerController {
 
     private String currentUrl;
     private boolean prepared;
+
+    // ─────────────────────────── native 采样缓存（修 A 的基石）───────────────────────────
+    //
+    // 下面这一组字段回答同一个问题：**native 播放器只能由谁读**。
+    //
+    // 答案是「只有探针线程」。原因是真机 ANR 取证（/data/anr/traces.txt，pid 1733）：
+    // 厂商栈（海信 MTK）的 MediaPlayer.seekTo() 会挂住不返回，而它握着实例的 native
+    // 串行锁 —— 同实例的 getCurrentPosition()/getDuration() 全部跟着堵。原来的主线程
+    // ticker 每 0.5 秒直调一次 native 查询，于是主线程被冻死：UI 卡死、所有控制指令
+    // （Seek / Stop / SetAVTransportURI）一起无响应，7 个以上 upnp-conn 线程排在同一个
+    // 实例锁后面等。
+    //
+    // 现在：探针线程独占 native 读 → 写下面这几个缓存；界面、看门狗、控制点回读
+    // （DlnaRendererService）一律读缓存。挂起的那次 seek 最多拖住探针，拖不住 UI。
+    //
+    // 见 PlaybackPolicy.POSITION_SAMPLE_INTERVAL_MS 的说明。
+
+    /** 最近一次采样到的**原始**位置（毫秒）。native 的读只发生在探针线程。 */
+    private volatile int cachedPositionMs;
+
+    /** 上面那个位置被采到的墙钟；0 = 本次播放还没采到过。 */
+    private volatile long cachedSampleAtMs;
+
+    /**
+     * 缓存的时长（毫秒）。
+     *
+     * <p>onPrepared 里先垫一次（那时 native 一定没挂），之后由探针线程刷新。
+     * 界面判「有没有内容」（{@code MainActivity.isPlaying()}）与控制点回读都看它 ——
+     * 原来它们每拍直调 {@code getDuration()}，正是 ANR 里主线程被冻死的那一句。
+     */
+    private volatile int cachedDurationMs;
+
+    /** 缓存的「是否正在播放」。{@code isActivelyPlaying()} 的外推判据要用它。 */
+    private volatile boolean cachedPlaying;
+
+    /**
+     * 探针这一次采样**正在读的那个实例**；{@code null} = 当前不在 native 里。
+     *
+     * <p>与 {@link #cachedSampleAtMs} 的区别：那个是「上一次**成功**采样的时刻」，
+     * 这个是「这一次采样**正在**进行」。只有后者能区分两种沉默：
+     * 「播放器停了所以没数据」与「探针被 native 卡住了」——
+     * 前者可以照常重建，后者一碰 native 就跟着堵死。
+     *
+     * <p><b>为什么要连实例一起记</b>：卡住的那条探针线程**永远回不来**，
+     * 它留下的时间戳会一直挂着。等新实例建好、又需要释放时，如果只看时间戳，
+     * 就会把新实例也误判成「挂起」—— 于是每一次释放都走后台，白绕一圈。
+     * 带上实例引用，判据自然只对「当前这个实例」成立。
+     */
+    private volatile MediaPlayer probeInFlightOwner;
+    private volatile long probeInFlightSinceMs;
+
+    /** 探针线程本体与开关；随实例重建而重起（旧的那条可能正卡在 native 里，让它自己烂掉）。 */
+    private Thread sampler;
+    private volatile boolean samplerRunning;
+    private volatile MediaPlayer samplerOwner;
 
     /**
      * 当前片源的真实视频宽高（软件信箱用）；{@code null} = 还没探到 / 探不到。
@@ -316,7 +378,11 @@ public class MediaPlayerController {
     /** SurfaceView 的 Surface 就绪 / 重建时调用 */
     public void setSurface(Surface surface) {
         this.surface = surface;
-        if (player != null) {
+        // native 已挂起时不碰实例：setSurface() 会排在挂起的那次 native 调用后面，
+        // 而这条路径是从界面（主线程）走进来的 —— 那就是一次现成的 ANR。
+        // 挂起态下画面本来已经僵住，等看门狗重建出新实例，surface 会在那时重新挂上
+        // （startInternal 里有 `if (surface != null) player.setSurface(surface)`）。
+        if (player != null && !isProbeWedged()) {
             try {
                 player.setSurface(surface);
             } catch (Exception e) {
@@ -383,7 +449,21 @@ public class MediaPlayerController {
     }
 
     private void startInternal() {
-        releasePlayer();
+        // 释放可能被挪到后台线程（native 已挂起时）—— 那种情况下**先返回**，
+        // 等释放完成再由回调重新进来。不能在这里同步等：等的就是那次挂起的 native。
+        // 重新进来时 player 已是 null，releasePlayer 立刻返回 true，正常往下走。
+        if (!releasePlayer(new Runnable() {
+            @Override
+            public void run() {
+                // 后台释放完成 —— 世界可能已经变了（用户暂停了、停止投屏了），
+                // 与 pendingRetry 的回调同一条纪律：条件不成立就不再起播。
+                if (!userPaused && currentUrl != null) {
+                    startInternal();
+                }
+            }
+        })) {
+            return;
+        }
         // 新实例创建时解除「native 不可碰」—— 上一轮错误态的豁免到此为止
         nativePlayerDead = false;
         try {
@@ -505,10 +585,26 @@ public class MediaPlayerController {
                         }
                     }
 
+                    // ---- 时长在这里垫一次底，然后交给探针线程刷新 ----
+                    //
+                    // onPrepared 是 native 刚回调上来的时刻，那一刻它一定没挂 ——
+                    // 这是整个生命周期里**唯一**可以放心直调 getDuration() 的窗口。
+                    // 之后界面（每 0.5 秒判「有没有内容」）与控制点回读
+                    // （GetMediaInfo / GetPositionInfo）都读这个缓存。
+                    //
+                    // 原实现是那两处各自直调 native，而主线程那一处正是真机 ANR
+                    // （/data/anr/traces.txt，pid 1733）里被冻死的那一句。
+                    cachedDurationMs = mp.getDuration();
+                    cachedPositionMs = 0;
+                    cachedPlaying = false;
+                    cachedSampleAtMs = System.currentTimeMillis();
+                    // 探针线程随实例启动 —— 全进程唯一的周期性 native 读者
+                    startSampler(mp);
+
                     mp.start();
                     notifyState("PLAYING");
                     if (listener != null) {
-                        listener.onPrepared(mp.getDuration(), hasVideo);
+                        listener.onPrepared(cachedDurationMs, hasVideo);
                     }
                     startWatchdog();
                 }
@@ -784,7 +880,7 @@ public class MediaPlayerController {
                     Log.i(TAG, "视频尺寸延迟就绪（第 " + attempt
                             + " 次复查），从音乐形态切回视频形态");
                     if (listener != null) {
-                        listener.onPrepared(mp.getDuration(), true);
+                        listener.onPrepared(cachedDurationMs, true);
                     }
                     return;
                 }
@@ -839,7 +935,7 @@ public class MediaPlayerController {
                         Log.i(TAG, "Content-Type 为 " + type
                                 + "（getVideoWidth 恒 0 的平台），从音乐形态切回视频形态");
                         if (listener != null) {
-                            listener.onPrepared(mp.getDuration(), true);
+                            listener.onPrepared(cachedDurationMs, true);
                         }
                     }
                 });
@@ -882,6 +978,110 @@ public class MediaPlayerController {
     private void startWatchdog() {
         handler.removeCallbacks(watchdog);
         handler.postDelayed(watchdog, WATCHDOG_INTERVAL_MS);
+    }
+
+    // ───────────────────────────── native 探针（全进程唯一的 native 读者）─────────────────────────────
+
+    /**
+     * 为某个播放器实例启动探针线程。
+     *
+     * <p><b>每个实例一条，不复用。</b>卡住的那条线程永远回不来（它就堵在 native 里），
+     * 复用它等于让新实例也没有位置可读。旧线程在 native 返回后会发现
+     * {@code samplerOwner} 已经换人（或 {@code samplerRunning} 已为假）而自行退出。
+     *
+     * @param owner 这条探针负责的实例；换实例必须重起一条
+     */
+    private void startSampler(MediaPlayer owner) {
+        stopSampler();
+        samplerOwner = owner;
+        samplerRunning = true;
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                samplerLoop();
+            }
+        }, "juping-native-probe");
+        // daemon：进程要退就退，别为了它拖着不关
+        t.setDaemon(true);
+        sampler = t;
+        t.start();
+    }
+
+    /**
+     * 停掉探针。
+     *
+     * <p><b>只置标志、不 join</b>：这条线程此刻可能正卡在 native 里（那正是它需要
+     * 被换掉的原因），join 就是把调用者一起拖进同一个坑。让它自己在 native 返回后退出。
+     */
+    private void stopSampler() {
+        samplerRunning = false;
+        samplerOwner = null;
+        sampler = null;
+    }
+
+    private void samplerLoop() {
+        final MediaPlayer mine = samplerOwner;
+        while (samplerRunning && samplerOwner == mine) {
+            if (prepared && !playerReleased && !nativePlayerDead && player == mine) {
+                sampleOnce(mine);
+            }
+            try {
+                Thread.sleep(PlaybackPolicy.POSITION_SAMPLE_INTERVAL_MS);
+            } catch (InterruptedException e) {
+                return;
+            }
+        }
+    }
+
+    /**
+     * 采一拍：位置 / 时长 / 播放态，写进缓存。
+     *
+     * <p>这三句是**整个应用里仅有的**周期性 native 读。以前它们分散在主线程
+     * ticker、看门狗、控制点轮询三处，各自都能被一次挂起的 seek 冻住；
+     * 现在只有这一条线程可能被冻，而它冻住只意味着「进度条不再刷新」。
+     */
+    private void sampleOnce(MediaPlayer mp) {
+        probeInFlightOwner = mp;
+        probeInFlightSinceMs = System.currentTimeMillis();
+        try {
+            int p = mp.getCurrentPosition();
+            int d = mp.getDuration();
+            boolean playing = mp.isPlaying();
+            if (mp != player) {
+                // 采样期间换过实例：这一拍作废，别把旧实例的值写进新实例的账本
+                return;
+            }
+            cachedPositionMs = p;
+            cachedDurationMs = d;
+            cachedPlaying = playing;
+            cachedSampleAtMs = System.currentTimeMillis();
+        } catch (Exception e) {
+            // 读失败就保持上一拍的值 —— 与 getPosition/getDuration 原来在错误态下的
+            // 语义一致（报最后已知值，而不是 0 或抛出去）
+        } finally {
+            // 只清**自己这一拍**留下的标记：卡死的那条旧线程可能在很久以后才返回，
+            // 那时新实例的探针可能正在 native 里 —— 无条件清会把新探针的
+            // 「正在读」标记抹掉，挂起判据跟着失灵（该走后台释放的走了同步）。
+            if (probeInFlightOwner == mp) {
+                probeInFlightOwner = null;
+                probeInFlightSinceMs = 0;
+            }
+        }
+    }
+
+    /**
+     * 探针是不是已经被 native 卡住了。
+     *
+     * <p>判据必须是「**当前这个实例**上的那次采样」超时：卡死的旧线程留下的时间戳
+     * 不能算到新实例头上（见 {@link #probeInFlightOwner}）。
+     */
+    private boolean isProbeWedged() {
+        MediaPlayer owner = probeInFlightOwner;
+        long since = probeInFlightSinceMs;
+        return owner != null
+                && owner == player
+                && since > 0
+                && System.currentTimeMillis() - since > PlaybackPolicy.NATIVE_PROBE_STUCK_MS;
     }
 
     /**
@@ -965,33 +1165,57 @@ public class MediaPlayerController {
         if (pending >= 0) {
             long seekElapsed = System.currentTimeMillis() - pendingSeekAtMs;
             if (pendingSeekLanded || PlaybackPolicy.isSeekExpired(seekElapsed)) {
+                // ---- seek 落地看门狗（修 A ②）----
+                //
+                // 必须在清位**之前**判定：判据要的正是「还没落地」这个状态。
+                //
+                // 真机现象：拖进度条 / 点下一集之后，界面卡死、控制指令全部无响应。
+                // ANR 取证（/data/anr/traces.txt，pid 1733）显示厂商栈的
+                // MediaPlayer.seekTo() 挂住不返回，握着实例的 native 串行锁，
+                // 主线程每 0.5 秒一次的 getDuration() 跟着堵死。
+                //
+                // 光把主线程从 native 上摘下来还不够：那一次 seek 永远落不了地，
+                // 播放器就此僵在那里。所以超时后**重建播放器**，
+                // 走与「假 EOS 重建」同一套补发机制（seekAfterRebuildMs 能扛过
+                // releasePlayer，由 onPrepared 补发）。补发预算用尽就不再重建
+                // —— 那是厂商直接拒绝这个 seek 的情形，重建会变成死循环。
+                boolean rebuild = PlaybackPolicy.shouldRebuildOnSeekTimeout(
+                        !pendingSeekLanded, seekElapsed, seekReplayCount);
                 pendingSeekMs = -1L;
                 // 立刻把基准对齐到当前位置：不对齐的话，"seek 期间位置没动"这段
                 // 静止会被下一轮检查算成卡死 —— 超时兜底反而制造一次多余的重连。
                 lastProgressAt = System.currentTimeMillis();
-                try {
-                    lastPosition = player.getCurrentPosition();
-                } catch (Exception ignored) {
-                    // 读不到就保持原值，下一轮会自行对齐
-                }
+                lastPosition = cachedPositionMs;
                 // 「落地」与「超时」是两回事，日志必须分开：原来共用一句
                 // 「超过 15000ms 仍未落地，放弃等待」，正常落地也报超时告警，
                 // 且打的是阈值常量而非真实耗时 —— 排障时完全误导。这里打真实 elapsed。
                 if (pendingSeekLanded) {
                     Log.i(TAG, "seek 到 " + pending + "ms 已落地（耗时 " + seekElapsed + "ms）");
+                } else if (rebuild) {
+                    Log.w(TAG, "seek 到 " + pending + "ms 超过 "
+                            + PlaybackPolicy.SEEK_PENDING_TIMEOUT_MS + "ms 仍未落地（实际 "
+                            + seekElapsed + "ms）—— 重建播放器后补发（第 "
+                            + (seekReplayCount + 1) + " 次）");
+                    seekAfterRebuildMs = pending;
+                    seekReplayCount++;
+                    // 卡死按网络问题处理，错误重连计数清零（与下面 stallCount 分支同一条纪律）
+                    retryCount = 0;
+                    scheduleRetry();
                 } else {
                     Log.w(TAG, "seek 到 " + pending + "ms 超过 "
                             + PlaybackPolicy.SEEK_PENDING_TIMEOUT_MS + "ms 仍未落地（实际 "
-                            + seekElapsed + "ms），放弃等待");
+                            + seekElapsed + "ms），补发预算已用尽，放弃等待");
                 }
             }
             return;
         }
         try {
-            if (!player.isPlaying()) {
+            // 位置 / 时长 / 播放态一律读缓存 —— 看门狗跑在主线程上，
+            // 这三句原来是直调 native 的（真机 ANR 里主线程就冻在这儿）。
+            if (!cachedPlaying) {
                 return;
             }
-            long pos = player.getCurrentPosition();
+            long pos = cachedPositionMs;
             // 「假 EOS」判据的第二路采样：看门狗每 5 秒一拍。
             // 控制点不轮询 GetPositionInfo 时，就只剩这一路在采位置 ——
             // 没有它，判据会把「根本没采到位置」错当成「位置是 0」。
@@ -1011,7 +1235,7 @@ public class MediaPlayerController {
             }
 
             // 时长已知 → 点播流，用严格阈值；时长未知或为 0 → 直播/分段流，放宽
-            int duration = player.getDuration();
+            int duration = cachedDurationMs;
             // 「起播了，但一直没出声」：位置从起播到现在恒为 0。
             // 与「卡死」是两件事（位置前进过 vs 从来没动过），阈值也该是两档 ——
             // 详见 PlaybackPolicy.isNotStarted。真机：秋殇 mp3 起播后位置冻在 0ms
@@ -1056,7 +1280,10 @@ public class MediaPlayerController {
 
     public synchronized void pause() {
         userPaused = true;
-        if (player != null && !playerReleased && !nativePlayerDead) {
+        // native 已挂起时不碰实例：pause() 会排在挂起的那次 native 调用后面，
+        // 而 Pause 往往是用户在卡死时的第一反应 —— 不能让它也堵住。
+        // 挂起态由看门狗重建收尾（重建出来的实例本来就是停的）。
+        if (player != null && !playerReleased && !nativePlayerDead && !isProbeWedged()) {
             try {
                 if (player.isPlaying()) {
                     player.pause();
@@ -1073,6 +1300,13 @@ public class MediaPlayerController {
         int action = PlaybackPolicy.playAction(player != null && prepared, preparing,
                 currentUrl != null);
         if (action == PlaybackPolicy.PLAY_START) {
+            // native 已挂起时不碰实例（同 pause）：start() 会排在挂起的那次 native
+            // 调用后面。挂起态下"取消暂停"没有意义 —— 那个播放器已经僵住了，
+            // 等看门狗重建出来的新实例照常起播（重建路径不经过这里）。
+            if (isProbeWedged()) {
+                Log.w(TAG, "native 已挂起，resume 不下发（等看门狗重建）");
+                return;
+            }
             try {
                 player.start();
                 lastProgressAt = System.currentTimeMillis();
@@ -1166,38 +1400,61 @@ public class MediaPlayerController {
         //
         // 只在 stop() 里做，**不放进 releasePlayer()** —— 重连也走那条路，
         // 而重连期间解绑画面会多闪一次蓝，正是要避免的。
-        if (player != null) {
+        //
+        // native 已挂起时跳过这一句：setSurface() 也是 native 调用，会排在挂起的
+        // 那次 seek 后面一起堵死 —— Stop 是用户在卡死时最想按的键，不能让它跟着堵。
+        // 那种情况下画面本来已经僵住，交给后面的释放（走后台线程）一并收尾。
+        if (player != null && !isProbeWedged()) {
             try {
                 player.setSurface(null);
             } catch (Exception e) {
                 Log.w(TAG, "解绑 Surface 失败", e);
             }
         }
-        releasePlayer();
+        releasePlayer(null);
         notifyState("STOPPED");
     }
 
-    public synchronized void seekTo(int ms) {
+    /**
+     * 跳到指定位置（毫秒）。
+     *
+     * <p><b>刻意不是 {@code synchronized}</b>，状态更新收在一个短临界区里，
+     * native 的 {@code seekTo()} 放在锁**外**调用。
+     *
+     * <p>为什么：真机 ANR 取证（{@code /data/anr/traces.txt}，pid 1733）里，
+     * 厂商栈（海信 MTK）的 {@code MediaPlayer.seekTo()} 挂住不返回，而原实现是
+     * {@code synchronized} 且**持锁**调 native —— 于是这个实例锁被一个不返回的调用
+     * 长期占着：7 个以上的 upnp-conn 线程排在它后面等，界面上的「下一集」
+     * 「停止」「换片源」全部无响应（用户报的正是这个）。
+     *
+     * <p>锁只保护**状态**（待决 seek、水位线、补发计数），不保护 native 调用 ——
+     * 一次挂起的 seek 从此只拖住它自己那条线程。
+     */
+    public void seekTo(int ms) {
         if (ms < 0) {
             return;
         }
-        // 无论能不能立刻下发，都先记下来 —— 这个目标值有三重作用，
-        // 见字段 pendingSeekMs 的注释。核心是：控制点拖了进度条之后，
-        // 它下次轮询必须看到"已经到那了"，否则就是不同步。
-        pendingSeekMs = ms;
-        pendingSeekAtMs = System.currentTimeMillis();
-        pendingSeekLanded = false;
-        // 控制点新拖的一次 seek = 用户的新意图：补发计数清零，重新给一次机会。
-        // （上一次"厂商做不到"的结论只针对上一次那个目标，不该连累这一次。）
-        seekReplayCount = 0;
-        // 水位线对齐到目标：不改的话，往回拖之后旧的高水位线会让外推
-        // 以为位置还停在旧处，甚至把进度直接推到片尾（钳到 dur 的副作用）。
-        hiRaw = ms;
-        hiWall = System.currentTimeMillis();
-
-        if (player != null && prepared && !playerReleased && !nativePlayerDead) {
+        MediaPlayer mp;
+        synchronized (this) {
+            // 无论能不能立刻下发，都先记下来 —— 这个目标值有三重作用，
+            // 见字段 pendingSeekMs 的注释。核心是：控制点拖了进度条之后，
+            // 它下次轮询必须看到"已经到那了"，否则就是不同步。
+            pendingSeekMs = ms;
+            pendingSeekAtMs = System.currentTimeMillis();
+            pendingSeekLanded = false;
+            // 控制点新拖的一次 seek = 用户的新意图：补发计数清零，重新给一次机会。
+            // （上一次"厂商做不到"的结论只针对上一次那个目标，不该连累这一次。）
+            seekReplayCount = 0;
+            // 水位线对齐到目标：不改的话，往回拖之后旧的高水位线会让外推
+            // 以为位置还停在旧处，甚至把进度直接推到片尾（钳到 dur 的副作用）。
+            hiRaw = ms;
+            hiWall = System.currentTimeMillis();
+            mp = (player != null && prepared && !playerReleased && !nativePlayerDead)
+                    ? player : null;
+        }
+        if (mp != null) {
             try {
-                player.seekTo(ms);
+                mp.seekTo(ms);
                 lastProgressAt = pendingSeekAtMs;
             } catch (Exception e) {
                 Log.w(TAG, "seek 失败", e);
@@ -1277,7 +1534,10 @@ public class MediaPlayerController {
                 // → onError → ERROR 刷屏死循环（网易云切歌真机踩过）。
                 return lastKnownPosition;
             }
-            int raw = player.getCurrentPosition();
+            // native 读**只**发生在探针线程（见字段区的说明），这里读缓存。
+            // 缓存最多比 native 落后一拍（250ms）—— 进度条是秒级的，无感；
+            // 换回来的是「主线程再也不会被一次挂起的 seek 冻死」。
+            int raw = cachedPositionMs;
             lastKnownPosition = raw;
             long now = System.currentTimeMillis();
             long pending = pendingSeekMs;
@@ -1332,11 +1592,11 @@ public class MediaPlayerController {
                     && now - hiWall > PlaybackPolicy.POSITION_FREEZE_EXTRAPOLATE_MS
                     && isActivelyPlaying()) {
                 long est = hiRaw + (now - hiWall);
-                int dur = 0;
-                try {
-                    dur = player.getDuration();
-                } catch (Exception ignored) {
-                }
+                // 时长同样读缓存：这里原来是直调播放器实例的 getDuration()，
+                // 而这条外推路径会在控制点轮询时被走到 —— 一旦 native 挂起，
+                // 就是又一次「HTTP 线程堵在 native 上」。缓存值由 onPrepared 垫底、
+                // 探针线程刷新，语义等价。
+                int dur = cachedDurationMs;
                 if (dur > 0 && est > dur) {
                     est = dur;
                 }
@@ -1348,28 +1608,36 @@ public class MediaPlayerController {
         }
     }
 
-    /** 是否真的在播（暂停 / 未就绪 / 释放中都不算）—— 位置外推的前提 */
+    /**
+     * 是否真的在播（暂停 / 未就绪 / 释放中都不算）—— 位置外推的前提。
+     *
+     * <p>读的是探针线程写下的缓存，不碰 native：这条判据会被控制点轮询
+     * （HTTP 线程）与界面刷新（主线程）走到，直调 {@code isPlaying()}
+     * 就是给 native 挂起留了两个新的堵点。
+     */
     private boolean isActivelyPlaying() {
         if (userPaused || player == null || playerReleased || nativePlayerDead || !prepared) {
             return false;
         }
-        try {
-            return player.isPlaying();
-        } catch (Exception e) {
-            return false;
-        }
+        return cachedPlaying;
     }
 
+    /**
+     * 当前时长（毫秒）。<b>读缓存，不碰 native。</b>
+     *
+     * <p>三个调用方全都不该被 native 拖住：界面每 0.5 秒判一次
+     * 「有没有内容」（{@code MainActivity.isPlaying()}）、控制点回读
+     * {@code GetMediaInfo}/{@code GetPositionInfo}、以及服务层 {@code onSeek}
+     * 的越界保护。原实现三处都直调 native —— 主线程那一处正是 ANR 里被冻死的地方。
+     *
+     * <p>缓存由 onPrepared 垫底（那时 native 一定没挂），之后探针线程每 250ms 刷新。
+     */
     public int getDuration() {
-        try {
-            if (player == null || playerReleased || nativePlayerDead || !prepared) {
-                // 同 getPosition：错误态/已释放的播放器碰一下就是 -38 循环
-                return 0;
-            }
-            return player.getDuration();
-        } catch (Exception e) {
+        if (player == null || playerReleased || nativePlayerDead || !prepared) {
+            // 同 getPosition：错误态/已释放的播放器碰一下就是 -38 循环
             return 0;
         }
+        return cachedDurationMs;
     }
 
     public void setVolume(float volume) {
@@ -1567,10 +1835,21 @@ public class MediaPlayerController {
     public void release() {
         handler.removeCallbacksAndMessages(null);
         pendingRetry = null;
-        releasePlayer();
+        releasePlayer(null);
     }
 
-    private void releasePlayer() {
+    /**
+     * 释放当前实例并清掉一切与它绑定的状态。
+     *
+     * @param onReleased native 已挂起、释放被挪到后台线程时，释放完成后回主线程执行的动作；
+     *                   {@code null} = 不需要后续动作（停止 / 退出路径）。
+     *                   同步释放（正常路径）**不会**调用它 —— 调用方在返回值处继续即可。
+     * @return {@code true} = 已经彻底释放完，调用方可以继续；
+     *         {@code false} = 释放改到后台执行了，等 {@code onReleased} 回来再继续。
+     */
+    private boolean releasePlayer(Runnable onReleased) {
+        // 挂起判定必须在清任何状态**之前**做：判据要的正是「当前实例上的那次采样超时」。
+        final boolean wedged = isProbeWedged();
         prepared = false;
         // 释放后 native 播放器不可再碰（任何方法调用都会触发 -38 错误回调）
         playerReleased = true;
@@ -1586,10 +1865,50 @@ public class MediaPlayerController {
         // 控制点看到的进度条是上一部片子的。
         preparing = false;
         pendingSeekMs = -1L;
+        // 采样缓存与探针随实例一起作废 —— 不清的话，新片源起播前界面会先显示
+        // 上一部的位置/时长（那正是"面板闪一下"的来源）。
+        cachedPositionMs = 0;
+        cachedDurationMs = 0;
+        cachedPlaying = false;
+        cachedSampleAtMs = 0;
+        stopSampler();
+        probeInFlightOwner = null;
+        probeInFlightSinceMs = 0;
         // 视频尺寸复查同理：载体（MediaPlayer 实例）没了就必须摘掉，
         // 否则过期复查会对着已释放的实例跑 —— 判定套到新片源上。
         cancelVideoRecheck();
         if (player != null) {
+            final MediaPlayer doomed = player;
+            // 先摘引用：后台释放期间任何访问器都不该再看到这个实例
+            player = null;
+            if (wedged) {
+                // ---- native 已挂起：绝不在主线程上 release() ----
+                //
+                // release() 会排在挂起的那次 seek 后面（同一个 native 串行锁），
+                // 在主线程上调就是把 ANR 从「ticker 读位置」原样搬到「重建播放器」。
+                // 所以交给后台线程：主线程立刻返回，释放完再回主线程继续建新实例 ——
+                // 顺序没有变（新实例仍然只在旧实例释放完**之后**才创建），
+                // 变的只是"谁在等"。
+                Log.w(TAG, "native 已挂起，释放播放器改到后台线程执行（主线程不等待）");
+                Thread t = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            doomed.release();
+                        } catch (Exception e) {
+                            Log.w(TAG, "后台释放 MediaPlayer 出错", e);
+                        }
+                        lastReleaseAtMs = System.currentTimeMillis();
+                        Log.i(TAG, "释放播放器: 后台 release 结束");
+                        if (onReleased != null) {
+                            handler.post(onReleased);
+                        }
+                    }
+                }, "juping-release");
+                t.setDaemon(true);
+                t.start();
+                return false;
+            }
             // 视频蓝屏修复 F1：这里**不再** player.reset()。
             //
             // 真机 A/B 日志（`.agent/video-bluescreen-plan.md` §1）定案：厂商栈
@@ -1605,15 +1924,15 @@ public class MediaPlayerController {
             long teardownAt = System.currentTimeMillis();
             Log.i(TAG, "释放播放器: release 开始（reset 已移除）");
             try {
-                player.release();
+                doomed.release();
             } catch (Exception e) {
                 Log.w(TAG, "释放 MediaPlayer 出错", e);
             }
             lastReleaseAtMs = System.currentTimeMillis();
             Log.i(TAG, "释放播放器: release 结束，耗时 "
                     + (lastReleaseAtMs - teardownAt) + "ms");
-            player = null;
         }
+        return true;
     }
 
     private void notifyState(String state) {

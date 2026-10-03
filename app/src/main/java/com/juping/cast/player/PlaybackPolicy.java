@@ -407,6 +407,67 @@ public final class PlaybackPolicy {
         return elapsedSinceSeekMs > SEEK_PENDING_TIMEOUT_MS;
     }
 
+    // ------------------------------------------------- native 采样与「挂起」探测
+
+    /**
+     * native 探针的采样间隔（毫秒）。
+     *
+     * <h3>为什么 native 只能由一条探针线程读</h3>
+     *
+     * <p>厂商栈（海信 MTK）的 {@code MediaPlayer.seekTo()} 会<b>挂住不返回</b>，
+     * 而它挂住时握着播放器的 native 串行锁 —— 同一个实例上的
+     * {@code getCurrentPosition()} / {@code getDuration()} 会跟着一起堵死。
+     * 真机 ANR 取证（{@code /data/anr/traces.txt}，pid 1733）里，主线程正是堵在
+     * {@code getDuration()} 上被冻住：界面卡死，所有控制指令（Seek / Stop /
+     * SetAVTransportURI）一起无响应，7 个以上的 upnp-conn 线程排在同一个
+     * 实例锁后面。
+     *
+     * <p>所以 native 读只留**一条探针线程**这一个入口，结果放进缓存；
+     * 界面、看门狗、控制点回读一律读缓存 —— 主线程从此不碰 native，
+     * 挂起的那次 seek 最多拖住探针，拖不住 UI。
+     *
+     * <p>250ms 一拍：进度条是秒级的，够用；0.6GB 的盒子上这点开销可以忽略。
+     */
+    public static final long POSITION_SAMPLE_INTERVAL_MS = 250L;
+
+    /**
+     * 探针在 native 里待超过这么久 = 这次 native 调用已经挂起。
+     *
+     * <p>正常平台上 {@code getCurrentPosition()} 是微秒级的，3000ms 只有
+     * 「已经挂了」才可能达到。判出来之后**不再对旧实例做任何 native 调用**
+     * （{@code release()} 也算）—— 那些调用会排在挂起的那次后面一起堵死，
+     * 主线程一旦碰就又是一次 ANR。
+     */
+    public static final long NATIVE_PROBE_STUCK_MS = 3000L;
+
+    /** 采样是否已经过期（探针被 native 卡住、缓存不再刷新）。 */
+    public static boolean isSampleStale(long sinceLastSampleMs) {
+        return sinceLastSampleMs > NATIVE_PROBE_STUCK_MS;
+    }
+
+    /**
+     * seek 看门狗：这次 seek 该不该「重建播放器再补发一次」。
+     *
+     * <p>三种「不该」各自对应一个真机踩过的故障，缺一不可：
+     * <ul>
+     *   <li><b>不在飞</b> —— 没有待决 seek，重建是纯粹的打扰；</li>
+     *   <li><b>没超时</b> —— 老芯片上一次 seek 要好几秒，提前重建会把播放拉回开头
+     *       （用户看到的是「拖了一下，电视跳回去了」）；</li>
+     *   <li><b>补发预算用尽</b> —— 厂商直接拒绝这个 seek 时，重建会变成死循环
+     *       （真机连续 51 轮，见 {@link #MAX_SEEK_REPLAY}）。</li>
+     * </ul>
+     *
+     * <p>「重建」不是这里做的：这里只回答该不该，动作在
+     * {@code MediaPlayerController.checkStall()} 里走既有的 {@code scheduleRetry()}。
+     */
+    public static boolean shouldRebuildOnSeekTimeout(boolean seekInFlight,
+                                                     long elapsedSinceSeekMs,
+                                                     int replaysSoFar) {
+        return seekInFlight
+                && isSeekExpired(elapsedSinceSeekMs)
+                && canReplaySeekAfterRebuild(replaysSoFar);
+    }
+
     // --------------------------------------------------------- 播放错误的分类
 
     /**

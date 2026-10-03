@@ -406,6 +406,46 @@ public class PolicyTest {
         check("stsd 音频 entry（mp4a，+32/+34 恰为 1280×720）→ null（fourcc 白名单拒收）",
                 rAudio == null, "得到 " + fmt(rAudio) + " —— 假尺寸混过了区间闸");
 
+        System.out.println("\n── 14. native 采样缓存与「挂起」判据（修 A）──");
+        System.out.println("   厂商栈（海信 MTK）的 seekTo 会挂住不返回，握着实例的 native 串行锁 ——");
+        System.out.println("   同实例的 getCurrentPosition/getDuration 全部跟着堵，主线程一碰就是 ANR");
+        System.out.println("   （真机取证 /data/anr/traces.txt，pid 1733）。");
+        System.out.println("   修法：native 只由一条探针线程读，界面/看门狗/控制点读缓存。");
+        System.out.println("   下面钉的是「什么时候算挂了」「什么时候该重建」。");
+
+        check("采样间隔是秒级进度条能接受的粒度（≤500ms）",
+                PlaybackPolicy.POSITION_SAMPLE_INTERVAL_MS > 0
+                && PlaybackPolicy.POSITION_SAMPLE_INTERVAL_MS <= 500L,
+                "得到 " + PlaybackPolicy.POSITION_SAMPLE_INTERVAL_MS + "ms");
+        check("挂起阈值严格大于采样间隔（否则正常的一拍就会被误判成挂起）",
+                PlaybackPolicy.NATIVE_PROBE_STUCK_MS
+                > PlaybackPolicy.POSITION_SAMPLE_INTERVAL_MS,
+                "间隔 " + PlaybackPolicy.POSITION_SAMPLE_INTERVAL_MS
+                + "ms，阈值 " + PlaybackPolicy.NATIVE_PROBE_STUCK_MS + "ms");
+
+        check("采样刚好到阈值 → 还没判挂起（判据用严格大于）",
+                !PlaybackPolicy.isSampleStale(PlaybackPolicy.NATIVE_PROBE_STUCK_MS),
+                "sinceLast=" + PlaybackPolicy.NATIVE_PROBE_STUCK_MS);
+        check("采样超过阈值 → 判挂起",
+                PlaybackPolicy.isSampleStale(PlaybackPolicy.NATIVE_PROBE_STUCK_MS + 1),
+                "sinceLast=" + (PlaybackPolicy.NATIVE_PROBE_STUCK_MS + 1));
+
+        long expired = PlaybackPolicy.SEEK_PENDING_TIMEOUT_MS + 1;
+        check("seek 在飞 + 已超时 + 还有补发预算 → 该重建",
+                PlaybackPolicy.shouldRebuildOnSeekTimeout(true, expired, 0),
+                "这是「拖了没反应、播放器僵住」唯一的自动出路");
+        check("seek 不在飞 → 不重建（哪怕时间早过了）",
+                !PlaybackPolicy.shouldRebuildOnSeekTimeout(false, expired, 0),
+                "没有待决 seek 时的重建是纯粹的打扰");
+        check("seek 还没超时 → 不重建（老芯片上一次 seek 要好几秒）",
+                !PlaybackPolicy.shouldRebuildOnSeekTimeout(true,
+                        PlaybackPolicy.SEEK_PENDING_TIMEOUT_MS, 0),
+                "提前重建会把播放拉回开头 —— 用户看到的是「拖了一下，电视跳回去了」");
+        check("补发预算用尽 → 不重建（厂商直接拒绝这个 seek）",
+                !PlaybackPolicy.shouldRebuildOnSeekTimeout(true, expired,
+                        PlaybackPolicy.MAX_SEEK_REPLAY),
+                "再重建就是死循环（真机连续 51 轮）");
+
         System.out.println();
         System.out.println("=".repeat(62));
         System.out.println("播放策略：" + passed + " / " + total + " 通过");
