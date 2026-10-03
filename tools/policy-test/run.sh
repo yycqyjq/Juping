@@ -40,6 +40,7 @@ HTTP="app/src/main/java/com/juping/cast/dlna/UpnpHttpServer.java"
 ED="app/src/main/java/com/juping/cast/dlna/EventDispatcher.java"
 SVC="app/src/main/java/com/juping/cast/DlnaRendererService.java"
 ACT="app/src/main/java/com/juping/cast/MainActivity.java"
+SSDP="app/src/main/java/com/juping/cast/dlna/SsdpResponder.java"
 LAYOUT="app/src/main/res/layout/activity_main.xml"
 COLORS="app/src/main/res/values/colors.xml"
 QR="app/src/main/java/com/juping/cast/QrRenderer.java"
@@ -3507,6 +3508,61 @@ report('挂起阈值与采样间隔定义在 PlaybackPolicy',
 report('MainActivity 读进度只经 service.getPlayer()（不自己 new 播放器）',
        'getPlayer().getPosition()' in act and 'getPlayer().getDuration()' in act,
        '界面拿到的必须是控制器那份缓存；自己持实例就绕过了采样层')
+
+sys.exit(1 if failed else 0)
+PY
+
+# ── 13. 真机验收脚本的就绪判据不许与源码脱钩 ──
+# verify-on-device.sh 等的那行日志，是「盒子绑上组播、能被手机搜到」的唯一信号。
+# 它漂过一次：源码把「SSDP 已加入组播组 …网卡=…」改成
+# 「SSDP 端口已绑定 :N，组播=已加入(网卡)，LOCATION=…」之后脚本没跟上 ——
+# 于是**真机验收永远红在第 ③ 步**，而自测夹具用的还是旧串（自测绿、真机红）。
+# 这类"闸门自己坏了、还报绿"的回归没有任何运行时症状，只能钉在源码上。
+echo
+echo "── 13. 真机验收脚本的就绪判据与源码字面量一致 ──"
+python3 - "$SSDP" <<'PY' || RC=1
+import re, sys, pathlib
+
+ssdp_path = sys.argv[1]
+ssdp = pathlib.Path(ssdp_path).read_text(encoding='utf-8')
+script = pathlib.Path('tools/verify-on-device.sh').read_text(encoding='utf-8')
+selftest = pathlib.Path('tools/protocol-test/verify-device-selftest.sh'
+                        ).read_text(encoding='utf-8')
+failed = []
+
+def report(name, ok, detail=''):
+    print('  [%s] %s%s' % ('PASS' if ok else 'FAIL', name,
+                           ('\n         ' + detail) if detail else ''))
+    if not ok:
+        failed.append(name)
+
+# ① 源码里那句 Log.i 必须还在（判据的唯一事实来源）
+log = re.search(r'Log\.i\(TAG,\s*"(SSDP 端口已绑定[^"]*)"', ssdp)
+report('SsdpResponder 里还有「SSDP 端口已绑定」那句 Log.i', log is not None,
+       '锚点：Log.i(TAG, "SSDP 端口已绑定…")。它没了，脚本等的东西就不存在了')
+report('SsdpResponder 区分「已加入 / 未加入」（同一行两种状态都打）',
+       '"已加入("' in ssdp and '未加入(将后台重试)' in ssdp,
+       '两种状态共用一行，所以判据**必须**带上「组播=已加入」——'
+       '只等「端口已绑定」会把「绑上端口但没进组」误判成就绪（手机其实搜不到）')
+
+# ② 脚本的 TAG_READY 必须含两个关键片段
+tag = re.search(r"TAG_READY='([^']*)'", script)
+report('verify-on-device.sh 的 TAG_READY 已找到（且是单引号正则）',
+       tag is not None, "锚点：TAG_READY='…'")
+if tag:
+    pat = tag.group(1)
+    report('TAG_READY 含「SSDP 端口已绑定」', 'SSDP 端口已绑定' in pat,
+           '源码打的是这句；写成旧串「SSDP 已加入组播组」就永远等不到')
+    report('TAG_READY 含「组播=已加入」', '组播=已加入' in pat,
+           '缺了它，未加入组播也会被判成就绪')
+report('脚本用 grep -E 匹配该判据（它是正则，不是字面量）',
+       'grep -E "$TAG_READY"' in script,
+       '用 grep（基本正则）的话 `[0-9]*` 这类元字符行为不同，判据会静默失配')
+
+# ③ 自测夹具必须用同一句 —— 夹具比被测对象宽容，自测就会报假绿
+report('自测夹具的假 logcat 用同一句（含 组播=已加入）',
+       'SSDP 端口已绑定' in selftest and '组播=已加入' in selftest,
+       '夹具用旧串时自测照样绿，而真机红 —— 这正是这次漂移没被发现的原因')
 
 sys.exit(1 if failed else 0)
 PY

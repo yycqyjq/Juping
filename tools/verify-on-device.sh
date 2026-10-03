@@ -48,7 +48,17 @@ ACTIVITY="$PKG/.MainActivity"
 # 而且「绑上了」才是用户真正在意的状态 —— 绑不上就是手机搜不到设备。
 # 绑定失败现在会自动带退避重试（见 SsdpResponder.bindUntilReady），
 # 所以这里等不到就说明是**持续**失败，日志里能直接看到原因。
-TAG_READY="SSDP 已加入组播组"
+#
+# ⚠️ 这里必须用**正则**、且必须带上「组播=已加入」：SsdpResponder 打的是
+#    `SSDP 端口已绑定 :1900，组播=已加入(wlan0)，LOCATION=…`
+# 而**同一行在组播没加入时也会打**（`组播=未加入(将后台重试)`）——
+# 只等「端口已绑定」会把「绑上端口但组播没进组」误判成就绪（手机其实搜不到）。
+#
+# 这条判据曾经漂过：源码把「SSDP 已加入组播组 …网卡=…」改成上面那句之后，
+# 脚本没跟上，于是**真机验收永远红在第 ③ 步**，而自测夹具用的还是旧串 ——
+# 自测绿、真机红，正是「测试替身比被测对象宽容」。现在由 policy-test 的
+# 守卫把脚本判据与 SsdpResponder 源码里的字面量钉在一起，改一处必须改两处。
+TAG_READY='SSDP 端口已绑定 :[0-9]*，组播=已加入'
 
 TARGET=""
 PLAY_URL=""
@@ -168,7 +178,7 @@ echo "── ③ 等 SSDP 绑上组播（最多 30 秒）──"
 LOCATION=""
 for _ in $(seq 1 60); do
     LOG="$("$ADB" logcat -d -v brief 2>/dev/null || true)"
-    LINE="$(printf '%s\n' "$LOG" | grep "$TAG_READY" | tail -1 || true)"
+    LINE="$(printf '%s\n' "$LOG" | grep -E "$TAG_READY" | tail -1 || true)"
     if [ -n "$LINE" ]; then
         # 形如：... 网卡=eth0（候选 2 张），LOCATION=http://192.168.1.9:49152/upnp/device.xml
         LOCATION="$(printf '%s' "$LINE" | sed -n 's|.*LOCATION=\(http://[0-9.]*:[0-9]*/[^ ]*\).*|\1|p')"
@@ -178,7 +188,8 @@ for _ in $(seq 1 60); do
 done
 
 if [ -z "$LOCATION" ]; then
-    echo "  [×] 30 秒内没等到「${TAG_READY}」。" >&2
+    echo "  [×] 30 秒内没等到「SSDP 端口已绑定 + 组播=已加入」。"
+    echo "      （判据正则：${TAG_READY}）" >&2
     echo >&2
     echo "  ── 相关日志 ──" >&2
     printf '%s\n' "$LOG" | grep -E "DlnaRenderer|SsdpResponder|UpnpHttpServer|NetUtil" | tail -30 >&2
