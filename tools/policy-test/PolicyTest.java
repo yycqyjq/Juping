@@ -406,6 +406,107 @@ public class PolicyTest {
         check("stsd 音频 entry（mp4a，+32/+34 恰为 1280×720）→ null（fourcc 白名单拒收）",
                 rAudio == null, "得到 " + fmt(rAudio) + " —— 假尺寸混过了区间闸");
 
+        // ---- 13b. H.264 DPB 容量：「有声无画」的判据（todo §7.21）----
+        System.out.println("   下面的判据来自一个真机现象：B 站 1080P 投上去黑屏有声、360P 正常。");
+        System.out.println("   根因不是分辨率本身，而是 max_num_ref_frames × 每帧宏块数 超出硬件 DPB 上限");
+        System.out.println("   （本机 MT5880 只到 Level 4.0 = 32768 宏块）。硬件发现装不下就放弃视频、");
+        System.out.println("   音频照放，而且**一个错误都不报** —— 这就是它最难查的地方。");
+        System.out.println("   判据只能从 SPS 里读。下面先钉「真流解得对」，再钉「判据分得开对错」。");
+
+        // ① 真实数据：B 站 360P 流的 SPS（从真机日志里的 URL 拉下来提取的，30 字节）。
+        //    它**真的含两处 00 00 03**（emulation prevention）—— 剥不掉就会整体错位，
+        //    而错位解出来的参考帧数往往仍是个 0~16 的"合理值"。这条夹具同时盖住两者。
+        byte[] bili360Sps = {
+                (byte) 0x67, (byte) 0x64, (byte) 0x00, (byte) 0x1E,
+                (byte) 0xAC, (byte) 0xCA, (byte) 0x70, (byte) 0x28,
+                (byte) 0x0B, (byte) 0xFE, (byte) 0x5C, (byte) 0x05,
+                (byte) 0xA8, (byte) 0x08, (byte) 0x08, (byte) 0x0A,
+                (byte) 0x00, (byte) 0x00, (byte) 0x03, (byte) 0x00,
+                (byte) 0x02, (byte) 0x00, (byte) 0x00, (byte) 0x03,
+                (byte) 0x00, (byte) 0x78, (byte) 0x1E, (byte) 0x2C,
+                (byte) 0x59, (byte) 0x4F,
+        };
+        byte[] moov360 = moovWithSps(bili360Sps);
+        Mp4Aspect.Dpb d360 = Mp4Aspect.dpb(moov360, moov360.length);
+        check("【真实流】B 站 360P 的 SPS → High / Level 3.0 / 40×23 宏块 / 6 参考帧",
+                d360 != null && d360.profileIdc == 100 && d360.levelIdc == 30
+                && d360.picWidthInMbs == 40 && d360.frameHeightInMbs == 23
+                && d360.maxNumRefFrames == 6,
+                d360 == null ? "null" : (d360.profileName() + " L" + d360.levelName()
+                        + " " + d360.picWidthInMbs + "×" + d360.frameHeightInMbs
+                        + " ref=" + d360.maxNumRefFrames));
+        check("【真实流】B 站 360P 不超限（5520 < 32768）—— 与真机实测「画面正常」一致",
+                d360 != null && d360.neededMbs() == 5520 && !d360.exceedsDevice(),
+                d360 == null ? "null" : ("needed=" + d360.neededMbs()));
+
+        // ② 判据的另一半：B 站 1080P 的形态（120×68 宏块 + 6 参考帧 = 48960）。
+        //    注意流**自己标 Level 5.0**（允许 110400 宏块）—— 按它自己的标称，
+        //    6 个参考帧完全合法。这正是它在别处能正常播、却在这台盒子上黑屏的原因：
+        //    **标称等级骗得过应用，骗不过硬件。**
+        byte[] moov1080 = moovWithSps(sps(100, 50, 6, 120, 68, 1));
+        Mp4Aspect.Dpb d1080 = Mp4Aspect.dpb(moov1080, moov1080.length);
+        check("【判据】1080P + 6 参考帧 → 需要 48960 宏块，超硬件上限 32768",
+                d1080 != null && d1080.neededMbs() == 48960 && d1080.exceedsDevice(),
+                d1080 == null ? "null" : ("needed=" + d1080.neededMbs()));
+        check("【判据】同一条流按它**自己标的** Level 5.0 却完全合法（110400）",
+                d1080 != null && d1080.declaredLevelMaxMbs() == 110400
+                && d1080.neededMbs() < d1080.declaredLevelMaxMbs(),
+                "所以判据**必须**用硬件上限，不能用流标称的 level");
+
+        // ③ 对照：自造的 1080P 只有 2 个参考帧（16320）—— 真机上画面是正常的。
+        //    分辨率一样、只是参考帧少，这就是"不是分辨率本身"的实证。
+        byte[] moovRef2 = moovWithSps(sps(100, 40, 2, 120, 68, 1));
+        Mp4Aspect.Dpb dRef2 = Mp4Aspect.dpb(moovRef2, moovRef2.length);
+        check("【对照】1080P + 2 参考帧 → 16320，不超限（真机上画面正常）",
+                dRef2 != null && dRef2.neededMbs() == 16320 && !dRef2.exceedsDevice(),
+                dRef2 == null ? "null" : ("needed=" + dRef2.neededMbs()));
+
+        // ④ 场编码：一帧占两倍宏块行数。漏掉 ×2 会把隔行 1080p 少算一半，
+        //    于是"本该报警的超限"被判成正常 —— 静默错里最难发现的那一类。
+        byte[] moovField = moovWithSps(sps(77, 40, 6, 120, 34, 0));
+        Mp4Aspect.Dpb dField = Mp4Aspect.dpb(moovField, moovField.length);
+        check("场编码（frame_mbs_only=0）→ 行数 ×2：34 行变 68 行、需要 48960",
+                dField != null && dField.frameHeightInMbs == 68
+                && dField.neededMbs() == 48960 && dField.exceedsDevice(),
+                dField == null ? "null" : (dField.frameHeightInMbs + " 行 / needed="
+                        + dField.neededMbs()));
+
+        // ⑤ 合理性闸：位流错位时会解出"看着合法"的错值，只能由闸挡住
+        byte[] moovBadRef = moovWithSps(sps(100, 40, 17, 120, 68, 1));
+        check("max_num_ref_frames = 17（超 H.264 规范上限 16）→ null",
+                Mp4Aspect.dpb(moovBadRef, moovBadRef.length) == null, "被放行了");
+        byte[] moovBadW = moovWithSps(sps(100, 40, 2, 600, 68, 1));
+        check("宏块列数 600（> 512，即 8192 像素）→ null",
+                Mp4Aspect.dpb(moovBadW, moovBadW.length) == null, "被放行了");
+
+        // ⑥ 只认 SPS：NAL header 的 nal_unit_type 必须 = 7。
+        //    不验的话，PPS 的第一个字节 0x68 会被当成 profile_idc 解下去。
+        byte[] ppsNal = sps(100, 40, 2, 120, 68, 1);
+        ppsNal[0] = 0x68;                                  // nal_unit_type = 8 (PPS)
+        byte[] moovPps = moovWithSps(ppsNal);
+        check("NAL 头是 PPS（0x68）而不是 SPS（0x67）→ null",
+                Mp4Aspect.dpb(moovPps, moovPps.length) == null, "把 PPS 当 SPS 解了");
+
+        // ⑦ 没有 avcC → null（不猜）。avc1 里没有 avcC 在现实里是存在的。
+        byte[] moovNoAvcC = moovOf(trakWithStsd(1920, 1080));
+        check("avc1 里没有 avcC 子 box → null",
+                Mp4Aspect.dpb(moovNoAvcC, moovNoAvcC.length) == null, "猜了一个值");
+
+        // ⑧ 入参异常一律 null，不许抛（这个方法在播放路径上，抛出去会掀翻整条流程）
+        check("dpb 对 null / 空 / 垃圾字节 → null（不抛异常）",
+                Mp4Aspect.dpb(null, 0) == null
+                && Mp4Aspect.dpb(new byte[0], 0) == null
+                && Mp4Aspect.dpb(garbage, garbage.length) == null,
+                "抛了异常或猜了值");
+
+        // ⑨ level 表：查不到返回 0（"判不了"），而不是拿个像真值的 0 去比大小
+        check("levelMaxDpbMbs 查表：L4.0=32768 / L3.0=8100 / L1b=396 / 未知=0",
+                Mp4Aspect.levelMaxDpbMbs(40) == 32768
+                && Mp4Aspect.levelMaxDpbMbs(30) == 8100
+                && Mp4Aspect.levelMaxDpbMbs(9) == 396
+                && Mp4Aspect.levelMaxDpbMbs(99) == 0,
+                "查表值与 H.264 Table A-1 不符");
+
         System.out.println("\n── 14. native 采样缓存与「挂起」判据（修 A）──");
         System.out.println("   厂商栈（海信 MTK）的 seekTo 会挂住不返回，握着实例的 native 串行锁 ——");
         System.out.println("   同实例的 getCurrentPosition/getDuration 全部跟着堵，主线程一碰就是 ANR");
@@ -619,6 +720,172 @@ public class PolicyTest {
         putShort(p, 24, w);                                // entry +32
         putShort(p, 26, h);                                // entry +34
         return box("avc1", p);
+    }
+
+    // ---- avcC / SPS 合成（给 DPB 判据用）----------------------------
+
+    /**
+     * avc1 的 VisualSampleEntry 固定头（78 字节）+ avcC 子 box。
+     *
+     * <p>固定头长度不是随便写的：SampleEntry 8 字节 + pre_defined/reserved
+     * 16 字节 + width/height/resolution 12 字节 + reserved/frame_count 6 字节 +
+     * compressorname 32 字节 + depth/pre_defined 4 字节 = 78。子 box 从载荷
+     * 偏移 78 起（也就是从 box 起点算 +86）—— 和 {@code Mp4Aspect.dpbFromTrak}
+     * 里那个偏移必须对得上，对不上就一路读到别的东西。
+     */
+    static byte[] avc1BoxWithAvcC(int w, int h, byte[] sps) {
+        byte[] head = new byte[78];
+        putShort(head, 24, w);                             // entry +32
+        putShort(head, 26, h);                             // entry +34
+        return box("avc1", concat(head, box("avcC", avcCPayload(sps))));
+    }
+
+    /**
+     * AVCDecoderConfigurationRecord 的载荷（不含 8 字节 box 头）。
+     *
+     * <pre>
+     * +0 configurationVersion        = 1
+     * +1 AVCProfileIndication
+     * +2 profile_compatibility
+     * +3 AVCLevelIndication
+     * +4 6 bits reserved + lengthSizeMinusOne
+     * +5 3 bits reserved + numOfSequenceParameterSets = 1
+     * +6 SPS 长度（16 位）
+     * +8 SPS NAL 本体
+     * </pre>
+     */
+    static byte[] avcCPayload(byte[] sps) {
+        byte[] p = new byte[8 + sps.length];
+        p[0] = 1;                                          // configurationVersion
+        p[1] = (byte) 100;                                 // AVCProfileIndication
+        p[2] = 0;                                          // profile_compatibility
+        p[3] = (byte) 30;                                  // AVCLevelIndication
+        p[4] = (byte) 0xFF;                                // reserved + lengthSize=3
+        p[5] = (byte) 0xE1;                                // reserved + numOfSPS=1
+        putShort(p, 6, sps.length);
+        System.arraycopy(sps, 0, p, 8, sps.length);
+        return p;
+    }
+
+    /** stsd：version/flags(4) + entry_count(4) + avc1（含 avcC）。 */
+    static byte[] stsdBoxWithAvcC(byte[] sps) {
+        byte[] entry = avc1BoxWithAvcC(1920, 1080, sps);
+        byte[] p = new byte[8 + entry.length];
+        putInt(p, 4, 1);                                   // entry_count = 1
+        System.arraycopy(entry, 0, p, 8, entry.length);
+        return box("stsd", p);
+    }
+
+    /** 一份含 avcC/SPS 的完整 moov。 */
+    static byte[] moovWithSps(byte[] sps) {
+        return moovOf(box("trak", box("mdia", box("minf", box("stbl",
+                stsdBoxWithAvcC(sps))))));
+    }
+
+    /**
+     * 现造一条 SPS NAL（含 1 字节 NAL header）。
+     *
+     * <p>只写到 {@code frame_cropping_flag} 之前 —— 正好覆盖 {@code Mp4Aspect}
+     * 的 DPB 解析要读的那一段（后面的裁剪与 VUI 与 DPB 容量无关）。
+     *
+     * @param widthMbs        宏块列数
+     * @param heightMapUnits  宏块行数（**未**乘场编码的 2，由 frameMbsOnly 决定）
+     * @param frameMbsOnly    1 = 逐行扫描；0 = 场编码（一帧两倍行数）
+     */
+    static byte[] sps(int profileIdc, int levelIdc, int maxRef,
+                      int widthMbs, int heightMapUnits, int frameMbsOnly) {
+        BitWriter w = new BitWriter();
+        w.u(profileIdc, 8);
+        w.u(0, 8);                       // constraint_setN_flags
+        w.u(levelIdc, 8);
+        w.ue(0);                         // seq_parameter_set_id
+        if (isHighProfile(profileIdc)) {
+            // High 系列多这一段。**漏掉它就整体错位** —— 所以合成夹具必须
+            // 和被测实现认同一份 profile 名单，否则测的是"两个 bug 互相抵消"。
+            w.ue(1);                     // chroma_format_idc = 1 (4:2:0)
+            w.ue(0);                     // bit_depth_luma_minus8
+            w.ue(0);                     // bit_depth_chroma_minus8
+            w.u(0, 1);                   // qpprime_y_zero_transform_bypass_flag
+            w.u(0, 1);                   // seq_scaling_matrix_present_flag
+        }
+        w.ue(0);                         // log2_max_frame_num_minus4
+        w.ue(0);                         // pic_order_cnt_type = 0
+        w.ue(0);                         // log2_max_pic_order_cnt_lsb_minus4
+        w.ue(maxRef);                    // max_num_ref_frames
+        w.u(0, 1);                       // gaps_in_frame_num_value_allowed_flag
+        w.ue(widthMbs - 1);              // pic_width_in_mbs_minus1
+        w.ue(heightMapUnits - 1);        // pic_height_in_map_units_minus1
+        w.u(frameMbsOnly, 1);            // frame_mbs_only_flag
+        if (frameMbsOnly == 0) {
+            w.u(1, 1);                   // mb_adaptive_frame_field_flag
+        }
+        w.u(1, 1);                       // direct_8x8_inference_flag
+        w.u(0, 1);                       // frame_cropping_flag
+        w.u(0, 1);                       // vui_parameters_present_flag
+        w.rbspTrailing();
+        byte[] rbsp = w.toBytes();
+        byte[] nal = new byte[1 + rbsp.length];
+        nal[0] = 0x67;                   // NAL header：nal_unit_type = 7（SPS）
+        System.arraycopy(rbsp, 0, nal, 1, rbsp.length);
+        return nal;
+    }
+
+    static boolean isHighProfile(int p) {
+        return p == 100 || p == 110 || p == 122 || p == 244 || p == 44 || p == 83
+                || p == 86 || p == 118 || p == 128 || p == 138 || p == 139
+                || p == 134 || p == 135;
+    }
+
+    /** 按位写的游标 —— 现造 SPS 位流用（被测实现是「按位读」，夹具就得「按位写」）。 */
+    static final class BitWriter {
+        private byte[] buf = new byte[64];
+        private int bitPos;
+
+        void u(int v, int n) {
+            for (int i = n - 1; i >= 0; i--) {
+                bit((v >> i) & 1);
+            }
+        }
+
+        /**
+         * 无符号 Exp-Golomb：把 {@code k+1} 写成「前导 0 个数 = 位宽-1」的形式。
+         * 例：0→{@code 1}、1→{@code 010}、6→{@code 00111}。
+         */
+        void ue(int k) {
+            int v = k + 1;
+            int bits = 32 - Integer.numberOfLeadingZeros(v);
+            for (int i = 0; i < bits - 1; i++) {
+                bit(0);
+            }
+            u(v, bits);
+        }
+
+        /** 有符号 Exp-Golomb：0→0、1→1、-1→2、2→3、-2→4 … */
+        void se(int k) {
+            ue(k <= 0 ? -2 * k : 2 * k - 1);
+        }
+
+        private void bit(int b) {
+            if ((bitPos >> 3) >= buf.length) {
+                buf = Arrays.copyOf(buf, buf.length * 2);
+            }
+            if (b != 0) {
+                buf[bitPos >> 3] |= (byte) (1 << (7 - (bitPos & 7)));
+            }
+            bitPos++;
+        }
+
+        /** rbsp_trailing_bits：一个 1，再补 0 到字节边界。 */
+        void rbspTrailing() {
+            bit(1);
+            while ((bitPos & 7) != 0) {
+                bit(0);
+            }
+        }
+
+        byte[] toBytes() {
+            return Arrays.copyOf(buf, (bitPos + 7) / 8);
+        }
     }
 
     /** 把 moov 放到「窗口开头是 mdat 载荷」的位置，逼 Mp4Aspect 走 scanForMoov 回退。 */

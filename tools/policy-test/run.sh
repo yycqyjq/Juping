@@ -3350,6 +3350,42 @@ report('DlnaRendererService.getVideoAspect 存在且委托给 player（不自己
        '判据权威在播放控制器（探测与记账都在那边），界面不自己猜 —— '
        '与 isAudioOnly()/isVideoPending() 同一条纪律')
 
+# ---- (15) H.264 DPB 预检：「有声无画」的判据（todo §7.21）----
+# 真机现象：B 站 1080P 投上去黑屏有声、360P 正常。根因不是分辨率本身，而是
+# max_num_ref_frames × 每帧宏块数 超出硬件 DPB 上限（本机 Level 4.0 = 32768）；
+# 硬件发现装不下就放弃视频、音频照放，**而且一个错误都不报** —— 这是它最难查的地方。
+# 本阶段只做「检测 + 日志」：判据要先在这台盒子上校准（尤其"解不出"的比例有多高），
+# 而加视图有把 MTK 蓝屏引回来的风险（§六 P2），提示条要单独做真机验证。
+# 注意：pb 本身已是 probe() 的方法体，源码在 probe_src —— 对 pb 再 body_of 必为 None
+_pb_probe = body_of(probe_src, 'public static int[] probe(String url)')
+report('DPB 预检复用探测窗口，不为它多发一次 Range',
+       _pb_probe is not None
+       and 'Mp4Aspect.dpb(' in _pb_probe
+       and _pb_probe.count('readWindow(') <= 2,
+       'avcC 在 stsd 里、stsd 在 moov 里 —— 和 tkhd 是同一个窗口，顺手多解一次就够。'
+       '再发一次 Range 会让"可选优化"变成两倍流量，弱网下直接拖慢起播；'
+       '而探测本来就允许失败（失败只影响摆信箱，不影响播放）')
+_exceeds = body_of(as_src, 'public boolean exceedsDevice()')
+report('DPB 判据用硬件上限，不是流标称的 level',
+       _exceeds is not None and 'DEVICE_MAX_DPB_MBS' in _exceeds
+       and 'declaredLevelMaxMbs' not in _exceeds,
+       'B 站 1080P 自己标 Level 5.0 —— 按它标称算，6 个参考帧完全合法，'
+       '所以用 declaredLevelMaxMbs 判会把这条流**放过去**。'
+       '标称等级骗得过应用、骗不过硬件')
+_pb_log = body_of(probe_src, 'private static void logDpb(String url, Mp4Aspect.Dpb d)')
+report('DPB 超限走 Log.w（真机上要能被 grep W 一把捞出）',
+       _pb_log is not None and 'Log.w(' in _pb_log and 'exceedsDevice()' in _pb_log,
+       '预检的全部目的就是"把问题说出来"。走 Log.i 的话和正常探测日志混在一起，'
+       '真机排查得逐条读 —— 级别本身就是信号')
+report('DPB 超限文案落到具体档位（360P）',
+       _pb_log is not None and '360P' in _pb_log,
+       '只说"超出本机能力"用户不知道该干什么。这个数字是 B 站真机实测出来的'
+       '（360P 能正常播），改它等于改结论')
+report('DPB 解不出时静默（不刷屏、不影响播放）',
+       _pb_log is not None and 'd == null' in _pb_log,
+       '非 H.264（HLS / H.265 / MP3）、moov 没落进窗口、SPS 格式不认 —— '
+       '都会返回 null。打出来只会淹没真信号，而后果仅仅是"没预检"')
+
 # ---- 版本纪律（二夜定的规矩：每次 dist 构建必须升版本）----
 build_sh = pathlib.Path('tools/build.sh').read_text(encoding='utf-8')
 report('build.sh dist 有版本硬闸（同版本连出两包直接红）',

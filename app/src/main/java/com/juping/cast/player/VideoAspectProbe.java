@@ -84,6 +84,10 @@ public final class VideoAspectProbe {
                 return null;
             }
             int[] size = Mp4Aspect.parse(head.buf, head.len);
+            // **DPB 预检复用同一个窗口** —— avcC 在 stsd 里、stsd 在 moov 里，
+            // 和 tkhd 同源。所以这是顺手多解一次，**零额外网络请求**。
+            // 这正是「播放前预检」敢做的前提：不用为它多发一次 Range。
+            Mp4Aspect.Dpb dpb = Mp4Aspect.dpb(head.buf, head.len);
             // 尾窗口：没做 faststart 的文件 moov 在文件尾部。只有「总长度已知
             // 且比一个窗口长」时才值得再发一次 —— 拿不到总长度就放弃尾部请求
             // （乱猜一个偏移只会读到更没用的字节）。
@@ -92,8 +96,13 @@ public final class VideoAspectProbe {
                 Window tail = readWindow(url, start, head.total - 1);
                 if (tail != null) {
                     size = Mp4Aspect.parse(tail.buf, tail.len);
+                    // 与 size 用**同一个窗口**重解，绝不混用头尾两个窗口的结果
+                    dpb = Mp4Aspect.dpb(tail.buf, tail.len);
                 }
             }
+            // 先记 DPB 判定、再走下面的宽高闸：宽高解不出不代表 DPB 解不出，
+            // 而预检要的正是「这条流本机解不解得了」这个独立结论。
+            logDpb(url, dpb);
             if (size == null) {
                 return null;
             }
@@ -111,6 +120,41 @@ public final class VideoAspectProbe {
         } catch (Exception e) {
             // 任何异常都静默退回全屏：探测是可选优化，失败不能影响播放本身。
             return null;
+        }
+    }
+
+    /**
+     * 把 DPB 预检结果打进日志 —— <b>这是「播放前预检」的第一阶段</b>。
+     *
+     * <p><b>为什么先只打日志、不加界面提示</b>：判据本身需要先在这台盒子上校准 ——
+     * 「解不出」的比例有多高、有没有误报、真实片源里超限的占比多少。校准完再固化成
+     * 用户可见的提示，才不会把一个没验证过的判断甩给用户。而且<b>加视图有把 MTK
+     * 蓝屏引回来的风险</b>（见 {@code todo §六 P2}：现有隐藏逻辑正是为规避蓝屏而设），
+     * 提示条要单独做真机验证。
+     *
+     * <p><b>解不出就静默</b>：非 H.264（HLS / H.265 / MP3）、moov 没落进窗口、
+     * SPS 格式不认 —— 这些一律返回 {@code null}。打出来只会淹没真信号，而它们的
+     * 后果仅仅是「没预检」，不影响播放本身。
+     *
+     * <p>超限走 {@code Log.w}：这条日志在真机上要被 {@code grep -E "W VideoAspectProbe"}
+     * 一把捞出来，级别必须和「正常探测成功」区分开。
+     */
+    private static void logDpb(String url, Mp4Aspect.Dpb d) {
+        if (d == null) {
+            return;
+        }
+        String detail = d.profileName() + " L" + d.levelName()
+                + " · " + d.picWidthInMbs + "x" + d.frameHeightInMbs + " 宏块"
+                + " · ref=" + d.maxNumRefFrames
+                + " · 需要 " + d.neededMbs() + " 宏块（本机上限 "
+                + Mp4Aspect.DEVICE_MAX_DPB_MBS + "）"
+                + "（域名 " + hostOf(url) + "）";
+        if (d.exceedsDevice()) {
+            Log.w(TAG, "片源超出本机解码能力：" + detail
+                    + " —— 硬件解码器会放弃视频、只放音频（表现为黑屏有声），"
+                    + "请在手机上降低清晰度（如 360P）");
+        } else {
+            Log.i(TAG, "解码能力预检通过：" + detail);
         }
     }
 

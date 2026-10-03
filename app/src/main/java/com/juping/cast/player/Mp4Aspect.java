@@ -255,6 +255,257 @@ public final class Mp4Aspect {
         return new int[] {w, h};
     }
 
+    // ------------------------------------------------------------------
+    // H.264 DPB 容量 —— 「有声无画」的判据
+    // ------------------------------------------------------------------
+
+    /**
+     * 本机 H.264 解码器的 DPB 上限（单位：宏块）。
+     *
+     * <p><b>为什么是个写死的常量</b>：这台电视（海信 MT5880）实测只到
+     * Level 4.0 —— 1080p 下最多 4 个参考帧。而 {@code MediaCodecInfo} /
+     * {@code MediaExtractor} 都要 API 16+，{@code MediaMetadataRetriever}
+     * 根本拿不到这个值 —— API 15 上**没有任何 API 能问到**解码器的 DPB 容量，
+     * 只能把实测值写死。换设备必须重新实测。
+     *
+     * <p>实测依据见 {@code .agent/todo.md §7.21} 的对照实验表：同一台盒子，
+     * 1080p/6 参考帧的黑屏、1080p/2 参考帧的正常、360p/6 参考帧的正常。
+     */
+    public static final int DEVICE_MAX_DPB_MBS = 32768;
+
+    /**
+     * 一次 H.264 SPS 解析的结果 —— DPB 判定的全部输入与派生量。
+     *
+     * <p>字段要么是 SPS 里**直接读出来的**，要么是由它们**无歧义算出**的，
+     * 没有任何猜测成分。（与这个类其它函数同一条纪律：算不出就返回 {@code null}，
+     * 绝不返回一个半成品让调用方以为拿到了真值。）
+     */
+    public static final class Dpb {
+        /** profile_idc：66=Baseline / 77=Main / 88=Extended / 100=High。 */
+        public final int profileIdc;
+        /** level_idc：数值是等级的 10 倍（30 = Level 3.0、40 = Level 4.0）。 */
+        public final int levelIdc;
+        /** max_num_ref_frames：解码器要同时保有的参考帧数。 */
+        public final int maxNumRefFrames;
+        /** 一帧的宏块列数 = pic_width_in_mbs_minus1 + 1。 */
+        public final int picWidthInMbs;
+        /** 一帧的宏块行数（已把场编码的 ×2 算进去）。 */
+        public final int frameHeightInMbs;
+
+        Dpb(int profileIdc, int levelIdc, int maxNumRefFrames,
+            int picWidthInMbs, int frameHeightInMbs) {
+            this.profileIdc = profileIdc;
+            this.levelIdc = levelIdc;
+            this.maxNumRefFrames = maxNumRefFrames;
+            this.picWidthInMbs = picWidthInMbs;
+            this.frameHeightInMbs = frameHeightInMbs;
+        }
+
+        /** 一帧占多少宏块 = 列 × 行。 */
+        public int picSizeInMbs() {
+            return picWidthInMbs * frameHeightInMbs;
+        }
+
+        /** DPB 需要多少宏块 = 参考帧数 × 每帧宏块数。 */
+        public int neededMbs() {
+            return maxNumRefFrames * picSizeInMbs();
+        }
+
+        /** 流**自己标的** level 允许多少宏块（H.264 Table A-1）；未知等级返回 0。 */
+        public int declaredLevelMaxMbs() {
+            return levelMaxDpbMbs(levelIdc);
+        }
+
+        /**
+         * 按**本机硬件**上限判定是否超限 —— 这才是真正的判据。
+         *
+         * <p>流可以把自己标成 Level 5.0（B 站 1080P 就是这么干的，按 5.0 算
+         * 6 个参考帧「合法」），但<b>标称等级骗得过应用，骗不过硬件</b>：
+         * 硬件解码器发现 DPB 装不下就放弃视频、音频照放 —— 用户看到黑屏有声，
+         * 而且<b>一个错误都不报</b>。
+         */
+        public boolean exceedsDevice() {
+            return neededMbs() > DEVICE_MAX_DPB_MBS;
+        }
+
+        /** profile 的可读名；未知返回 {@code "profile <n>"}。 */
+        public String profileName() {
+            switch (profileIdc) {
+                case 66: return "Baseline";
+                case 77: return "Main";
+                case 88: return "Extended";
+                case 100: return "High";
+                case 110: return "High 10";
+                case 122: return "High 4:2:2";
+                case 244: return "High 4:4:4";
+                default: return "profile " + profileIdc;
+            }
+        }
+
+        /** level 的可读名（"3.0" / "4.0" / "1b"）；未知返回 {@code "level <n>"}。 */
+        public String levelName() {
+            if (levelIdc == 9) {
+                return "1b";
+            }
+            if (levelIdc < 10) {
+                return "level " + levelIdc;
+            }
+            return (levelIdc / 10) + "." + (levelIdc % 10);
+        }
+    }
+
+    /**
+     * H.264 Table A-1 的 MaxDpbMbs（按 level_idc 查）。
+     *
+     * <p>表里没有的等级返回 0 —— 调用方据此知道「判不了」，而不是拿到一个
+     * 看起来像真值的 0 去比较。
+     */
+    public static int levelMaxDpbMbs(int levelIdc) {
+        switch (levelIdc) {
+            case 9:  return 396;      // Level 1b
+            case 10: return 396;
+            case 11: return 900;
+            case 12: return 2376;
+            case 13: return 2376;
+            case 20: return 2376;
+            case 21: return 4752;
+            case 22: return 8100;
+            case 30: return 8100;
+            case 31: return 18000;
+            case 32: return 20480;
+            case 40: return 32768;
+            case 41: return 32768;
+            case 42: return 34816;
+            case 50: return 110400;
+            case 51: return 184320;
+            case 52: return 184320;
+            default: return 0;
+        }
+    }
+
+    /**
+     * 从一段含 moov 的字节里解析视频轨的 H.264 SPS，给出 DPB 判定结果；
+     * 解析不出返回 {@code null}。
+     *
+     * <p><b>为什么不需要额外的网络请求</b>：{@code avcC} 在 {@code stsd} 里、
+     * {@code stsd} 在 {@code moov} 里 —— 和 {@link #parse} 读 tkhd 用的是
+     * <b>同一个窗口</b>。所以只要这个窗口已经拿到了，SPS 就是顺手多走两层的事，
+     * 零额外流量。这是本功能敢做「播放前预检」的前提。
+     *
+     * <p>只认 H.264（{@code avc1} / {@code avc3}）。H.265 的 SPS 在 {@code hvcC}
+     * 里、结构完全不同，一律返回 {@code null}（不猜）。
+     *
+     * @param buf 读到的字节（与 {@link #parse} 同一份窗口即可）
+     * @param len 有效长度
+     */
+    public static Dpb dpb(byte[] buf, int len) {
+        if (buf == null || len <= 0) {
+            return null;
+        }
+        int[] moov = findTopLevel(buf, 0, len, 'm', 'o', 'o', 'v');
+        if (moov == null) {
+            moov = scanForMoov(buf, len);
+        }
+        if (moov == null || moov[0] + moov[1] > len) {
+            return null;
+        }
+        return dpbFromMoov(buf, moov[0] + 8, moov[0] + moov[1]);
+    }
+
+    /** 在 moov 载荷里逐个 trak 找带 avcC 的那条。 */
+    static Dpb dpbFromMoov(byte[] b, int off, int end) {
+        int[] trak = findChild(b, off, end, 't', 'r', 'a', 'k');
+        while (trak != null) {
+            Dpb d = dpbFromTrak(b, trak[0] + 8, trak[0] + trak[1]);
+            if (d != null) {
+                return d;
+            }
+            int[] next = findChild(b, trak[0] + trak[1], end, 't', 'r', 'a', 'k');
+            if (next == null) {
+                break;
+            }
+            trak = next;
+        }
+        return null;
+    }
+
+    /** trak → mdia → minf → stbl → stsd → avc1/avc3 → avcC。 */
+    static Dpb dpbFromTrak(byte[] b, int off, int end) {
+        int[] mdia = findChild(b, off, end, 'm', 'd', 'i', 'a');
+        if (mdia == null) {
+            return null;
+        }
+        int[] minf = findChild(b, mdia[0] + 8, mdia[0] + mdia[1], 'm', 'i', 'n', 'f');
+        if (minf == null) {
+            return null;
+        }
+        int[] stbl = findChild(b, minf[0] + 8, minf[0] + minf[1], 's', 't', 'b', 'l');
+        if (stbl == null) {
+            return null;
+        }
+        int[] stsd = findChild(b, stbl[0] + 8, stbl[0] + stbl[1], 's', 't', 's', 'd');
+        if (stsd == null || stsd[1] < 16) {
+            return null;
+        }
+        int entry = stsd[0] + 16;
+        int entryEnd = stsd[0] + stsd[1];
+        // VisualSampleEntry 的固定头是 78 字节（从 entry 的 box 起点算到
+        // compressorname 之后的 depth/pre_defined 结束），子 box 从 +86 起。
+        // 算错这个偏移会一路读到别的东西 —— 而且多半还是"合法字节"，
+        // 所以下面必须再验 fourcc，不能只靠偏移对得上。
+        if (entry + 86 > entryEnd || entry + 86 > b.length) {
+            return null;
+        }
+        int entryType = typeAt(b, entry + 4);
+        // 只有 avc1 / avc3 带 avcC。hvc1/hev1 的 SPS 在 hvcC 里，
+        // 结构完全不同 —— 不认就是「算不出」，走 null 红线。
+        if (entryType != fourcc('a', 'v', 'c', '1')
+                && entryType != fourcc('a', 'v', 'c', '3')) {
+            return null;
+        }
+        int[] avcc = findChild(b, entry + 86, entryEnd, 'a', 'v', 'c', 'C');
+        if (avcc == null) {
+            return null;
+        }
+        return parseAvcC(b, avcc[0] + 8, avcc[0] + avcc[1]);
+    }
+
+    /**
+     * 解 AVCDecoderConfigurationRecord，取第一个 SPS。
+     *
+     * <pre>
+     * configurationVersion         u(8)   = 1
+     * AVCProfileIndication         u(8)
+     * profile_compatibility        u(8)
+     * AVCLevelIndication           u(8)
+     * 6 bits reserved + lengthSizeMinusOne      u(8)
+     * 3 bits reserved + numOfSequenceParameterSets  u(8)
+     * for each SPS:  u(16) 长度 + 该长度的 NAL
+     * </pre>
+     *
+     * <p>只解第一个 SPS：多 SPS 属于可伸缩/多视图编码，本机解不了也不需要。
+     */
+    static Dpb parseAvcC(byte[] b, int off, int end) {
+        if (off + 7 > end || off + 7 > b.length) {
+            return null;
+        }
+        if ((b[off] & 0xFF) != 1) {
+            return null;    // 只认第 1 版配置记录
+        }
+        int numSps = b[off + 5] & 0x1F;
+        if (numSps < 1) {
+            return null;
+        }
+        int p = off + 6;
+        int spsLen = readU16(b, p);
+        p += 2;
+        // 长度必须是个能装下 NAL header + 几个字段的合理值，且不能越界
+        if (spsLen < 4 || p + spsLen > end || p + spsLen > b.length) {
+            return null;
+        }
+        return parseSps(b, p, spsLen);
+    }
+
     /**
      * stsd 的第一个 sample entry 是不是**视觉轨**（视频编解码）。
      *
@@ -402,5 +653,213 @@ public final class Mp4Aspect {
 
     private static int fourcc(char a, char b, char c, char d) {
         return (a << 24) | (b << 16) | (c << 8) | d;
+    }
+
+    // ------------------------------------------------------------------
+    // H.264 SPS 解析
+    // ------------------------------------------------------------------
+
+    /**
+     * 解一条 SPS NAL，给出 DPB 判定结果；任何一步不合规都返回 {@code null}。
+     *
+     * <p>字段顺序见 H.264 7.3.2.1.1。这里只读到 {@code frame_mbs_only_flag}
+     * 为止 —— 后面的 {@code frame_cropping} / VUI 与 DPB 容量无关
+     * （DPB 用宏块数算，不用裁剪后的像素数）。
+     */
+    static Dpb parseSps(byte[] src, int off, int len) {
+        if (len < 4) {
+            return null;
+        }
+        // **NAL header 必须先跳过**：首字节是 forbidden_zero_bit(1) +
+        // nal_ref_idc(2) + nal_unit_type(5)。不跳的话会把 0x67 当成
+        // profile_idc，解出 103 这种根本不存在的 profile、level 0.0、
+        // 参考帧数还是个"看着合理"的值 —— 这个坑实际踩过。
+        if ((src[off] & 0x1F) != 7) {
+            return null;    // 不是 SPS
+        }
+        byte[] rbsp = unescapeRbsp(src, off + 1, len - 1);
+        BitReader r = new BitReader(rbsp);
+        try {
+            int profileIdc = r.u(8);
+            r.u(8);                     // constraint_setN_flags + reserved
+            int levelIdc = r.u(8);
+            r.ue();                     // seq_parameter_set_id
+
+            if (profileIdc == 100 || profileIdc == 110 || profileIdc == 122
+                    || profileIdc == 244 || profileIdc == 44 || profileIdc == 83
+                    || profileIdc == 86 || profileIdc == 118 || profileIdc == 128
+                    || profileIdc == 138 || profileIdc == 139 || profileIdc == 134
+                    || profileIdc == 135) {
+                // High 系列比 Baseline/Main 多这一段，**必须跟着读完**，
+                // 否则后面所有字段整体错位。
+                int chromaFormatIdc = r.ue();
+                if (chromaFormatIdc == 3) {
+                    r.u(1);             // separate_colour_plane_flag
+                }
+                r.ue();                 // bit_depth_luma_minus8
+                r.ue();                 // bit_depth_chroma_minus8
+                r.u(1);                 // qpprime_y_zero_transform_bypass_flag
+                if (r.u(1) != 0) {      // seq_scaling_matrix_present_flag
+                    int lists = (chromaFormatIdc == 3) ? 12 : 8;
+                    for (int i = 0; i < lists; i++) {
+                        if (r.u(1) != 0) {      // seq_scaling_list_present_flag
+                            skipScalingList(r, (i < 6) ? 16 : 64);
+                        }
+                    }
+                }
+            }
+
+            r.ue();                     // log2_max_frame_num_minus4
+            int pocType = r.ue();       // pic_order_cnt_type
+            if (pocType == 0) {
+                r.ue();                 // log2_max_pic_order_cnt_lsb_minus4
+            } else if (pocType == 1) {
+                r.u(1);                 // delta_pic_order_always_zero_flag
+                r.se();                 // offset_for_non_ref_pic
+                r.se();                 // offset_for_top_to_bottom_field
+                int cycle = r.ue();     // num_ref_frames_in_pic_order_cnt_cycle
+                if (cycle < 0 || cycle > 255) {
+                    return null;
+                }
+                for (int i = 0; i < cycle; i++) {
+                    r.se();             // offset_for_ref_frame[i]
+                }
+            }
+
+            int maxNumRefFrames = r.ue();
+            r.u(1);                     // gaps_in_frame_num_value_allowed_flag
+            int picWidthInMbs = r.ue() + 1;
+            int picHeightInMapUnits = r.ue() + 1;
+            int frameMbsOnlyFlag = r.u(1);
+            if (frameMbsOnlyFlag == 0) {
+                r.u(1);                 // mb_adaptive_frame_field_flag
+            }
+            r.u(1);                     // direct_8x8_inference_flag
+
+            // 场编码（frame_mbs_only_flag = 0）时一帧占两倍的行数 ——
+            // 漏掉这个 ×2 会把隔行扫描的 1080p 少算一半宏块，
+            // 于是「本该报警的超限」被判成正常。
+            int frameHeightInMbs = (2 - frameMbsOnlyFlag) * picHeightInMapUnits;
+
+            // ---- 合理性闸：位流错位时会解出"看着合法"的错值 ----
+            // H.264 规范里 max_num_ref_frames 上限是 16；分辨率上限按
+            // 本项目的 MAX_DIM（8192 像素 = 512 宏块）取宽裕值。
+            // 没有这几道闸，「错位」会被当成「一个奇怪的正常流」放过去。
+            if (maxNumRefFrames < 0 || maxNumRefFrames > 16) {
+                return null;
+            }
+            if (picWidthInMbs < 1 || picWidthInMbs > 512) {
+                return null;
+            }
+            if (frameHeightInMbs < 1 || frameHeightInMbs > 1024) {
+                return null;
+            }
+            return new Dpb(profileIdc, levelIdc, maxNumRefFrames,
+                    picWidthInMbs, frameHeightInMbs);
+        } catch (RuntimeException e) {
+            // 位流读越界 / 前导 0 过多：一律当"解不出"，不抛给调用方。
+            return null;
+        }
+    }
+
+    /**
+     * 跳过一条 scaling list（默认矩阵用的差分编码）。
+     *
+     * <p>不跳过的话，下面所有字段都会错位 —— 而错位解出来的
+     * {@code max_num_ref_frames} 往往仍是个 0~16 的"合理值"，
+     * 于是这条流被安静地判成正常。
+     */
+    private static void skipScalingList(BitReader r, int size) {
+        int lastScale = 8;
+        int nextScale = 8;
+        for (int j = 0; j < size; j++) {
+            if (nextScale != 0) {
+                int delta = r.se();
+                nextScale = (lastScale + delta + 256) % 256;
+            }
+            lastScale = (nextScale == 0) ? lastScale : nextScale;
+        }
+    }
+
+    /**
+     * 剥掉 SPS 里的 emulation prevention 字节。
+     *
+     * <p>H.264 规定 NAL 载荷里不许出现 {@code 00 00 00/01/02/03}（那会被
+     * 误当成起始码），所以编码器在 {@code 00 00} 之后插入一个 {@code 03} 打断它。
+     * <b>不剥掉这些 03，位流会整体错位</b>，解出来的参考帧数是个看似合理的错值。
+     *
+     * <p>做法：单次扫描，只在「已经连着两个 00 且当前字节是 03」时丢弃它，
+     * 丢弃后把 00 计数归零 —— 03 本来就是来打断这个序列的。
+     */
+    private static byte[] unescapeRbsp(byte[] src, int off, int len) {
+        byte[] out = new byte[len];
+        int n = 0;
+        int zeros = 0;
+        for (int i = 0; i < len; i++) {
+            int v = src[off + i] & 0xFF;
+            if (zeros >= 2 && v == 0x03) {
+                zeros = 0;
+                continue;
+            }
+            out[n++] = (byte) v;
+            zeros = (v == 0) ? zeros + 1 : 0;
+        }
+        byte[] r = new byte[n];
+        System.arraycopy(out, 0, r, 0, n);
+        return r;
+    }
+
+    /**
+     * 按位读的游标。越界一律抛异常，由 {@link #parseSps} 统一转成 {@code null}。
+     *
+     * <p>为什么自己写而不是用现成的：这是**位**流不是字节流，且
+     * {@code java.util.BitSet} 只按位存取、不提供 Exp-Golomb。
+     */
+    private static final class BitReader {
+        private final byte[] b;
+        private final int bitEnd;
+        private int bitPos;
+
+        BitReader(byte[] b) {
+            this.b = b;
+            this.bitPos = 0;
+            this.bitEnd = b.length * 8;
+        }
+
+        /** 读 {@code n} 位无符号（{@code n} ≤ 32）。 */
+        int u(int n) {
+            if (n <= 0 || n > 32 || bitPos + n > bitEnd) {
+                throw new IllegalStateException("SPS 位流越界");
+            }
+            int v = 0;
+            for (int i = 0; i < n; i++) {
+                v = (v << 1) | ((b[bitPos >> 3] >> (7 - (bitPos & 7))) & 1);
+                bitPos++;
+            }
+            return v;
+        }
+
+        /** 无符号 Exp-Golomb（ue(v)）：先数前导 0 的个数 k，再读 k 位。 */
+        int ue() {
+            int zeros = 0;
+            while (u(1) == 0) {
+                zeros++;
+                // 上限保护：SPS 里不可能有 31 个前导 0。没有这道闸，
+                // 一段垃圾位流会把循环跑到位流尽头（甚至死循环）。
+                if (zeros > 31) {
+                    throw new IllegalStateException("SPS Exp-Golomb 前导 0 过多");
+                }
+            }
+            if (zeros == 0) {
+                return 0;
+            }
+            return (1 << zeros) - 1 + u(zeros);
+        }
+
+        /** 有符号 Exp-Golomb（se(v)）：0→0、1→1、2→-1、3→2、4→-2 … */
+        int se() {
+            int k = ue();
+            return ((k & 1) == 1) ? ((k + 1) / 2) : -(k / 2);
+        }
     }
 }
