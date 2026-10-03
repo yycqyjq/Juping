@@ -11,12 +11,10 @@ import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.net.ConnectivityManager;
-import android.net.Uri;
 import android.net.wifi.WifiManager;
 import android.os.Binder;
 import android.os.Handler;
 import android.os.IBinder;
-import android.provider.Settings;
 import android.util.Log;
 
 import com.juping.cast.dlna.DidlLite;
@@ -25,16 +23,12 @@ import com.juping.cast.dlna.NetUtil;
 import com.juping.cast.dlna.SsdpResponder;
 import com.juping.cast.dlna.UpnpHttpServer;
 import com.juping.cast.player.MediaPlayerController;
+import com.juping.cast.player.MediaTypes;
 import com.juping.cast.player.PlaybackPolicy;
 import com.juping.cast.player.RenderState;
-import com.juping.cast.web.ApkEndpoints;
-import com.juping.cast.web.ApkScanner;
-import com.juping.cast.web.LocalStore;
-import com.juping.cast.web.WebCastEndpoints;
-import com.juping.cast.web.WebRouter;
+import com.juping.cast.web.WebCastHost;
 
 import java.io.ByteArrayOutputStream;
-import java.io.File;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -56,14 +50,7 @@ import java.util.UUID;
  */
 public class DlnaRendererService extends Service
         implements UpnpHttpServer.CommandHandler, MediaPlayerController.Listener,
-        EventDispatcher.EventSource,
-        // 网页上传的东西要能"投到电视"，而这件事的落点在本类（onSetUri + onPlay
-        // 才是真正的播放动作）。让 WebCastEndpoints 反向拿一个回调接口，
-        // 而不是自己去碰播放器 —— 播放状态机只此一处，多一个入口就多一套竞态。
-        WebCastEndpoints.CastTarget,
-        // 外接存储 APK 安装（批 3.5）：唤起系统安装器需要 Service 上下文（startActivity），
-        // 落点同样在本类。端点拿回调接口，不自己碰 Intent。
-        ApkEndpoints.InstallTarget {
+        EventDispatcher.EventSource {
 
     private static final String TAG = "DlnaRendererService";
 
@@ -143,20 +130,25 @@ public class DlnaRendererService extends Service
     private MediaPlayerController player;
 
     /**
-     * 上传落盘与网页端点。
+     * 网页那一整套（扫码上传页 + 外接存储装应用），连同它们需要的两个落点回调。
      *
-     * <p>生命周期跟服务走：{@code LocalStore} 只是包了一个目录路径，
-     * 端点是无状态的，两者都不持有 Context（{@code LocalStore} 只在构造时用一下
-     * {@code getFilesDir()}），所以网络变化重建 HTTP 服务时**不需要重建它们** ——
+     * <p>原来这里是 5 个字段（{@code LocalStore} / {@code WebCastEndpoints} /
+     * {@code ApkScanner} / {@code ApkEndpoints} / {@code WebRouter}）加 5 行装配，
+     * 本类还自己实现了 {@code CastTarget} 与 {@code InstallTarget} 两个接口、
+     * 自己拼 {@code ACTION_VIEW} 的 Intent、自己知道 {@code /status} 里
+     * {@code storage} 那段长什么样。可这些事与「当一台 DLNA 渲染端」没有关系 ——
+     * 它们是「这台盒子上还有一个网页」带来的。2026-10-03 起整个搬到
+     * {@link WebCastHost}，本类只剩这一个字段。
+     *
+     * <p>**唯一**留在本类的耦合面是 {@link WebCastHost.Playback} 那三个方法：
+     * 本机地址、实际端口、以及"把地址播出去"。前两个只有服务知道，
+     * 第三个必须复用 {@code onSetUri} + 播放 —— 播放状态机只此一处，
+     * 多一个入口就多一套竞态。
+     *
+     * <p>生命周期跟服务走：网络变化重建 HTTP 服务时**不需要重建它** ——
      * 重建了反而会把上传目录重新探一遍，白做。
      */
-    private LocalStore webStore;
-    private WebCastEndpoints webEndpoints;
-    /** APK 扫描与安装端点（批 3.5）。生命周期跟服务走。 */
-    private ApkScanner apkScanner;
-    private ApkEndpoints apkEndpoints;
-    /** 复合路由：上传端点 + 安装包端点，串成 UpnpHttpServer 要的那一个 WebEndpoints。 */
-    private WebRouter webRouter;
+    private WebCastHost webCast;
 
     private String uuid;
     private String friendlyName;
@@ -374,19 +366,33 @@ public class DlnaRendererService extends Service
 
         localIp = NetUtil.pickLocalIp();
 
-        // 网页上传端点。建在 HTTP 服务之前 —— 构造要把它传进去。
-        // 落盘根是 getFilesDir()/uploads（为什么不是外部存储，见 LocalStore 的类注释：
-        // 这台盒子上"外部存储"就是插着的那支 U 盘）。
-        webStore = new LocalStore(this);
-        webEndpoints = new WebCastEndpoints(webStore, this);
-        // 外接存储 APK 扫描 / 安装（批 3.5）。与上传端点共用同一个 HTTP 服务，
-        // 由 WebRouter 串起来 —— HTTP 层只认一个 WebEndpoints。
-        apkScanner = new ApkScanner(this);
-        apkEndpoints = new ApkEndpoints(apkScanner, this);
-        webRouter = new WebRouter(webEndpoints, apkEndpoints);
+        // 网页那一整套（上传页 + 装应用）。建在 HTTP 服务之前 —— 构造要把它传进去。
+        // 三个回调刻意写成匿名类而不是让本类去 implements：那样本类就又认识
+        // WebCastHost 的接口了，摘出去的意义打折。三个方法就是全部耦合面。
+        webCast = new WebCastHost(this, new WebCastHost.Playback() {
+            @Override
+            public String localIp() {
+                return getLocalIp();
+            }
+
+            @Override
+            public int httpPort() {
+                return getHttpPort();
+            }
+
+            @Override
+            public void cast(String url, String didl) {
+                // 复用既有那条 DLNA 渲染路径：onSetUri 里还有一整套状态对齐
+                // （currentUri / 元数据 / 标题 / kindFromMetadata / 清空下一曲队列 /
+                // 推 AVTransport 事件），绕开它直接播的话，控制点回读到的
+                // CurrentURI 还是上一部片子，电视机和手机显示的是两个不同的东西。
+                onSetUri(url, didl);
+                onPlay();
+            }
+        });
 
         httpServer = new UpnpHttpServer(HTTP_PORT, uuid, friendlyName, BuildConfig.VERSION_NAME, this, this,
-                webRouter);
+                webCast.endpoints());
         // 图标要在 start() 之前给 —— 设备描述是随请求现生成的，
         // 但早点给上可以让"第一台来搜的控制点"就看到图标。
         provideDeviceIcon();
@@ -663,7 +669,7 @@ public class DlnaRendererService extends Service
             h.shutdown();
         }
         httpServer = new UpnpHttpServer(HTTP_PORT, uuid, friendlyName, BuildConfig.VERSION_NAME, this, this,
-                webRouter);
+                webCast.endpoints());
         provideDeviceIcon();
         httpServer.start();
         int after = httpServer.getPort();
@@ -810,14 +816,12 @@ public class DlnaRendererService extends Service
             sb.append("\"subscribers\":").append(httpServer.aliveSubscriberCount()).append(',');
             sb.append("\"msSinceLastControl\":").append(httpServer.millisSinceLastControl()).append(',');
         }
-        // 上传目录与存储版图。排障时不开 adb 也能看到"文件到底存哪了、还剩多少"——
-        // 这台盒子上"外部存储"就是那支 U 盘，纸面上推不出来，只能看实机。
-        if (webEndpoints != null) {
-            sb.append("\"storage\":").append(webEndpoints.storageJson()).append(',');
-        }
-        // 未知来源开关（批 3.5）：装不上时先看这里 —— 无鉴权端点，只暴露一个布尔。
-        if (apkEndpoints != null) {
-            sb.append("\"installAllowed\":").append(apkEndpoints.isInstallAllowed()).append(',');
+        // 上传目录与存储版图 / 「未知来源」开关 —— 排障时不开 adb 也能看到
+        // "文件到底存哪了、还剩多少"。这两个字段**属于网页子系统**，
+        // 所以由 WebCastHost 自己拼那一段：服务这边若还要逐项取，
+        // 等于把刚摘出去的 5 个字段换个地方又摆一遍。
+        if (webCast != null) {
+            sb.append(webCast.statusJson());
         }
         sb.append("\"uptimeSec\":").append(
                 (System.currentTimeMillis() - startedAtMs) / 1000);
@@ -1003,7 +1007,7 @@ public class DlnaRendererService extends Service
             // 取证：形态是靠扩展名定的，而不是靠元数据 —— 下次再出"形态不对"，
             // 有没有这一行决定了能否一眼看出是哪路信号失效。
             Log.i(TAG, "元数据没判出形态（无 upnp:class？），改按地址扩展名 ."
-                    + extensionOf(uri) + " 定形态");
+                    + MediaTypes.extensionOf(uri) + " 定形态");
         }
         return byExtension;
     }
@@ -1020,13 +1024,13 @@ public class DlnaRendererService extends Service
         if (uri == null || uri.length() == 0) {
             return KIND_UNKNOWN;
         }
-        if (isImageName(uri)) {
+        if (MediaTypes.isImageName(uri)) {
             return KIND_IMAGE;
         }
-        if (isAudioName(uri)) {
+        if (MediaTypes.isAudioName(uri)) {
             return KIND_AUDIO;
         }
-        if (isVideoName(uri)) {
+        if (MediaTypes.isVideoName(uri)) {
             return KIND_VIDEO;
         }
         return KIND_UNKNOWN;
@@ -1037,213 +1041,6 @@ public class DlnaRendererService extends Service
         if (player != null) {
             player.resume();
         }
-    }
-
-    // ------------------------------------------- WebCastEndpoints.CastTarget
-
-    /**
-     * 把盒子上已上传的本地文件当投屏源播出去（网页上点「投到电视」的落点）。
-     *
-     * <p><b>为什么复用 onSetUri 而不是直接 player.play()</b>：onSetUri 里还有一整套
-     * 状态对齐 —— currentUri / 元数据 / 标题 / kindFromMetadata / 清空下一曲队列 /
-     * 推 AVTransport 事件。绕开它直接播，控制点回读到的 CurrentURI 还是上一部片子，
-     * 界面形态也会停在旧类型上，等于电视机和手机显示的是两个不同的东西。
-     *
-     * <p><b>为什么地址是 {@code http://<本机IP>:<端口>/media/<名字>}，而不是 {@code file://}</b>：
-     * 上传的文件在应用私有目录里（{@code files/uploads} 真机实测是 {@code drwx------}），
-     * 而真正去 open 它的是**另一个进程** mediaserver —— 它穿不过这个目录，
-     * 实测只会拿到 {@code error (1, -2147483648)}，电视上什么都不放。
-     * 改由我们自己进程以 HTTP 提供，权限问题就不存在了。
-     *
-     * <p>顺带两个好处：① Content-Type 探测要用 http 地址，而这台 MTK 盒子
-     * {@code getVideoWidth()} 恒返回 0 —— 少了探测，上传的视频会被判成纯音频，
-     * 画面在放、界面却弹音乐卡片；② {@code currentUri} 成了一个真正的 URL，
-     * 控制点回读/续播/拖拽都按既有那条（http 媒体的）路径走，不必为本地文件
-     * 再开一套语义。
-     */
-    @Override
-    public void castLocalFile(File file) {
-        if (file == null) {
-            return;
-        }
-        String url = "http://" + getLocalIp() + ":" + getHttpPort()
-                + "/media/" + Uri.encode(file.getName());
-        onSetUri(url, didlFor(file));
-        onPlay();
-    }
-
-    // ------------------------------------------- ApkEndpoints.InstallTarget
-
-    /**
-     * 「未知来源」开关是否已开（批 3.5）。
-     *
-     * <p>Android 4.0 上是**全局开关**：读 {@code INSTALL_NON_MARKET_APPS}
-     * （API 3 起可用；API 17 起 deprecated 但仍可读），1 = 已开。关着时系统安装器会拒绝，
-     * 所以先查它、把「去打开」这条指引提前给出来，而不是让用户点了没反应。
-     *
-     * <p>读不出来（个别 ROM 没这个键）时返回 true —— 让系统安装器自己判断，
-     * 好过我们误判成「未开」把用户挡在门外。
-     */
-    @Override
-    public boolean isInstallAllowed() {
-        try {
-            return Settings.Secure.getInt(getContentResolver(),
-                    Settings.Secure.INSTALL_NON_MARKET_APPS, 0) == 1;
-        } catch (Throwable t) {
-            Log.w(TAG, "读「未知来源」开关失败，按已开处理", t);
-            return true;
-        }
-    }
-
-    /**
-     * 唤起系统安装器安装外接卷上的一个 APK（批 3.5）。
-     *
-     * <p>用 {@code ACTION_VIEW} + {@code application/vnd.android.package-archive}
-     * 而不是 {@code ACTION_INSTALL_PACKAGE}：前者是 Android 4.0 上最通用的安装唤起方式，
-     * 系统安装器必然注册了它。地址用 {@code file://}（{@code Uri.fromFile}）——
-     * 本项目 {@code targetSdk 19 < 24}，{@code FileUriExposedException} 不生效，
-     * 无需 FileProvider。必须带 {@code FLAG_ACTIVITY_NEW_TASK}（从 Service 上下文启动）。
-     *
-     * <p><b>若装的是聚屏自己</b>：安装过程中系统会杀掉本进程 → 前台服务随之中断 →
-     * 装完需重新打开聚屏。这是系统行为，无解（方案 §6.2），已在 README 写明。
-     *
-     * @return 是否成功发起；真正装上要等电视端遥控器确认
-     */
-    @Override
-    public boolean installApk(File apk) {
-        if (apk == null) {
-            return false;
-        }
-        Intent i = new Intent(Intent.ACTION_VIEW);
-        i.setDataAndType(Uri.fromFile(apk), "application/vnd.android.package-archive");
-        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        try {
-            startActivity(i);
-            Log.i(TAG, "已唤起安装器：" + apk.getName());
-            return true;
-        } catch (RuntimeException e) {
-            Log.e(TAG, "唤起安装器失败：" + apk.getName(), e);
-            return false;
-        }
-    }
-
-    /**
-     * 给本地文件拼一段最小 DIDL-Lite。
-     *
-     * <p><b>为什么必须自己拼</b>：{@link DidlLite} 只有读取方法、没有构造器。
-     * 而 {@code <upnp:class>} 这一项不能省 —— {@link #kindOf} 靠它分音频/视频/图片，
-     * 少了它 mp3 会被判成 {@code KIND_UNKNOWN}，界面按视频形态渲染出**一块黑屏**，
-     * 而声音其实正常（用户会以为投屏坏了）。
-     */
-    private static String didlFor(File file) {
-        String name = file.getName();
-        String title = escapeXml(name);
-        String upnpClass;
-        // 图片必须**先判**：它若掉进下面那个"其他一律当视频"的兜底分支，
-        // {@link #kindOf} 就会把 kindFromMetadata 判成 KIND_VIDEO，
-        // 界面于是走视频通道去等一个永远不来的视频帧 —— 又是黑屏。
-        if (isImageName(name)) {
-            upnpClass = "object.item.imageItem.photo";
-        } else if (isAudioName(name)) {
-            upnpClass = "object.item.audioItem.musicTrack";
-        } else {
-            upnpClass = "object.item.videoItem";
-        }
-        return "<DIDL-Lite xmlns:dc=\"http://purl.org/dc/elements/1.1/\""
-                + " xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\""
-                + " xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\">"
-                + "<item id=\"" + title + "\" parentID=\"0\" restricted=\"1\">"
-                + "<dc:title>" + title + "</dc:title>"
-                + "<upnp:class>" + upnpClass + "</upnp:class>"
-                + "</item></DIDL-Lite>";
-    }
-
-    /**
-     * 按扩展名判是不是图片。
-     *
-     * <p>只认浏览器与相册最常产出的这几种。判错方向的代价不对称：
-     * 漏判成图片会退回"视频"通道（黑屏），误判成图片则一张真视频变成一张
-     * 显示不出来的图 —— 所以宁可只认确定的扩展名。
-     */
-    private static boolean isImageName(String name) {
-        String ext = extensionOf(name);
-        return "jpg".equals(ext) || "jpeg".equals(ext) || "png".equals(ext)
-                || "gif".equals(ext) || "bmp".equals(ext) || "webp".equals(ext);
-    }
-
-    /**
-     * 小写扩展名（不含点）；没有点则返回空串。
-     *
-     * <p><b>既能吃文件名，也能吃 URL</b>：URL 上的查询串/锚点会污染扩展名
-     * （{@code …/a.mp4?token=xx} 直接取最后一个点的后半段会得到 {@code mp4?token=xx}），
-     * 所以先把它们切掉。
-     *
-     * <p>还要挡住「路径里有句点却没有扩展名」的情况：{@code http://h/1.2/video}
-     * 取出来的是 {@code 2/video}，{@code http://h/video.2019} 取出来的是 {@code 2019} ——
-     * 都不是扩展名。只认纯字母数字、不超过 5 位的尾巴，其余一律当"没有扩展名"。
-     */
-    private static String extensionOf(String name) {
-        String n = name.toLowerCase(java.util.Locale.ROOT);
-        int cut = n.indexOf('?');
-        if (cut >= 0) {
-            n = n.substring(0, cut);
-        }
-        cut = n.indexOf('#');
-        if (cut >= 0) {
-            n = n.substring(0, cut);
-        }
-        int dot = n.lastIndexOf('.');
-        if (dot < 0) {
-            return "";
-        }
-        String ext = n.substring(dot + 1);
-        if (ext.length() == 0 || ext.length() > 5) {
-            return "";
-        }
-        for (int i = 0; i < ext.length(); i++) {
-            char c = ext.charAt(i);
-            if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) {
-                return "";
-            }
-        }
-        return ext;
-    }
-
-    /**
-     * 按扩展名判是不是视频。
-     *
-     * <p>列进来的都是明确"有画面"的容器。{@code m3u8}（HLS）**刻意不收** ——
-     * 它既可能是视频、也可能是纯音频网络电台，见 {@link #kindOfUrl} 里那条
-     * "拿不准就不猜"的说明。
-     */
-    private static boolean isVideoName(String name) {
-        String ext = extensionOf(name);
-        return "mp4".equals(ext) || "m4v".equals(ext) || "mkv".equals(ext)
-                || "avi".equals(ext) || "mov".equals(ext) || "webm".equals(ext)
-                || "flv".equals(ext) || "ts".equals(ext) || "m2ts".equals(ext)
-                || "wmv".equals(ext) || "mpg".equals(ext) || "mpeg".equals(ext)
-                || "3gp".equals(ext) || "rmvb".equals(ext) || "asf".equals(ext)
-                || "ogv".equals(ext) || "vob".equals(ext) || "mts".equals(ext);
-    }
-
-    /**
-     * 按扩展名判是不是音频。
-     *
-     * <p>判不出来一律当视频：视频是"有画面"的默认预期，猜错的代价也最小 ——
-     * 猜成视频而实际是音频，画面是黑的但声音在放；猜成音频而实际是视频，
-     * 界面会切到音乐形态、把画面藏起来，那才是真的丢了东西。
-     */
-    private static boolean isAudioName(String name) {
-        String ext = extensionOf(name);
-        return "mp3".equals(ext) || "m4a".equals(ext) || "aac".equals(ext)
-                || "wav".equals(ext) || "flac".equals(ext) || "ogg".equals(ext)
-                || "wma".equals(ext) || "ape".equals(ext);
-    }
-
-    /** DIDL-Lite 是 XML，文件名里的 {@code & < > " '} 必须转义 */
-    private static String escapeXml(String s) {
-        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                .replace("\"", "&quot;").replace("'", "&apos;");
     }
 
     @Override

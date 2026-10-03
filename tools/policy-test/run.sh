@@ -38,6 +38,10 @@ trap 'rm -rf "$OUT"' EXIT INT TERM
 
 POLICY="app/src/main/java/com/juping/cast/player/PlaybackPolicy.java"
 RSTATE="app/src/main/java/com/juping/cast/player/RenderState.java"
+# 媒体形态判定（2026-10-03 从 DlnaRendererService 摘出，零 Android 依赖）
+MT="app/src/main/java/com/juping/cast/player/MediaTypes.java"
+# 网页子系统宿主（2026-10-03 从 DlnaRendererService 摘出；本文件只查它的 didlFor）
+HOST="app/src/main/java/com/juping/cast/web/WebCastHost.java"
 CTRL="app/src/main/java/com/juping/cast/player/MediaPlayerController.java"
 ASPECT="app/src/main/java/com/juping/cast/player/Mp4Aspect.java"
 PROBE="app/src/main/java/com/juping/cast/player/VideoAspectProbe.java"
@@ -55,7 +59,7 @@ QR="app/src/main/java/com/juping/cast/QrRenderer.java"
 # ── 1. 编译（不需要 android.jar —— PlaybackPolicy 零 Android 依赖）──
 echo "── 编译播放策略（桌面 JVM，零 Android 依赖）──"
 if ! "$JAVAC" -nowarn -encoding UTF-8 -d "$OUT" \
-        "$POLICY" "$RSTATE" "$ASPECT" "$DESC" "$HERE/PolicyTest.java" 2>"$OUT/javac.err"; then
+        "$POLICY" "$RSTATE" "$ASPECT" "$MT" "$DESC" "$HERE/PolicyTest.java" 2>"$OUT/javac.err"; then
     echo "编译失败：" >&2
     cat "$OUT/javac.err" >&2
     exit 2
@@ -746,12 +750,14 @@ PY
 # 两种写法都能造成它，而两种在编译期和日志里都不报任何东西：
 #   · 把越界目标原样放行；
 #   · 把「解析失败」当成 0 下发（0 是合法时刻，语义却是"跳到开头"）。
-python3 - "$SVC" "$HTTP" "$ACT" <<'PY' || RC=1
+python3 - "$SVC" "$HTTP" "$ACT" "$MT" "$HOST" <<'PY' || RC=1
 import re, sys, pathlib
-svc_path, http_path, act_path = sys.argv[1], sys.argv[2], sys.argv[3]
+svc_path, http_path, act_path, mt_path, host_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 svc = pathlib.Path(svc_path).read_text(encoding='utf-8')
 http = pathlib.Path(http_path).read_text(encoding='utf-8')
 act_src = pathlib.Path(act_path).read_text(encoding='utf-8')
+mt = pathlib.Path(mt_path).read_text(encoding='utf-8')
+host = pathlib.Path(host_path).read_text(encoding='utf-8')
 failed = []
 
 def report(name, ok, detail=''):
@@ -794,6 +800,8 @@ def strip_comments(src):
 
 svc = strip_comments(svc)
 http = strip_comments(http)
+mt = strip_comments(mt)
+host = strip_comments(host)
 
 def body_of(src, marker):
     i = src.find(marker)
@@ -943,8 +951,12 @@ if ko:
            'object.item.imageItem.photo。不认它，照片会落到"未知"，'
            '再被当成视频处理')
 
-df = body_of(svc, 'private static String didlFor(File file)')
-report('didlFor 方法体已找到', df is not None,
+# 2026-10-03 起 didlFor 随 web-cast 子系统搬到 web/WebCastHost。
+# 注意判据**没有**跟着"降级"成"文件里出现过 imageItem"就完事 ——
+# 仍然钉方法体：'imageItem' 在同一个文件里出现两次（图片档 + 音频档的注释里
+# 也可能提到），只看整个文件的话，把图片那一档删掉照样绿。
+df = body_of(host, 'private static String didlFor(File file)')
+report('didlFor 方法体已找到（2026-10-03 起在 web/WebCastHost）', df is not None,
        '锚点：private static String didlFor(File file)')
 if df:
     report('didlFor 把图片判成 object.item.imageItem.photo',
@@ -952,11 +964,20 @@ if df:
            '上传页投的是本地文件，走的就是 didlFor 拼元数据这条路。'
            '少了图片这一档，照片会被拼成 videoItem，kindOf 再把它判成视频 —— '
            '又是黑屏')
+    report('didlFor 的形态判定走 MediaTypes（不在本地再抄一份扩展名表）',
+           'MediaTypes.isImageName(' in df and 'MediaTypes.isAudioName(' in df
+           and '"jpg"' not in df and '"mp3"' not in df,
+           '抄一份出来的话，两边迟早分叉 —— 而分叉的表现是'
+           '「上传页投的照片是黑的、控制点投的同一张却正常」，'
+           '看着像两个 bug，其实是一个')
 
-report('isImageName 按扩展名认图片（含 jpg 与 png）',
-       'isImageName' in svc and re.search(r'"jpg"', svc) is not None
-       and re.search(r'"png"', svc) is not None,
-       '扩展名是 didlFor 分类的唯一依据；漏掉 jpg/png 等于最常见的照片都不认')
+report('服务的形态兜底走 MediaTypes（不自己再留一份扩展名表）',
+       'MediaTypes.isImageName(uri)' in svc and 'MediaTypes.isVideoName(uri)' in svc
+       and re.search(r'"jpg"\s*\.equals', svc) is None,
+       '表的内容由 PolicyTest §18 在桌面上穷举，这里只钉**调用点**。'
+       '本地再抄一份的话，两边迟早分叉 —— 而分叉的表现是'
+       '「控制点投的同一张照片正常，上传页投的却是黑的」，'
+       '看着像两个 bug，其实是一个')
 
 su2 = body_of(svc, 'public void onSetUri(String uri, String metadata)')
 if su2:
@@ -2366,14 +2387,15 @@ PY
 #   · 播放器音量绕过 applyVolume 单独下发 → 设了静音、改一下音量又有声音了
 echo
 echo "── 11. 照成熟 DMR 补齐的源码级不变量 ──"
-python3 - "$HTTP" "$CTRL" "$SVC" "$DESC" <<'PY' || RC=1
+python3 - "$HTTP" "$CTRL" "$SVC" "$DESC" "$MT" <<'PY' || RC=1
 import re, sys, pathlib
 
-http_path, ctrl_path, svc_path, desc_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+http_path, ctrl_path, svc_path, desc_path, mt_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 http = pathlib.Path(http_path).read_text(encoding='utf-8')
 ctrl = pathlib.Path(ctrl_path).read_text(encoding='utf-8')
 svc = pathlib.Path(svc_path).read_text(encoding='utf-8')
 desc = pathlib.Path(desc_path).read_text(encoding='utf-8')
+mt = pathlib.Path(mt_path).read_text(encoding='utf-8')
 ssdp = pathlib.Path('app/src/main/java/com/juping/cast/dlna/SsdpResponder.java'
                     ).read_text(encoding='utf-8')
 def strip_comments(src):
@@ -2485,6 +2507,7 @@ ctrl = strip_comments(ctrl)
 svc = strip_comments(svc)
 ssdp = strip_comments(ssdp)
 desc = strip_comments(desc)
+mt = strip_comments(mt)
 failed = []
 
 
@@ -3081,7 +3104,7 @@ report('onSetUri 与 onSourceChanged 都走 kindOfAny（两条入口同一判据
        '只改一条的话：正常投屏（onSetUri）对了，而重投 / 续播接棒'
        '（onSourceChanged）仍按老判据把视频判成纯音频 —— '
        '表现成"有时行、有时不行"，是最难查的那种形态')
-ex = body_of(svc, 'private static String extensionOf(String name)')
+ex = body_of(mt, 'public static String extensionOf(String name)')
 report('extensionOf 支持 URL：先切查询串/锚点，再只认合法扩展名',
        ex is not None
        and re.search(r"indexOf\('\?'\)[\s\S]{0,120}?substring\(0,\s*cut\)",
@@ -3094,10 +3117,11 @@ report('extensionOf 支持 URL：先切查询串/锚点，再只认合法扩展�
        '不限字形与长度的话 http://h/1.2/video 会取出 "2/video"、'
        'http://h/video.2019 会取出 "2019" —— 都会把非视频地址误判成视频。'
        '（本条第一版只查 indexOf(\'#\') 在不在，把 substring(0, cut) 改成 '
-       'substring(0, 0) 照样绿 —— 证伪时抓出来的，所以现在连"切法"一起钉）')
+       'substring(0, 0) 照样绿 —— 证伪时抓出来的，所以现在连"切法"一起钉）'
+       '（2026-10-03 起锚点在 player/MediaTypes，切法细节另有 PolicyTest §18 穷举）')
 report('isVideoName 收录常见容器，且刻意不收 m3u8',
-       'private static boolean isVideoName(String name)' in svc
-       and '"mp4".equals(ext)' in svc and '"m3u8"' not in svc,
+       'public static boolean isVideoName(String name)' in mt
+       and '"mp4".equals(ext)' in mt and '"m3u8"' not in mt,
        '扩展名兜底靠的就是这张表，漏掉 mp4 等于没兜底；'
        'm3u8（HLS）是**刻意**不收的 —— 它既可能是视频、也可能是纯音频网络电台，'
        '而猜错方向的代价不对称：视频被判成音频时，音乐卡片把画面整个盖住')

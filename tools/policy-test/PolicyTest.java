@@ -1,4 +1,5 @@
 import com.juping.cast.dlna.DlnaDescription;
+import com.juping.cast.player.MediaTypes;
 import com.juping.cast.player.Mp4Aspect;
 import com.juping.cast.player.PlaybackPolicy;
 import com.juping.cast.player.RenderState;
@@ -926,6 +927,78 @@ public class PolicyTest {
                 DlnaDescription.isKnownAction(firstAction)
                         && !DlnaDescription.isKnownAction("Tampered"),
                 "返回数组本身的话，断言代码能悄悄改掉生产用的白名单");
+
+        System.out.println("\n── 18. 媒体形态判定（原来住在 DlnaRendererService 里的私有静态方法）──");
+        System.out.println("   这四条判定只看文件名/地址，一个 Android API 都不碰 —— 抽进");
+        System.out.println("   player/MediaTypes 之后，第一次能在桌面上把边界穷举一遍。");
+        System.out.println("   以前只有一条「方法体里出现过 indexOf('?')」的源码守卫，");
+        System.out.println("   把 substring(0, cut) 改成 substring(0, 0) 它照样绿。");
+
+        check("常见扩展名取得到", "mp4".equals(MediaTypes.extensionOf("a.mp4")),
+                "得到 " + MediaTypes.extensionOf("a.mp4"));
+        check("大写归一（A.MP4 → mp4）", "mp4".equals(MediaTypes.extensionOf("A.MP4")),
+                "得到 " + MediaTypes.extensionOf("A.MP4") + " —— 不归一的话相册里那些 .JPG 全认不出");
+        check("URL 带查询串：先切 ? 再取扩展名（CDN 地址几乎必然带签名）",
+                "mp4".equals(MediaTypes.extensionOf("http://h/a.mp4?token=x&expire=1")),
+                "得到 " + MediaTypes.extensionOf("http://h/a.mp4?token=x&expire=1")
+                        + " —— 不切的话取出来是 mp4?token=x&expire=1，一个类型都认不出");
+        check("URL 带锚点：先切 # 再取扩展名",
+                "mp4".equals(MediaTypes.extensionOf("http://h/a.mp4#t=10")),
+                "得到 " + MediaTypes.extensionOf("http://h/a.mp4#t=10"));
+        check("路径里有句点但没有扩展名（…/1.2/video → 空串）",
+                "".equals(MediaTypes.extensionOf("http://h/1.2/video")),
+                "得到 " + MediaTypes.extensionOf("http://h/1.2/video")
+                        + " —— 切出来是 \"2/video\"，带斜杠，不是扩展名");
+        check("完全没有点 → 空串", "".equals(MediaTypes.extensionOf("noext")),
+                "得到 " + MediaTypes.extensionOf("noext"));
+        check("尾巴超过 5 位 → 空串", "".equals(MediaTypes.extensionOf("a.abcdefg")),
+                "得到 " + MediaTypes.extensionOf("a.abcdefg"));
+        check("尾巴含非字母数字 → 空串", "".equals(MediaTypes.extensionOf("a.m p4")),
+                "得到 " + MediaTypes.extensionOf("a.m p4"));
+        check("null 安全（返回空串，不抛）", "".equals(MediaTypes.extensionOf(null)),
+                "服务里原来的实现直接 NPE —— 抽出来时顺手补上，"
+                        + "顺带让这条边界第一次可以被断言");
+
+        // 「纯数字尾巴照原样返回」是**刻意**的，不是漏网：3gp 就是数字开头。
+        // 代价是这类地址归成"认不出来"，不是误判成某一类。
+        check("纯数字尾巴照原样返回（…/video.2019 → \"2019\"）",
+                "2019".equals(MediaTypes.extensionOf("http://h/video.2019")),
+                "得到 " + MediaTypes.extensionOf("http://h/video.2019"));
+        check("但那个尾巴认不出任何类型（形态仍是未知，不是被猜成某一类）",
+                !MediaTypes.isVideoName("http://h/video.2019")
+                        && !MediaTypes.isImageName("http://h/video.2019")
+                        && !MediaTypes.isAudioName("http://h/video.2019"),
+                "认错方向的代价不对称，所以宁可「认不出」不可「猜一个」");
+        check("3gp 是视频 —— 证明不能要求尾巴以字母开头",
+                MediaTypes.isVideoName("clip.3gp"),
+                "「必须字母开头」看起来更严，却会把 3gp 整类漏掉");
+
+        check("图片：jpg / jpeg / png 都认", MediaTypes.isImageName("x.jpg")
+                        && MediaTypes.isImageName("x.jpeg") && MediaTypes.isImageName("x.PNG"),
+                "漏掉 jpg/png 等于最常见的照片都不认");
+        check("音频：mp3 认", MediaTypes.isAudioName("x.mp3"), "");
+        check("视频：mp4 / mkv / ts 都认", MediaTypes.isVideoName("x.mp4")
+                        && MediaTypes.isVideoName("x.mkv") && MediaTypes.isVideoName("x.ts"),
+                "扩展名兜底靠的就是这张表，漏掉 mp4 等于没兜底");
+        check("m3u8 刻意不收（HLS 既可能是视频、也可能是纯音频网络电台）",
+                !MediaTypes.isVideoName("live.m3u8"),
+                "收进来就会把纯音频电台判成视频：音乐卡片换成一块黑屏，"
+                        + "用户什么都看不到 —— 猜错方向的代价不对称");
+        check("认不出来一律不算任何一类（拿不准就不猜）",
+                !MediaTypes.isVideoName("x.unknownext")
+                        && !MediaTypes.isAudioName("x.unknownext")
+                        && !MediaTypes.isImageName("x.unknownext"),
+                "视频被判成音频会把画面整个盖住；音频被判成视频只是黑屏有声。"
+                        + "两害相权，宁可不判、交给 onPrepared 与 Content-Type 去定论");
+        // didlFor 里「图片必须先判」的前提就是这三张表互不重叠 ——
+        // 重叠的话，判成哪一类取决于 if 的顺序，而顺序是最容易被顺手改的东西。
+        check("三张表互不重叠：同一个扩展名不会既是图片又是音频/视频",
+                MediaTypes.isImageName("x.jpg") && !MediaTypes.isAudioName("x.jpg")
+                        && !MediaTypes.isVideoName("x.jpg")
+                        && !MediaTypes.isImageName("x.mp4")
+                        && !MediaTypes.isImageName("x.mp3"),
+                "重叠的话 didlFor 的 upnp:class 就取决于 if 的先后顺序，"
+                        + "而顺序是最容易被顺手改掉的（图片被判成视频 = 黑屏）");
 
         System.out.println();
         System.out.println("=".repeat(62));

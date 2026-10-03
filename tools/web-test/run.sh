@@ -132,7 +132,8 @@ PY
 #    Activity.onCreate。这类漂移编译照过、单测照绿，只能在源码层面钉。
 python3 - "$WEB/ApkScan.java" "$WEB/ApkEndpoints.java" "$WEB/ApkScanner.java" \
         "$ROOT/app/src/main/java/com/juping/cast/DlnaRendererService.java" \
-        "$ROOT/app/src/main/java/com/juping/cast/MainActivity.java" <<'PY' || RC=1
+        "$ROOT/app/src/main/java/com/juping/cast/MainActivity.java" \
+        "$WEB/WebCastHost.java" <<'PY' || RC=1
 import re, sys, pathlib
 
 scan = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8')   # ApkScan（纯逻辑）
@@ -140,6 +141,7 @@ endp = pathlib.Path(sys.argv[2]).read_text(encoding='utf-8')   # ApkEndpoints（
 scnr = pathlib.Path(sys.argv[3]).read_text(encoding='utf-8')   # ApkScanner（胶水）
 svc  = pathlib.Path(sys.argv[4]).read_text(encoding='utf-8')   # DlnaRendererService
 act  = pathlib.Path(sys.argv[5]).read_text(encoding='utf-8')   # MainActivity（UI 线程）
+host = pathlib.Path(sys.argv[6]).read_text(encoding='utf-8')   # WebCastHost（安装落点）
 failed = []
 
 def report(name, ok, detail=''):
@@ -149,12 +151,21 @@ def report(name, ok, detail=''):
         failed.append(name)
 
 # ① 安装只走系统安装器：ACTION_VIEW + pkg-archive MIME（不自己实现安装、不用别的 action）
+#    2026-10-03 起落点在 web/WebCastHost（随 web-cast 子系统从服务摘出）。
+#    这里刻意**同时**查服务："服务里不该再有安装 Intent" 本身也是一条不变量 ——
+#    不然以后有人顺手在服务里再拼一个，两条实现就开始分叉。
 report('安装用 ACTION_VIEW（Android 4.0 上最通用的唤起方式）',
-       'Intent.ACTION_VIEW' in svc)
+       'Intent.ACTION_VIEW' in host)
 report('安装 MIME = application/vnd.android.package-archive',
-       'application/vnd.android.package-archive' in svc)
+       'application/vnd.android.package-archive' in host)
 report('安装 Intent 带 FLAG_ACTIVITY_NEW_TASK（从 Service 上下文启动必需）',
-       'FLAG_ACTIVITY_NEW_TASK' in svc)
+       'FLAG_ACTIVITY_NEW_TASK' in host)
+report('服务里不再自己拼安装 Intent（落点唯一）',
+       'package-archive' not in svc,
+       '判据只认 **MIME**，不认 FLAG_ACTIVITY_NEW_TASK —— 服务里另有一处'
+       '合法用法（bringPlayerToFront 把界面带回前台），拿 flag 当判据会冤枉它。'
+       '两份安装实现迟早分叉：一份补了 flag、另一份没补 —— 而这条路径只在'
+       '真机上点「安装」时才走到，分叉了没人发现')
 
 # ② /apk/install 只接受「本次扫描结果里出现过」的路径（把攻击面从「装任意文件」
 #    收窄到「装本机外接卷上本来就有的包」），落点再叠一道 isUnder 防 .. 穿越
