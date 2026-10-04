@@ -41,8 +41,8 @@ android {
         //   中等更新（新能力、行为变更）→ 改中间那位，末位归零：0.2.1 → 0.3.0
         //   大更新 → 改第一位（暂未用到）
         // 界面上的"版本"直接读这个值，所以发版只需改这一处。
-        versionCode 33
-        versionName "0.2.18"
+        versionCode 35
+        versionName "0.2.20"
     }
 
     if (hasSigningConfig) {
