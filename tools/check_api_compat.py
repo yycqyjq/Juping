@@ -34,7 +34,7 @@ lint 不会吭声。这个脚本是**独立于 lint 的第二道判据**：
      这样继承来的方法（如 Button 上的 setOnClickListener，其实声明在 View 上）不会误报
   3. 逐个比对，列出「引用了但目标平台没有」的成员
 
-踩过的三个坑（都已在代码里修掉，改动前先读一遍）：
+踩过的四个坑（都已在代码里修掉，改动前先读一遍）：
   · 描述符正则不能排除 ';' —— `Ljava/lang/String;` 的尾分号是描述符的一部分。
     排掉它会让所有「返回对象类型」的方法全部误报，而返回 void 的却正常，
     症状非常有迷惑性。
@@ -42,6 +42,10 @@ lint 不会吭声。这个脚本是**独立于 lint 的第二道判据**：
     回调都是 protected，用 -public 会看不到，全部误报成「缺失」。
   · 构造函数的声明是 `public android.media.MediaPlayer();` —— 类名和左括号之间
     **没有空格**，所以「空白 + 名字 + (」那套正则会漏掉所有构造函数。
+  · 数组类型描述符带前导 `[`（`[Ljava/lang/String;.clone`）—— 匹配时正则必须连
+    `[` 一起吃掉，否则会从里面抠出 `Ljava/lang/String;` 子串，把**数组的 clone**
+    当成 `java.lang.String.clone()` 去查表（String 不覆盖 clone → 报「越界」，
+    而真机根本不会崩）。数组的成员调用只有 clone，直接放过。
 """
 import os
 import re
@@ -52,7 +56,14 @@ from collections import defaultdict
 # dexdump 反汇编里的引用形态（注意是 `.` 不是 `->`）：
 #   |0002: invoke-virtual {v4}, Landroid/content/Intent;.getAction:()Ljava/lang/String; // method
 #   |0000: iget-object v1, v0, Lcom/foo/Bar;.this$0:Lcom/foo/Bar; // field
-REF_RE = re.compile(r'(L[\w/$]+;)\.([\w$<>]+):(\S+)')
+#
+# ⚠️ 类型描述符前面可能带数组维度 `[`（`[Ljava/lang/String;.clone`）——
+#    必须连 `[` 一起匹配，否则正则会从 `[Ljava/lang/String;` 里抠出
+#    `Ljava/lang/String;` 子串，把**数组的 clone** 当成元素类的 clone 去查表。
+#    历史误报：`DlnaDescription.KNOWN_ACTIONS.clone()`（String[]）被报成
+#    「java.lang.String.clone() 在目标平台不存在」—— 而 String 根本不覆盖
+#    clone()，这条引用在 Java 里编译都编译不出来，纯属误判。
+REF_RE = re.compile(r'(\[*L[\w/$]+;)\.([\w$<>]+):(\S+)')
 
 PLATFORM_PREFIXES = (
     'android/', 'java/', 'javax/', 'org/apache/', 'org/xml/', 'org/json/',
@@ -103,7 +114,14 @@ def collect_refs(apk, dexdump_bin, tmpdir):
     with open(dump, encoding='utf-8', errors='replace') as f:
         for line in f:
             for m in REF_RE.finditer(line):
-                cls = m.group(1)[1:-1]
+                raw = m.group(1)
+                if raw.startswith('['):
+                    # 数组类型上的方法调用只可能是 clone()（Object.clone 是数组
+                    # 唯一继承来的方法；数组长度走 array-length 指令，不产生字段引用）。
+                    # 数组的 clone 是 **Java 语言层面**的合法操作，任何 Android 版本
+                    # 都有 —— 不查表、直接放过，别拿元素类型去 android.jar 里找。
+                    continue
+                cls = raw[1:-1]
                 if not cls.startswith(PLATFORM_PREFIXES):
                     continue
                 member, desc = m.group(2), m.group(3)
