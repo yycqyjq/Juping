@@ -59,6 +59,20 @@ public class MediaPlayerController {
         void onSourceChanged(String uri, String metadata);
 
         /**
+         * 真实片尾自然播完（无续播、非假 EOS、非过期实例）。
+         *
+         * <p>这与 {@code onStateChanged("STOPPED")} 的区别：
+         * <ul>
+         *   <li>{@code STOPPED} 还会在暂停、控制点 Stop、错误等多条路径触发，不具备「自然播完」语义；</li>
+         *   <li>本回调仅在 {@link #handleCompletion} 的真实片尾分支、且 {@code player} 未被替换时触发。</li>
+         * </ul>
+         * 实现方应清除当前片源字段（currentUri/元数据/标题/歌手/封面/歌词/下一曲/错误），
+         * 使 {@link com.juping.cast.player.RenderState#hasContent()} 归假，界面回到空闲面板。
+         * <b>不改 transportState</b>（已由前一步 {@code notifyState("STOPPED")} 推过）。
+         */
+        void onPlaybackEnded();
+
+        /**
          * 播放出错。
          *
          * <p>{@code kind} 是 {@link PlaybackPolicy} 里的 {@code ERR_*} 分类 ——
@@ -439,10 +453,13 @@ public class MediaPlayerController {
     private boolean muted;
 
     /**
-     * 懒取的 {@code AudioManager}，只用来推系统 {@code STREAM_MUSIC} 音量（§7.6 第③层）。
+     * 懒取的 {@code AudioManager}，只用来推框架 {@code STREAM_MUSIC} 流（§7.6 第③层）。
+     *
+     * <p>⚠️ 本机（海信 MTK5880）实测该流【不参与实际响度】——厂商音频绕过框架混音器，
+     * 保留推送仅为不绕过混音器的普通 Android 设备兜底（三通路取证见 todo §7.24）。
      *
      * <p>懒取而不是在构造里取：多数会话里控制点一次音量都不调，没必要为一个
-     * 可能用不到的服务去碰系统。取不到就保持 null，调用方按"不动系统音量"处理。
+     * 可能用不到的服务去碰系统。取不到就保持 null，调用方按"不推框架流"处理。
      */
     private AudioManager audioManager;
 
@@ -1344,6 +1361,16 @@ public class MediaPlayerController {
         // 解绑 Surface 放在 release 之前，与 stop() 同一条顺序纪律：先让解码器
         // 交出输出面、视频层随即关闭，再释放实例，避免"停住了还蓝着一块"。
         notifyState("STOPPED");
+        // 「自然播完」要单独告诉服务层，不能只靠上面那句 STOPPED：
+        // STOPPED 还会从暂停收尾、控制点 Stop、错误等多条路径进来，
+        // 蹭那个字符串收尾会把「暂停」也清成片源为空（QA 复盘过同款误伤）。
+        // 而界面形态机（PlaybackPolicy.modeOf）只要 currentUri 还挂着
+        // 就判成「仍在放」→ 视频态 SurfaceView 继续盖着面板，可视频层
+        // 又已经随 release 关掉 —— 结果就是「播完黑屏不回面板」。
+        // 清字段不碰 native，站在回调栈里执行是安全的。
+        if (listener != null) {
+            listener.onPlaybackEnded();
+        }
         final MediaPlayer doomed = player;
         handler.post(new Runnable() {
             @Override
@@ -1893,13 +1920,15 @@ public class MediaPlayerController {
         // 先记下来再下发：重连会重建 MediaPlayer 实例，不记的话音量会丢。
         this.volume = Math.max(0f, Math.min(1f, volume));
         applyVolume();
-        // §7.6 第③层：实例音量只是**相对系统流音量**的一个乘数 —— 盒子自己的
-        // 媒体音量若很低，控制点怎么调都听不出来（我们记了、也下发了、日志正常）。
-        // 所以「控制点显式设了一次音量」时，把系统 STREAM_MUSIC 一起推到位。
+        // 框架流推送（§7.6 第③层）：在普通 Android 设备上，实例音量是**相对系统流音量的
+        // 乘数**，系统流很低时控制点怎么调都听不出来 —— 所以显式设音量时把 STREAM_MUSIC 一起推到位。
+        // ⚠️ 本机三通路实测（2026-10-04）：这台海信盒子厂商音频绕过框架混音器，
+        // STREAM_MUSIC 不参与实际响度（见 applySystemVolume 注释与 todo §7.24）——
+        // 保留推送是为跨设备正确性，本机真实音量靠上面 applyVolume() 那条实例下发。
         //
         // 刻意**只在这里**做、不放进 applyVolume()：applyVolume() 还会在重建
-        // 播放器实例时被重放（见它的注释），而重放不该去改系统音量 ——
-        // 用户刚在盒子上用遥控器调过的音量，不该因为一次断流重连就被拽回控制点的值。
+        // 播放器实例时被重放（见它的注释），而重放不该去动框架流 ——
+        // 用户刚在盒子上按过音量，不该因为一次断流重连就被拽回控制点的值。
         applySystemVolume();
     }
 
@@ -1961,32 +1990,36 @@ public class MediaPlayerController {
     }
 
     /**
-     * 把当前音量推到系统 {@code STREAM_MUSIC} 流上（§7.6 第③层）。
+     * 把当前音量推到框架 {@code STREAM_MUSIC} 流上。
      *
-     * <p><b>为什么需要它</b>：{@code player.setVolume(v, v)} 是**相对系统流音量**
-     * 的乘数。盒子自己的媒体音量是 0 时，实例音量拉到 1.0 也是静音 ——
-     * 这正是真机上「音量调不动」最可能的解释。所以控制点显式设音量时，
-     * 顺手把系统流档位一起推到位。
+     * <p><b>⚠️ 本机真机实测订正（2026-10-04）—— 这台电视上它【不参与实际响度】</b>：
+     * 三通路取证确立（详见 todo.md §7.24）——① 遥控器音量走海信固件/硬件通路，
+     * 完全不进 Android（按音量减×3，框架五条流纹丝不动）；② 真正管耳朵的是
+     * {@code player.setVolume}（厂商 CmpbPlayer 把实例值转发进真实响度通路）；
+     * ③ 本方法推的 STREAM_MUSIC 框架流，虽然 {@code service call} 能精确读回，
+     * 但播放中 {@code media.audio_flinger} 显示 active tracks 空、Output thread
+     * {@code total writes: 0} 而视频仍真实出声 —— 厂商音频绕过了框架混音器，
+     * STREAM_MUSIC 在这台机上是**空转的装饰流**。
      *
-     * <p><b>与静音的分工</b>：静音**只**走播放器实例（{@code applyVolume()} 里的
+     * <p><b>那为什么还留着这段</b>：跨设备正确性。换一台不绕过混音器的普通
+     * Android 设备，实例音量确实是「相对系统流音量的乘数」，系统流为 0 时
+     * 拉满实例也没声 —— 那时这一推是有意义的兜底。本机不生效不等于代码错，
+     * 只是这台平台的事实。日志措辞按此订正：不再声称「系统音量已下发」。
+     *
+     * <p><b>与静音的分工不变</b>：静音仍只走播放器实例（{@code applyVolume()} 里的
      * {@code v = 0}）。不把系统流压到 0，是因为那会把整台盒子的声音一起静掉
      * （别的应用也跟着哑），而且取消静音还得记住原值再还原。
      *
-     * <p><b>读回不受影响</b>：{@code GetVolume} 报的仍是控制点设过的那个值
-     * （{@link #volume}），不是系统流档位换算回来的数 —— 否则用户在盒子上按一下
-     * 遥控器，控制点那边的音量条就会自己跳。
-     *
-     * <p><b>真机验收点</b>：这一层的效果只能在真机上确认（盒子系统媒体音量
-     * 调到很低，再让控制点拉到 100，听音量是否真的上去）。两条取证日志
-     * （「系统音量已下发」/「系统音量未下发」）就是给那次验收用的。
+     * <p><b>GetVolume 仍回读 {@link #volume}</b>（控制点设过的那个值），不是系统流
+     * 档位换算回来的数 —— 否则用户在盒子上按一下遥控器，控制点那边的音量条就会自己跳。
      */
     private void applySystemVolume() {
         int streamMax = streamMaxVolume();
         int target = PlaybackPolicy.systemStreamVolumeFor(Math.round(volume * 100f), streamMax);
         if (target < 0) {
             // -1 = 拿不到流上限（个别 ROM 返回 0 / 负数）。什么都别做，但要说出来：
-            // 「这次没动系统音量」和「动了但没生效」在真机上长得一样，只有日志能分开。
-            Log.i(TAG, "取证 系统音量未下发（拿不到 STREAM_MUSIC 上限=" + streamMax + "）");
+            // 「这次没动框架流」和「动了但本机不参与混音」在真机上长得一样，只有日志能分开。
+            Log.i(TAG, "取证 框架流未推送（拿不到 STREAM_MUSIC 上限=" + streamMax + "）");
             return;
         }
         AudioManager am = audioManager();
@@ -1995,12 +2028,17 @@ public class MediaPlayerController {
         }
         try {
             am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0);
-            Log.i(TAG, "取证 系统音量已下发: STREAM_MUSIC=" + target + "/" + streamMax);
+            // 措辞订正（2026-10-04）：这里推的是框架 STREAM_MUSIC 流，本机真机实测
+            // 【不参与实际响度】（厂商音频绕过混音器）。原来写「系统音量已下发」
+            // 会让人误以为动了电视真实音量 —— 用户当场指出「你没改系统的音量」正是
+            // 被这句误导。如实写成「框架流已推送」，并注明本机不生效、仅为跨设备兼容。
+            Log.i(TAG, "取证 框架流已推送: STREAM_MUSIC=" + target + "/" + streamMax
+                    + "（本机不参与实际响度，真实音量见上一条 音量已下发）");
         } catch (Throwable t) {
             // 个别 ROM 会要求 MODIFY_AUDIO_SETTINGS。本项目**刻意不声明**它
             // （权限面最小，见 AndroidManifest 的注释）；真机若在这里打出
             // SecurityException，再回来补那一条权限 —— 那时就有实测依据了。
-            Log.w(TAG, "设置系统音量失败（若为 SecurityException，说明本机要求 "
+            Log.w(TAG, "推送框架流音量失败（若为 SecurityException，说明本机要求 "
                     + "MODIFY_AUDIO_SETTINGS）", t);
         }
     }

@@ -1335,6 +1335,47 @@ report('Auto-Stop 判据：播放中 + 无订阅者 + 曾有订阅者 + 指令�
 report('Auto-Stop 挂在服务自检看门狗里',
        'checkAutoStop();' in svc,
        '服务已有 30 秒自检节拍，复用它而不是另起线程')
+# ---- ⑯.5 自然播完收尾：真实片尾必须清片源回面板（2026-10-04 黑屏修复） ----
+# 真机现象（用户报）：视频播完电视停在黑屏，不回引导面板。根因：EOS 分支
+# 只释放播放器实例，currentUri 还挂着 —— 形态机判"仍在放"，SurfaceView
+# 盖着面板，而视频层已随 release 关掉，就是那一屏黑。§7.14 当年只在
+# onStop 打了补丁，自然播完这条路一直漏着。
+hc = body_of(strip_comments(ctrl), 'private void handleCompletion(MediaPlayer mp)')
+report('handleCompletion 方法体已找到（播完唯一处置点）', hc is not None,
+       '锚点：private void handleCompletion(MediaPlayer mp)')
+if hc:
+    report('真实片尾通知服务层 onPlaybackEnded（清片源回面板）',
+           'listener.onPlaybackEnded()' in hc,
+           '少了这步，播完 currentUri 还挂着，界面判"仍在放"→ 黑屏不回面板（真机复现）')
+pe = body_of(strip_comments(svc), 'public void onPlaybackEnded()')
+report('DlnaRendererService.onPlaybackEnded 方法体已找到', pe is not None,
+       '锚点：public void onPlaybackEnded()')
+if pe:
+    report('播完收尾与 onStop 走同一个 clearPlaybackFields()（清零清单唯一真值）',
+           'clearPlaybackFields();' in pe,
+           '两套清零各写各的迟早漏字段 —— §7.14 的根因就是"只有 onStop 清、自然播完漏了"')
+osb = body_of(strip_comments(svc), 'public void onStop()')
+report('onStop 也走 clearPlaybackFields()（与控制点 Stop 同源）',
+       osb is not None and 'clearPlaybackFields();' in osb,
+       '清零判据只有一份，不会再漂')
+# 用**行首锚定**区分清零与声明：清零语句 `        currentUri = "";` 从行首
+# 起只有空白；字段声明 `    private volatile String currentUri = "";` 行首
+# 起是 private —— `^\s*currentUri` 只可能命中前者。裸子串匹配会把声明也数进去
+# （grep 实测全文命中 2 处：176 声明 + 1084 清零 → 守卫必红）；
+# 而负向后顾若排除空格，清零行首正是缩进空格，会把自己也排除掉（0 处 → 照样红）。
+uri_clears = re.findall(r'^\s*currentUri = "";', strip_comments(svc), re.M)
+report('currentUri 的清零语句全文件唯一（公共收尾方法内，不许出现第二处）',
+       len(uri_clears) == 1,
+       '实际 ' + str(len(uri_clears)) + ' 处 —— 每多一处就是一个会漂移的副本')
+cpb = body_of(strip_comments(svc), 'private void clearPlaybackFields()')
+report('clearPlaybackFields 方法体已找到（收尾清零唯一出处）', cpb is not None,
+       '锚点：private void clearPlaybackFields()')
+if cpb:
+    report('清零清单完整：uri/标题/歌手/封面/下一曲一个都不能少',
+           all(k in cpb for k in ('currentUri', 'currentTitle', 'currentArtist',
+                                  'currentAlbumArtUri', 'nextUri')),
+           '漏一个字段就是"新歌名配旧封面"那类自相矛盾的复发')
+
 # ---- ⑯ 收尾必须回空闲：onStop() 清片源，不能只 player.stop() ----
 # 真机现象（用户报）：音乐投屏没有"关闭"的地方 —— 一首歌播完，电视就停在
 # 音乐界面、冻在结束位置不动。根因是收尾只停了播放器、没清 currentUri，

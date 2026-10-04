@@ -721,6 +721,37 @@ public class PolicyTest {
         check("宽限只对音频：视频播完 + 宽限内 → MODE_IDLE（不维持）",
                 PlaybackPolicy.modeOf(RenderState.empty(), mVid, 100L) == PlaybackPolicy.MODE_IDLE,
                 "视频宽限会把「闪面板」换成「闪蓝屏」");
+
+        // ---- 「播完黑屏不回面板」修复钉（2026-10-04 真机） ----
+        // 真实片尾的收尾时序：① onPlaybackEnded 清 currentUri（hasSource 归假，
+        // 此刻 releasePlayer 还没跑，cachedDurationMs 仍留值 —— 瞬态，≤1 拍）；
+        // ② releasePlayer 临界区把时长缓存清零 → hasContent() 才归假 → IDLE。
+        // ② 的快照就是黑屏 bug 的现场输入：控制器壳还在（hasPlayer=true），
+        // 但片源与时长都没了 —— 这个组合必须判 IDLE，判成 VIDEO 就是
+        // 「SurfaceView 盖着面板、视频层已关」的那一屏黑。
+        PlaybackPolicy.ModeMemory mEos = new PlaybackPolicy.ModeMemory();
+        PlaybackPolicy.modeOf(snap(RenderState.KIND_VIDEO, false, false, 205000L), mEos, 0L);
+        check("播完时序①：清了片源但时长缓存未归零 → 仍是 VIDEO（瞬态，不闪面板）",
+                PlaybackPolicy.modeOf(
+                        new RenderState(true, false, RenderState.KIND_VIDEO, false, false,
+                                false, false, 204660L, 205000L, 0, 0),
+                        mEos, 200L) == PlaybackPolicy.MODE_VIDEO,
+                "release 还没跑，视频层仍在 —— 此时弹面板会被视频层盖住，白闪一下");
+        check("播完时序②：releasePlayer 清零后（hasPlayer 壳在、uri 空、时长 0）→ MODE_IDLE",
+                PlaybackPolicy.modeOf(
+                        new RenderState(true, false, RenderState.KIND_VIDEO, false, false,
+                                false, false, 0L, 0L, 0, 0),
+                        mEos, 700L) == PlaybackPolicy.MODE_IDLE,
+                "这正是黑屏 bug 的现场输入 —— 判不成 IDLE，电视就停在黑屏不回面板");
+        PlaybackPolicy.ModeMemory mEosA = new PlaybackPolicy.ModeMemory();
+        PlaybackPolicy.modeOf(snap(RenderState.KIND_AUDIO, true, false, 180000L), mEosA, 0L);
+        check("音频播完：清零后宽限内仍冻音乐卡片（§7.14 行为不回退）",
+                PlaybackPolicy.modeOf(
+                        new RenderState(true, false, RenderState.KIND_AUDIO, true, false,
+                                false, false, 0L, 0L, 0, 0),
+                        mEosA, 0L + 1499L) == PlaybackPolicy.MODE_AUDIO,
+                "播完走的是与 onStop 同一处清零 —— 音频宽限语义必须原样保持");
+
         PlaybackPolicy.ModeMemory mImg = new PlaybackPolicy.ModeMemory();
         PlaybackPolicy.modeOf(snap(RenderState.KIND_IMAGE, false, false, 0L), mImg, 0L);
         check("宽限只对音频：图片播完 + 宽限内 → MODE_IDLE（不维持）",

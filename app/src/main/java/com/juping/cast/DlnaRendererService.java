@@ -1056,6 +1056,26 @@ public class DlnaRendererService extends Service
             player.stop();
         }
         transportState = "STOPPED";
+        clearPlaybackFields();
+        // 报一次：控制点要知道"设备上已经没内容了"
+        notifyEvent("AVTransport");
+    }
+
+    /**
+     * 把「当前在放什么」的字段一次性清零 —— onStop 与真实片尾（onPlaybackEnded）共用。
+     *
+     * <p>为什么必须是同一个方法：这两条路要清的是**同一组事实**（片源、元数据、
+     * 标题、歌手、封面、歌词、下一曲、错误）。原来只有 onStop 清，自然播完那条
+     * 路（{@link MediaPlayerController} 的真实片尾分支）漏了 —— currentUri 还挂着，
+     * 形态机判成「仍在放」，视频层已随 release 关掉、面板又被 SurfaceView 盖着，
+     * 电视就停在黑屏不回引导面板（真机复现：EOS 后 /status 仍报 uri=Y，且没有任何
+     * 「形态→IDLE」）。两处共用一处，判据不再漂移。
+     *
+     * <p><b>不碰 transportState、不推事件</b>：调用方各自决定何时报
+     * （onStop 推 AVTransport；片尾路径已由 notifyState("STOPPED") 经
+     * onStateChanged 推过，重复推会被状态去重掐掉，不如不推）。
+     */
+    private void clearPlaybackFields() {
         // 必须把当前片源清掉。
         // MainActivity.isPlaying() 在时长归零后会退化成「有没有 URI」来判断，
         // 而这个字段不清就永远非空 —— 结果是用户按了停止，电视上却还停在
@@ -1073,13 +1093,12 @@ public class DlnaRendererService extends Service
         currentLyrics = "";
         // 下一曲队列一并作废：Stop 是控制点明确结束，歌单不跨 Stop 存活
         // （DLNA 语义：新的 SetAVTransportURI/Stop 都会清掉 Next）。
+        // 自然播完同样作废 —— 走到这里的上一曲已经在控制器侧消费掉了。
         nextUri = "";
         nextUriMetadata = "";
-        // 一并清掉上一次的错误：已经停止的传输不该继续挂着旧报错，
+        // 一并清掉上一次的错误：已经结束的传输不该继续挂着旧报错，
         // 否则 describeState() 会优先显示那句陈旧的「出错：…」。
         clearError();
-        // 报一次：控制点要知道"设备上已经没内容了"
-        notifyEvent("AVTransport");
     }
 
     @Override
@@ -1172,6 +1191,39 @@ public class DlnaRendererService extends Service
         videoMissing = false;
         Log.i(TAG, "自动续播已切换片源: " + currentUri);
         notifyEvent("AVTransport");
+    }
+
+    /**
+     * 真实片尾（控制器判据：非续播、非假 EOS、非过期实例）——「播完自动回面板」的收尾。
+     *
+     * <p>DLNA 语义上播完只把传输状态报成 STOPPED，服务侧字段原样留着 —— 而
+     * currentUri 还挂着，形态机（{@link PlaybackPolicy#modeOf}）就判成「仍在放」：
+     * 视频态下 SurfaceView 继续盖住引导面板，那一层的画面却又已随 release 关掉，
+     * 电视停在黑屏不回面板。真机复现坐实：EOS 后 {@code /status} 仍报 {@code uri=Y}，
+     * 之后没有任何一条「形态→IDLE」日志。清零走 {@link #clearPlaybackFields()}，
+     * 与控制点 Stop（{@link #onStop()}）共用同一处，判据不漂移。
+     *
+     * <p><b>不动 transportState</b>：本回调之前控制器已 {@code notifyState("STOPPED")}，
+     * {@link #onStateChanged} 会把状态对齐成 STOPPED。
+     *
+     * <p><b>清零后要补推一次事件</b>：STOPPED 那次推送里 CurrentURI 还是刚播完那条，
+     * 订阅中的控制点要看到「片源已空」才会把手机上的「正在播放」撤掉。
+     * 这次推送与 onStateChanged 的去重不冲突（那边去重的是状态，这边传的是
+     * 事件刷新）；从播放器回调线程直调 notifyEvent 也不是新风险 ——
+     * onStateChanged 本来就在同一线程里这么推（§7.20 后事件变量读的是采样缓存，不碰 native）。
+     *
+     * <p>音频播完同样走这里：清零后 hasContent() 归假，但 lastPlayingMode 还是
+     * AUDIO、宽限 1.5s 内维持音乐卡片再回 IDLE —— 与 §7.14 已验收的「停止后
+     * 先冻卡片」行为无缝衔接，不闪面板。视频不吃宽限（理由见 UI_GRACE_MS），
+     * 立即回面板 —— 正是「播完直接退回去」要的。
+     */
+    @Override
+    public void onPlaybackEnded() {
+        clearPlaybackFields();
+        notifyEvent("AVTransport");
+        // 取证锚点：这行和「片尾收尾：已释放播放器」之间必须能看到界面侧的
+        // 「形态: VIDEO → IDLE」（视频播完）或 1.5 秒宽限后的 IDLE（音频播完）。
+        Log.i(TAG, "自然播完收尾：片源字段已清零（界面将回空闲）");
     }
 
     @Override
