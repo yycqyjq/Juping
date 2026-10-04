@@ -56,6 +56,13 @@ CHECKS = [
     ('全局', '崩溃（FATAL EXCEPTION）', r'FATAL EXCEPTION', 'must0'),
 ]
 
+# 聚屏自己的 TAG（+ 播放器/音频这类排障相关的）。
+# 全量 logcat 里 **97% 是系统噪音**（Cmpb_MW / wpa_supplicant / HiMarket /
+# SmartFS / AudioPolicyService…），只有这些 TAG 是「我们的日志」。
+APP_TAGS = ('DlnaRendererService', 'UpnpHttpServer', 'MediaPlayerController',
+            'SsdpResponder', 'MediaProxy', 'MainActivity', 'WebCastHost',
+            'AwesomePlayer', 'MediaPlayer', 'CmpbPlayer')
+
 COLORS = {'should': '\033[36m', 'must0': '\033[31m', 'info': '\033[2m'}
 RESET = '\033[0m'
 
@@ -70,6 +77,10 @@ def newest_log():
 def main():
     args = [a for a in sys.argv[1:]]
     group = None
+    clean = False
+    if '--clean' in args:
+        clean = True
+        args.remove('--clean')
     if '--group' in args:
         i = args.index('--group')
         group = args[i + 1]
@@ -80,6 +91,27 @@ def main():
 
     with open(path, encoding='utf-8', errors='replace') as f:
         lines = f.readlines()
+
+    if clean:
+        # 「只看事件」：① 只留我们的 TAG；② 再剔掉只读轮询与逐条取证。
+        # 控制点每秒轮询 2~3 次 GetPositionInfo/GetTransportInfo，每条请求打 6 行
+        # （含 SOAP 全文），几分钟就能刷掉几万行 —— 真正的状态变化全被埋掉。
+        KEEP = re.compile(r'[VDIWE]/(?:%s)\s*\(' % '|'.join(APP_TAGS))
+        NOISE = re.compile(
+            r'取证 (请求头|body|已回|音量指令)'                            # 逐条取证
+            r'|action=(GetPositionInfo|GetTransportInfo|GetMediaInfo)\b'  # 只读轮询
+            r'|<< (GET|POST) /'                                           # 与「控制指令」行重复
+            r'|<s:Envelope'                                               # SOAP 全文的续行
+        )
+        n = 0
+        for ln in lines:
+            if not KEEP.search(ln) or NOISE.search(ln):
+                continue
+            print(ln.rstrip())
+            n += 1
+        print('\n（原始 %d 行 → 事件 %d 行，剔掉 %.1f%% 的噪音）'
+              % (len(lines), n, 100.0 * (len(lines) - n) / max(1, len(lines))))
+        return
 
     print('日志: %s（%d 行）' % (path, len(lines)))
     print('=' * 66)
