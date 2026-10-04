@@ -553,7 +553,29 @@ public class MediaPlayerController {
         return true;
     }
 
-    private void startInternal() {
+    /**
+     * 建实例并起播 —— <b>整个「释放旧的 → 建新的 → 配置新的」序列必须原子</b>。
+     *
+     * <p><b>为什么是 {@code synchronized}</b>：这个方法会被三条不同的路调进来 ——
+     * {@link #play()}（持实例锁）、{@link #resume()}（持锁）、以及
+     * <b>auto-advance 后台线程</b>（续播，见 {@code onCompletion} 里的
+     * {@code new Thread(..., "auto-advance")}）与释放回调（主线程）。
+     * 后两条**不持锁**。
+     *
+     * <p>不加锁时两条路会互相拆台：A 线程刚 {@code new MediaPlayer()} 出来，
+     * B 线程的 {@code releasePlayer()} 就把字段置空了，A 走到
+     * {@code player.setScreenOnWhilePlaying()} 直接 NPE。
+     * 真机取证：日志里 {@code setDataSource 完成: 距释放 -14ms} —— 负 14 毫秒
+     * 说明 setDataSource 期间另有一次释放把 {@code lastReleaseAtMs} 推到了"未来"。
+     * （{@code scheduleRetry} 里那段「两个 startInternal 会各自把对方刚建的实例
+     * 释放掉」的注释描述的就是同一个竞态，当时只堵了重连这条路。）
+     *
+     * <p><b>代价</b>：持锁期间会跑 {@code setDataSource()}（可能几百毫秒）。
+     * 主线程调进来时本就在锁内（{@code play()} 是 synchronized），行为不变；
+     * 变的是 auto-advance 那条后台路 —— 它现在也会持锁。续播发生在「当前曲目
+     * 自然播完」的时刻，此时几乎不会有并发的控制指令，这个窗口可以接受。
+     */
+    private synchronized void startInternal() {
         // ---- 「上一次建实例还在路上」：并入那一次，不重复建 ----
         //
         // 异步释放之后，从「开始释放」到「回调里 new MediaPlayer()」之间有一段空窗期，
@@ -1294,7 +1316,48 @@ public class MediaPlayerController {
             scheduleRetry();
             return;
         }
+        // ---- 真实片尾：报停止之后，还要把播放器收尾干净 ----
+        //
+        // 为什么不能只 notifyState("STOPPED") 就 return：
+        // 自然播完 / 看门狗片尾补判走到这里时，厂商 MediaPlayer **仍然活着**、
+        // 仍然占着 `TV_WIN_ID_MAIN` 那块硬件视频窗。MTK 的视频渲染不在
+        // SurfaceFlinger 图层表里（screencap 抓不到），只有 release 播放器
+        // 才能关掉那一层。不释放的后果：定格帧（或黑帧）**永久滞留**在屏幕上，
+        // 用户按返回退出、重投别的片子都盖不住它 —— 表现为"还卡在上一条"。
+        // 真机取证：日志 08:26:50 报 STOPPED 却没有任何 release，直到 3.5 分钟
+        // 后的下一次操作才释放（`release 开始`）—— 那 3.5 分钟画面一直冻着。
+        //
+        // 必须**抛到下一轮主循环**再释放：此刻可能正站在厂商 onCompletion 的
+        // 回调栈里，在那个栈里 release 播放器自己，老平台有崩溃先例
+        // （见上方续播分支同一条纪律）。post 出去就脱离了回调栈。
+        //
+        // 解绑 Surface 放在 release 之前，与 stop() 同一条顺序纪律：先让解码器
+        // 交出输出面、视频层随即关闭，再释放实例，避免"停住了还蓝着一块"。
         notifyState("STOPPED");
+        final MediaPlayer doomed = player;
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                // 排队期间可能又起了新实例（重投 / 续播）：只有字段还是
+                // 当初那个"已播完"的实例才动手，否则放过它（新实例自有其收尾）。
+                if (doomed != null && doomed == player) {
+                    // 解绑 Surface 是 native 调用 —— 与 stop() 同一条纪律：
+                    // native 已挂起时跳过，否则这句会把主线程堵死（ANR）。
+                    // 跳过后仍靠下面的 release（走后台线程）关掉硬件视频窗，
+                    // 只是可能多一瞬间残留，但绝不以 ANR 为代价。
+                    if (!isProbeWedged()) {
+                        try {
+                            doomed.setSurface(null);
+                        } catch (Exception e) {
+                            Log.w(TAG, "片尾解绑 Surface 失败", e);
+                        }
+                    }
+                    releasePlayer(null);
+                    Log.i(TAG, "片尾收尾：已释放播放器（清硬件视频窗）"
+                            + (isProbeWedged() ? "，native 挂起，跳过解绑" : ""));
+                }
+            }
+        });
     }
 
     /**
@@ -2087,7 +2150,15 @@ public class MediaPlayerController {
         }
     }
 
-    public void release() {
+    /**
+     * 生命周期结束时的整体释放（服务销毁）。
+     *
+     * <p>加 {@code synchronized} 是为了与 {@link #startInternal()} 同锁 ——
+     * 它是 {@code releasePlayer()} 三个调用方里**唯一不持锁**的那个
+     * （另两个 {@code play()} / {@code stop()} 本身就是 synchronized）。
+     * 不加的话，一次「销毁」与一次「正在建实例」并发，照样能把 player 置空。
+     */
+    public synchronized void release() {
         handler.removeCallbacksAndMessages(null);
         pendingRetry = null;
         releasePlayer(null);
@@ -2105,40 +2176,53 @@ public class MediaPlayerController {
      *         {@code false} = 释放已交给后台线程，等 {@code onReleased} 回来再继续。
      */
     private boolean releasePlayer(Runnable onReleased) {
-        prepared = false;
-        // 释放后 native 播放器不可再碰（任何方法调用都会触发 -38 错误回调）
-        playerReleased = true;
-        // 外推锚点随实例一起作废 —— 不清的话，新片源开头的正常位置
-        // 会被当成「冻结」而误触发外推。
-        hiRaw = -1;
-        hiWall = 0;
-        // 「假 EOS」水位线随实例一起作废：新实例是另一次播放（重连 / 换片 / 续播），
-        // 不清的话上一次播放的远位置会让新播放的假 EOS 判据直接失灵。
-        maxPlayedMs = -1;
-        // 实例都没了，"准备中"和"待决的 seek"也就失去了载体。
-        // 不清的话，下一次播放的「当前位置」会一直报上一次拖到的那个位置 ——
-        // 控制点看到的进度条是上一部片子的。
-        preparing = false;
-        pendingSeekMs = -1L;
-        // 采样缓存与探针随实例一起作废 —— 不清的话，新片源起播前界面会先显示
-        // 上一部的位置/时长（那正是"面板闪一下"的来源）。
-        cachedPositionMs = 0;
-        cachedDurationMs = 0;
-        cachedPlaying = false;
-        cachedSampleAtMs = 0;
-        stopSampler();
-        probeInFlightOwner = null;
-        probeInFlightSinceMs = 0;
-        // 视频尺寸复查同理：载体（MediaPlayer 实例）没了就必须摘掉，
-        // 否则过期复查会对着已释放的实例跑 —— 判定套到新片源上。
-        cancelVideoRecheck();
-        if (player == null) {
-            // 本来就没有实例：没什么可释放的，调用方直接往下走。
-            return true;
+        final MediaPlayer doomed;
+        // ---- 状态清理 + 摘引用整体进实例锁 ----
+        // 必须与 startInternal()（synchronized）互斥：后者**持锁**跑完「建实例 →
+        // 配置实例」的全过程；这里若能在它中间把 player 置空，就会在
+        // new MediaPlayer() 与 setScreenOnWhilePlaying() 之间抛 NPE。
+        // 真机取证：`setDataSource 完成: 距释放 -14ms` —— 负 14 毫秒说明
+        // setDataSource 期间另有一次释放把 lastReleaseAtMs 推到了"未来"，
+        // 紧接着 657 行的 setScreenOnWhilePlaying(true) 就 NPE 了。
+        //
+        // 临界区里**不碰 native**（release 仍一律交给后台线程，见下），
+        // 所以「native 挂起占住实例锁」那条老风险不会从这里回来。
+        synchronized (this) {
+            prepared = false;
+            // 释放后 native 播放器不可再碰（任何方法调用都会触发 -38 错误回调）
+            playerReleased = true;
+            // 外推锚点随实例一起作废 —— 不清的话，新片源开头的正常位置
+            // 会被当成「冻结」而误触发外推。
+            hiRaw = -1;
+            hiWall = 0;
+            // 「假 EOS」水位线随实例一起作废：新实例是另一次播放（重连 / 换片 / 续播），
+            // 不清的话上一次播放的远位置会让新播放的假 EOS 判据直接失灵。
+            maxPlayedMs = -1;
+            // 实例都没了，"准备中"和"待决的 seek"也就失去了载体。
+            // 不清的话，下一次播放的「当前位置」会一直报上一次拖到的那个位置 ——
+            // 控制点看到的进度条是上一部片子的。
+            preparing = false;
+            pendingSeekMs = -1L;
+            // 采样缓存与探针随实例一起作废 —— 不清的话，新片源起播前界面会先显示
+            // 上一部的位置/时长（那正是"面板闪一下"的来源）。
+            cachedPositionMs = 0;
+            cachedDurationMs = 0;
+            cachedPlaying = false;
+            cachedSampleAtMs = 0;
+            stopSampler();
+            probeInFlightOwner = null;
+            probeInFlightSinceMs = 0;
+            // 视频尺寸复查同理：载体（MediaPlayer 实例）没了就必须摘掉，
+            // 否则过期复查会对着已释放的实例跑 —— 判定套到新片源上。
+            cancelVideoRecheck();
+            if (player == null) {
+                // 本来就没有实例：没什么可释放的，调用方直接往下走。
+                return true;
+            }
+            doomed = player;
+            // 先摘引用：后台释放期间任何访问器都不该再看到这个实例
+            player = null;
         }
-        final MediaPlayer doomed = player;
-        // 先摘引用：后台释放期间任何访问器都不该再看到这个实例
-        player = null;
         // ---- native 的 release() 一律交给后台线程，**没有例外** ----
         //
         // 这条纪律是 2026-10-04 用真机 ANR 转储换来的，与 seekTo() 是同一个模子：

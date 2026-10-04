@@ -453,11 +453,38 @@ public class PolicyTest {
         check("只有 ftyp 没有 moov → null",
                 Mp4Aspect.parse(ftypOnly, ftypOnly.length) == null, "ftyp + 16 字节载荷");
 
+        // ---- 窗口截断的**边界**：切在字段之后能解、切在字段之前必须 null ----
+        // 大 moov（faststart 的长视频，moov 可达几百 KB）装不进探测窗口，但只要
+        // 要读的字段落在窗口内就得解出来；字段被切掉则老实返回 null，
+        // 绝不拿窗口外的字节当尺寸。
         byte[] full = moovOf(videoTrak(0, 1920, 1080, false));
         byte[] trunc = Arrays.copyOf(full, full.length - 20);
-        check("moov 不完整落在窗口内 → null（不读窗口外的垃圾）",
+        check("截断点切掉 tkhd 的宽高（92 字节的 tkhd 只剩 72）→ null",
                 Mp4Aspect.parse(trunc, trunc.length) == null,
-                "声明 " + full.length + " 字节、实际只有 " + trunc.length);
+                "声明 " + full.length + " 字节、实际只有 " + trunc.length
+                + " —— 宽高在 tkhd 的 +84/+88，读不到就返回 null，不猜");
+
+        // ---- 容忍 moov 截断：这是 B 站 1080P 的真实形状 ----
+        // 实测：bili1080.mp4 的 moov 声明 256807 字节，而探测窗口只有 64KB；
+        // 但 avcC 落在文件偏移 563 处 —— 远在窗口之内。修前那条
+        // 「moov 必须完整落在窗口内，否则 null」的约束让整条解析链直接放弃，
+        // 预检一条日志都不打（真机 logcat 里 VideoAspectProbe 计数 = 0）。
+        byte[] bigFull = moovWithBigTail(sps(100, 50, 6, 120, 68, 1), 300000);
+        byte[] bigTrunc = Arrays.copyOf(bigFull, 1024);
+        int[] rBig = Mp4Aspect.parse(bigTrunc, bigTrunc.length);
+        check("大 moov（声明 " + bigFull.length + " 字节）截到 1KB 窗口 → 仍解出 1920×1080",
+                rBig != null && rBig[0] == 1920 && rBig[1] == 1080, "得到 " + fmt(rBig));
+        Mp4Aspect.Dpb dBig = Mp4Aspect.dpb(bigTrunc, bigTrunc.length);
+        check("同上，DPB 也解得出（avcC 同样在 moov 头部）→ ref=6 / 需要 48960 / 超限",
+                dBig != null && dBig.maxNumRefFrames == 6
+                && dBig.neededMbs() == 48960 && dBig.exceedsDevice(),
+                dBig == null ? "null" : ("ref=" + dBig.maxNumRefFrames
+                        + " needed=" + dBig.neededMbs()));
+        byte[] bigCut = Arrays.copyOf(bigFull, 60);
+        check("截到 60 字节（切在 stsd 之前）→ 宽高与 DPB 都返回 null",
+                Mp4Aspect.parse(bigCut, bigCut.length) == null
+                && Mp4Aspect.dpb(bigCut, bigCut.length) == null,
+                "把窗口外的字节当成了字段值");
 
         // ---- 信箱盒子：fitInside（QA 复审①，按面板缩放而不是按原始像素摆）----
         int[] f1 = Mp4Aspect.fitInside(720, 1280, 1920, 1080);
@@ -1594,6 +1621,19 @@ public class PolicyTest {
     static byte[] moovWithSps(byte[] sps) {
         return moovOf(box("trak", box("mdia", box("minf", box("stbl",
                 stsdBoxWithAvcC(sps))))));
+    }
+
+    /**
+     * 一份「moov 很大」的夹具：正常结构 + stbl 里追加一个巨大的表
+     * （{@code stco}，模拟真实的 chunk offset / sample size 大表）。
+     *
+     * <p>用来复现 faststart 长视频的形状 —— moov 声明几百 KB，整个装不进探测
+     * 窗口，但 tkhd / stsd / avcC 都在 moov 头部。截断窗口后必须仍能解出，
+     * 这就是 B 站 1080P 预检失效的那个场景。
+     */
+    static byte[] moovWithBigTail(byte[] sps, int padBytes) {
+        return moovOf(box("trak", box("mdia", box("minf", box("stbl",
+                concat(stsdBoxWithAvcC(sps), box("stco", new byte[padBytes])))))));
     }
 
     /**

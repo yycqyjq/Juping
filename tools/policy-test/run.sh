@@ -1215,8 +1215,8 @@ report('MediaPlayerController 有 buildPending 状态位（异步释放的空窗
        re.search(r'boolean\s+buildPending', ctrl) is not None,
        '没有它就无法区分「上一个实例正在后台释放、新的还没建」与「压根没有实例」')
 
-si = body_of(ctrl, 'private void startInternal()')
-report('startInternal 方法体已找到', si is not None, '锚点：private void startInternal()')
+si = body_of(ctrl, 'void startInternal()')
+report('startInternal 方法体已找到', si is not None, '锚点：void startInternal()')
 if si:
     report('startInternal 在 prepareAsync 之前置 preparing',
            re.search(r'preparing\s*=\s*true', si) is not None,
@@ -1236,6 +1236,17 @@ if si:
            re.search(r'if\s*\(\s*releaseStuckReported\s*\)', si) is not None,
            '栈已死时 release 永不返回、不会有回调 —— 还打「并入它的回调」就是句'
            '空话，而这条日志正是排障时唯一能看到的线索（日志说谎比不写更糟）')
+    # startInternal 必须与 releasePlayer 的「置空」互斥：它会被 auto-advance
+    # 后台线程（续播）和释放回调调进来，那两条路**都不持锁**。不加锁时
+    # A 线程刚 new 出实例、B 线程 releasePlayer 就把 player 置空，
+    # A 走到 setScreenOnWhilePlaying() 直接 NPE。
+    # 真机取证：日志 `setDataSource 完成: 距释放 -14ms` —— 负 14 毫秒说明
+    # setDataSource 期间另有一次释放把 lastReleaseAtMs 推到了"未来"。
+    report('startInternal 是 synchronized（与 releasePlayer 的置空互斥）',
+           re.search(r'private\s+synchronized\s+void\s+startInternal\s*\(', ctrl)
+           is not None,
+           '去掉 synchronized 就回到「两个 startInternal 各自把对方刚建的实例'
+           '释放掉」的竞态 —— 表现是投屏偶发失败 + NPE，而非确定性崩，最难查')
 
 prep = body_of(ctrl, 'new MediaPlayer.OnPreparedListener()')
 report('OnPreparedListener 匿名类体已找到', prep is not None,
@@ -1612,6 +1623,32 @@ if oc:
            'seekReplayCount = 0' in body_of(ctrl, 'public synchronized boolean play(String url)')
            and 'seekReplayCount = 0' in stop_body,
            '它是"同一次 seek"的计数，换片源 / 停止就是新的一次，必须归零')
+
+    # ---- 真实片尾必须把播放器释放干净（返回键清不掉画面的根因）----
+    # 厂商 MediaPlayer 播完后若不 release，就一直占着 TV_WIN_ID_MAIN 硬件视频窗
+    # （MTK 视频层不在 SurfaceFlinger 表里，只有 release 能关）。而报完 STOPPED
+    # 后 currentMode() 变 IDLE，用户按返回走的是默认退出、根本不碰那个窗 ——
+    # 定格帧永久滞留，表现为"按了返回画面还在、重投别的也盖不住"。
+    # 真机取证：08:26:50 报 STOPPED 却无 release，画面冻到 3.5 分钟后下一次操作。
+    _ns = oc.find('notifyState("STOPPED")')
+    _rp = oc.find('releasePlayer(', _ns)
+    report('真实片尾在 notifyState("STOPPED") 之后释放播放器（清硬件视频窗）',
+           _ns >= 0 and _rp >= 0,
+           '只报停止不 release 的话，厂商播放器一直活着占住视频窗 —— '
+           '这是"返回键清不掉卡住画面"的直接根因')
+    report('片尾释放用 handler.post 抛出（脱离 onCompletion 回调栈）',
+           _ns >= 0 and re.search(r'notifyState\("STOPPED"\)[\s\S]*?handler\.post\(', oc)
+           is not None,
+           '在厂商 onCompletion 回调栈里 release 播放器自己，老平台有崩溃先例'
+           '（见续播分支同一条纪律）—— 必须抛到下一轮主循环')
+    report('片尾释放前校验「字段还是当初那个已播完实例」',
+           _rp >= 0 and re.search(r'doomed\s*==\s*player', oc[_ns:]) is not None,
+           'post 排队期间可能已重投 / 续播起了新实例：无条件 release 会把新播放掐掉')
+    report('片尾解绑 Surface 有 isProbeWedged 守卫（native 挂起时跳过，防 ANR）',
+           _rp >= 0 and re.search(r'isProbeWedged\(\)', oc[_ns:]) is not None,
+           'setSurface(null) 是 native 调用，厂商栈挂起时主线程直接调它会堵死 —— '
+           '与 stop() 里那条同锁同纪律')
+
 
 if cs:
     report('checkStall 采样「观察到的最远位置」',
@@ -2941,9 +2978,9 @@ if od:
            '那时候字段全是空的')
 
 # ---- (8) 播放器：唤醒锁与单一音量出口 ----
-si2 = body_of(ctrl, 'private void startInternal()')
+si2 = body_of(ctrl, 'void startInternal()')
 report('MediaPlayerController.startInternal 方法体已找到', si2 is not None,
-       '锚点：private void startInternal()')
+       '锚点：void startInternal()')
 if si2:
     report('startInternal 里申请了 PARTIAL_WAKE_LOCK',
            'setWakeMode' in si2 and 'PARTIAL_WAKE_LOCK' in si2,
@@ -3710,11 +3747,21 @@ report('releasePlayer 标出「建实例在路上」的空窗期（buildPending 
        'Play 必然落进来再建一次（真机实测两次 release + 两次 prepare）。'
        '判据钉在赋值本身而不是标识符上：方法里那句注释正好写着「见 buildPending」，'
        '只查标识符的话注释就能把守卫喂饱（同上面 isProbeWedged 那条的坑）')
+# 状态清理 + 摘引用必须在实例锁内 —— 与 startInternal() 同一把锁。
+# 置空若留在锁外，startInternal 建实例期间它照样能把 player 变成 null：
+# 真机日志 `setDataSource 完成: 距释放 -14ms` 就是这一幕（负值 = 释放发生在
+# setDataSource 之后、而那条日志已经打出来了），紧接着 657 行 NPE。
+report('releasePlayer 的状态清理与摘引用在实例锁内',
+       rlp_nc is not None
+       and re.search(r'synchronized\s*\(\s*this\s*\)[\s\S]*?player\s*=\s*null',
+                     rlp_nc) is not None,
+       '两处必须同一把锁：startInternal 加了 synchronized 而这里没有的话，'
+       '竞态原样存在（只是从「必然」变成「偶发」），反而更难查')
 # 回调是在 startInternal 里构造后传给 releasePlayer 的，所以判据落在 startInternal 上。
 # 本块没有 strip_comments，这里就地剥一次注释：回调上方那段注释里正好写着
 # 「必须在 startInternal() 之前清」，不剥的话这句注释就能把守卫喂饱
 # （同上面 isProbeWedged 那条的坑）。
-si726 = body_of(ctrl, 'private void startInternal()')
+si726 = body_of(ctrl, 'void startInternal()')
 si726 = re.sub(r'//[^\n]*', '', re.sub(r'/\*[\s\S]*?\*/', '', si726)) if si726 else ''
 report('释放回调在 startInternal 之前清 buildPending',
        re.search(r'buildPending\s*=\s*false[\s\S]{0,400}?startInternal\(\)', si726) is not None,

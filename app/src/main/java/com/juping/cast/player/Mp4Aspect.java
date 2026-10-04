@@ -25,7 +25,14 @@ public final class Mp4Aspect {
     private Mp4Aspect() {
     }
 
-    /** 单次 Range 探测读的窗口：足够装下 ftyp + 常见的 moov。 */
+    /**
+     * 单次 Range 探测读的窗口。
+     *
+     * <p><b>不要求装下整个 moov</b> —— 只需要装下 ftyp + moov 的<b>头部</b>。
+     * 解析器容忍 moov 被窗口截断（见 {@link #parse}），而 tkhd / stsd / avcC
+     * 都在 moov 头 400 余字节内，所以 64KB 对几百 KB 的大 moov 一样够用
+     * （实测 B 站 1080P：moov 256807 字节，avcC 在文件偏移 563 处）。
+     */
     public static final int WINDOW_BYTES = 64 * 1024;
 
     /**
@@ -111,12 +118,18 @@ public final class Mp4Aspect {
         if (moov == null) {
             return null;
         }
-        // moov 必须完整落在窗口内，否则字段会读到窗口外的垃圾。
-        if (moov[0] + moov[1] > len) {
-            return null;
+        // **容忍 moov 被窗口截断**：faststart 的长视频 moov 可达几百 KB，而探测
+        // 窗口只有 {@link #WINDOW_BYTES}（64KB）—— 整个 moov 装不下。但 tkhd 在
+        // trak 头部、stsd 在 stbl 头部，实测距 moov 头仅 400 余字节，必定落在窗口
+        // 里。所以把 end 钳到窗口内继续解析，而不是直接放弃。
+        // （这里原先是 `moov[0] + moov[1] > len → return null`，正是它让 B 站
+        // 1080P 的预检一条日志都不打：moov 声明 256807 字节 > 64KB 窗口。）
+        int end = (int) Math.min((long) moov[0] + moov[1], len);
+        if (end <= moov[0] + 8) {
+            return null;    // 连 moov 的 box 头都没读全
         }
         // 注意第三个参数是**绝对结束位置**（box 起点 + 长度），不是载荷长度
-        return parseMoov(buf, moov[0] + 8, moov[0] + moov[1]);
+        return parseMoov(buf, moov[0] + 8, end);
     }
 
     /**
@@ -406,10 +419,16 @@ public final class Mp4Aspect {
         if (moov == null) {
             moov = scanForMoov(buf, len);
         }
-        if (moov == null || moov[0] + moov[1] > len) {
+        if (moov == null) {
             return null;
         }
-        return dpbFromMoov(buf, moov[0] + 8, moov[0] + moov[1]);
+        // 与 {@link #parse} 同一处理：容忍 moov 被窗口截断 —— avcC 也在 moov
+        // 头部，整个 moov 装不下不影响判定。
+        int end = (int) Math.min((long) moov[0] + moov[1], len);
+        if (end <= moov[0] + 8) {
+            return null;
+        }
+        return dpbFromMoov(buf, moov[0] + 8, end);
     }
 
     /** 在 moov 载荷里逐个 trak 找带 avcC 的那条。 */
@@ -556,11 +575,18 @@ public final class Mp4Aspect {
             // 会变成负数，p 变负后循环条件仍成立，下一轮 readUInt 就越界崩了。
             // 不合法就当作「这里不是 box 边界」返回 null，交给 scanForMoov 回退。
             long next = (long) p + size;
-            if (next <= p || next > end) {
-                return null;
-            }
+            // **命中优先于越界检查**：faststart 的长视频 moov 可达几百 KB，而
+            // 探测窗口只有 {@link #WINDOW_BYTES}（64KB）—— 整个 moov 装不下。
+            // 这时仍要把 moov 的位置和**声明**大小交出去：调用方会把 end 钳到
+            // 窗口内继续解析，而 tkhd / stsd / avcC 都在 moov 头部（实测距 moov
+            // 头 400 余字节），必定落在窗口里。
+            // （曾经这里先查越界再比类型，于是「moov 声明 256807 > 窗口 65536」
+            // 直接返回 null —— B 站 1080P 的预检一条日志都不打，根因在此。）
             if (type == want) {
                 return new int[] {p, (int) Math.min(size, Integer.MAX_VALUE - 8)};
+            }
+            if (next <= p || next > end) {
+                return null;
             }
             p = (int) next;
         }
@@ -600,7 +626,21 @@ public final class Mp4Aspect {
         return null;
     }
 
-    /** 在 [off,end) 里顺序找第一个子 box，返回 {offset, size}。 */
+    /**
+     * 在 [off,end) 里顺序找第一个子 box，返回 {offset, size}。
+     *
+     * <p><b>目标 box 越界 = 被窗口截断，不是「找不到」</b>：返回<b>钳断到窗口
+     * 边界</b>的长度（{@code end - p}），让调用方按「窗口边界即硬边界」尽力读
+     * 它的头部字段。这是大 moov 场景能工作的关键 —— trak 的声明大小往往几十万
+     * 字节（它装着整个 stbl 的表），而我们要的 tkhd / stsd 就在 trak 头部。
+     *
+     * <p>钳断是安全的：调用方读字段时同时受 {@code size} 与 {@code b.length}
+     * 约束（如 {@link #tkhdSize} 的 {@code hOff + 4 > size} 闸），读不全就返回
+     * {@code null}，绝不会把窗口外的字节当成字段值。
+     *
+     * <p>非目标 box 越界则仍返回 {@code null}：跳过它需要它的真实长度，而那个
+     * 长度已被截断 —— 无法定位它后面的兄弟 box，只能老实说找不到。
+     */
     private static int[] findChild(byte[] b, int off, int end, char t0, char t1,
                                    char t2, char t3) {
         if (off < 0 || end > b.length) {
@@ -616,7 +656,8 @@ public final class Mp4Aspect {
             }
             if (type == want) {
                 if (p + size > end) {
-                    return null;
+                    // 被窗口截断 —— 交出可见部分，由调用方决定读不读得全。
+                    return new int[] {p, end - p};
                 }
                 return new int[] {p, (int) Math.min(size, Integer.MAX_VALUE - 8)};
             }

@@ -32,6 +32,11 @@ import java.net.URL;
  * faststart 的文件 moov 在尾部 —— 先用头窗口碰运气，命中就收工；只有确实需要
  * 且总长度已知时才发第二次。不是 MP4（buf[4..8) 不是 {@code ftyp}）在第一发
  * 就返回，连第二次都省了。
+ *
+ * <p><b>头窗口不必装下整个 moov</b>：faststart 的长视频 moov 可达几百 KB
+ * （B 站 1080P 实测 256807 字节），远超 64KB 窗口。但 tkhd / stsd / avcC 都在
+ * moov 头部（实测 avcC 落在文件偏移 563 处），而解析器容忍 moov 被截断 ——
+ * 所以头窗口一次就够，不需要为大 moov 加大窗口或补发请求。
  */
 public final class VideoAspectProbe {
 
@@ -76,7 +81,9 @@ public final class VideoAspectProbe {
             return null;
         }
         try {
-            // 头窗口：faststart 的文件 moov 就在前面。总长度顺手从响应里拿。
+            // 头窗口：faststart 的文件 moov 就在前面（哪怕 moov 有几百 KB，
+            // 它头部那几百字节也够解出 tkhd / stsd / avcC —— 解析器容忍截断）。
+            // 总长度顺手从响应里拿。
             Window head = readWindow(url, 0, Mp4Aspect.WINDOW_BYTES - 1);
             if (head == null || !looksLikeMp4(head.buf, head.len)) {
                 // 不是 MP4（MP3 / AAC / 未知格式）：头四个字节一读就知道，
