@@ -2933,6 +2933,38 @@ report('MediaPlayerController.setMute 先记状态再下发',
        sv2 is not None and 'this.muted = mute' in sv2 and 'applyVolume' in sv2,
        '重连会重建 MediaPlayer 实例。不先记的话，一次断流就把用户的静音取消了')
 
+# ---- (8.1) §7.6 第③层：SetVolume 同时驱动系统 STREAM_MUSIC 流音量 ----
+# 原来音量只落在播放器实例上 —— 那是**相对系统流音量**的乘数。盒子自己的媒体
+# 音量低时，控制点怎么调都听不出来，而日志一切正常（"我们记了、也下发了"）。
+# 这一层能不能听出来只能在真机上确认，所以**形状**必须钉死：推哪个流、
+# 什么时候推、拿不到上限时怎么办。语义（映射的边界）归 PolicyTest §19。
+asv = body_of(ctrl, 'private void applySystemVolume()')
+report('MediaPlayerController.applySystemVolume 方法体已找到', asv is not None,
+       '锚点：private void applySystemVolume()')
+if asv:
+    report('推的是 STREAM_MUSIC（不是 RING / SYSTEM / NOTIFICATION）',
+           'AudioManager.STREAM_MUSIC' in asv,
+           '推错流的后果很隐蔽：铃声音量变了、媒体流没变 —— 用户听到的还是"没反应"，'
+           '而日志说"已下发"')
+    report('拿不到流上限时早退、绝不动系统音量（target < 0）',
+           re.search(r'if\s*\(\s*target\s*<\s*0\s*\)', asv) is not None,
+           '个别 ROM 的 getStreamMaxVolume 返回 0 或负数。照着算的话 index 会落到 0 ——'
+           '把"读不到上限"变成"静音整台盒子"，比什么都不做糟得多')
+    report('设置系统音量包在 try 里（个别 ROM 要求权限，不许把播放拖崩）',
+           'setStreamVolume' in asv and 'catch' in asv,
+           '这条路径由控制点触发，异常必须就地吃掉 —— 让一次 SetVolume 把播放器'
+           '搞崩（或让 SOAP 线程抛出去）是完全不成比例的代价')
+sv3 = body_of(ctrl, 'public void setVolume(float volume)')
+report('setVolume 里推了系统音量（第③层的唯一接线点）',
+       sv3 is not None and 'applySystemVolume' in sv3,
+       '不接线的话这一层等于没做 —— 而它**不会**让任何闸门变红：'
+       '实例音量照旧下发、回读照旧正确、日志照旧正常，只是听不出来')
+report('applyVolume 里**不**推系统音量（重连重放不该改用户刚调过的盒子音量）',
+       av is not None and 'applySystemVolume' not in av,
+       'applyVolume 会在重建播放器实例时被重放。放进去的话，用户在盒子上用'
+       '遥控器把音量调小之后，一次断流重连就会把它拽回控制点的值 ——'
+       '而且是在用户没做任何操作的时候悄悄发生的')
+
 # ---- (9) 网络变化监听 ----
 # LOCATION 是「绑上网卡那一刻生成一次」的，网络一变它就是旧 IP。
 # 没有监听的话，Wi-Fi 断一下就得重启 App —— 而看门狗判据是

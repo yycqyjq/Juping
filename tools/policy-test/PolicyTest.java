@@ -1000,6 +1000,104 @@ public class PolicyTest {
                 "重叠的话 didlFor 的 upnp:class 就取决于 if 的先后顺序，"
                         + "而顺序是最容易被顺手改掉的（图片被判成视频 = 黑屏）");
 
+        System.out.println("\n── 19. 音量 → 系统流档位的映射（§7.6 第③层）──");
+        System.out.println("   原来音量只落在播放器实例上，那是**相对系统 STREAM_MUSIC 音量**的乘数：");
+        System.out.println("   盒子自己的媒体音量低时，控制点怎么调都听不出来（日志却一切正常）。");
+        System.out.println("   现在 SetVolume 顺手把系统流档位推到位。映射里的取整与夹取全是边界，");
+        System.out.println("   而且 streamMax 各机型不同（常见 15，也有 10 / 7）—— 放这里能扫一遍。");
+
+        check("0 → 0（控制点拉到最低，系统流也必须到最低）",
+                PlaybackPolicy.systemStreamVolumeFor(0, 15) == 0,
+                "得到 " + PlaybackPolicy.systemStreamVolumeFor(0, 15));
+        check("100 → streamMax（拉满必须等于满格）",
+                PlaybackPolicy.systemStreamVolumeFor(100, 15) == 15
+                        && PlaybackPolicy.systemStreamVolumeFor(100, 10) == 10
+                        && PlaybackPolicy.systemStreamVolumeFor(100, 7) == 7,
+                "拉满只到 14/15 的话，用户会觉得「最大声还是不够大」，"
+                        + "而且他没有任何办法再往上推");
+        check("50 / streamMax=10 → 5",
+                PlaybackPolicy.systemStreamVolumeFor(50, 10) == 5,
+                "得到 " + PlaybackPolicy.systemStreamVolumeFor(50, 10));
+        check("50 / streamMax=15 → 8（7.5 四舍五入）",
+                PlaybackPolicy.systemStreamVolumeFor(50, 15) == 8,
+                "得到 " + PlaybackPolicy.systemStreamVolumeFor(50, 15));
+        check("33 / streamMax=10 → 3（3.3 向下取整）",
+                PlaybackPolicy.systemStreamVolumeFor(33, 10) == 3,
+                "得到 " + PlaybackPolicy.systemStreamVolumeFor(33, 10));
+        // 用整数除法会错：99*1/100 == 0，而 0.99 四舍五入是 1。
+        // 这条就是「判据必须能区分整数除法与浮点」的那个夹具。
+        check("99 / streamMax=1 → 1（证明用的是浮点，不是整数除法）",
+                PlaybackPolicy.systemStreamVolumeFor(99, 1) == 1,
+                "得到 " + PlaybackPolicy.systemStreamVolumeFor(99, 1)
+                        + " —— 整数除法会给 0，于是「拖到 99」和「拖到 0」听起来一模一样");
+
+        check("越界上夹：150 → streamMax",
+                PlaybackPolicy.systemStreamVolumeFor(150, 15) == 15,
+                "得到 " + PlaybackPolicy.systemStreamVolumeFor(150, 15)
+                        + " —— 控制点发越界值时不许越出档位表");
+        check("越界下夹：-5 → 0",
+                PlaybackPolicy.systemStreamVolumeFor(-5, 15) == 0,
+                "得到 " + PlaybackPolicy.systemStreamVolumeFor(-5, 15));
+
+        check("拿不到流上限（streamMax=0）→ -1，表示「别动系统音量」",
+                PlaybackPolicy.systemStreamVolumeFor(50, 0) == -1,
+                "得到 " + PlaybackPolicy.systemStreamVolumeFor(50, 0)
+                        + " —— 用 0 当「不动」是不行的：0 是合法档位（真正的静音），"
+                        + "两者混在一起会把「读不到上限」变成「静音整台盒子」");
+        check("流上限为负（个别 ROM 会返回负数）→ 同样 -1",
+                PlaybackPolicy.systemStreamVolumeFor(50, -3) == -1,
+                "得到 " + PlaybackPolicy.systemStreamVolumeFor(50, -3));
+
+        // 扫一遍：任何 volume × 任何 streamMax，结果都必须落在 [0, streamMax]。
+        // 单点断言挑不出「某个区间的取整越界」，只能靠穷举。
+        int[] maxes = {1, 2, 3, 7, 10, 15, 16, 30, 100};
+        boolean inRange = true;
+        String firstBad = "";
+        for (int mi = 0; mi < maxes.length; mi++) {
+            for (int v = -10; v <= 110; v++) {
+                int got = PlaybackPolicy.systemStreamVolumeFor(v, maxes[mi]);
+                if (got < 0 || got > maxes[mi]) {
+                    inRange = false;
+                    if (firstBad.length() == 0) {
+                        firstBad = "volume=" + v + " streamMax=" + maxes[mi] + " → " + got;
+                    }
+                }
+            }
+        }
+        check("穷举：任意音量 × 任意流上限，档位都落在 0 ~ streamMax 内", inRange,
+                firstBad.length() > 0 ? ("第一个越界：" + firstBad)
+                        : "（含越界输入 -10 / 110 与 streamMax=1 的极端档位）");
+
+        // 单调不减：音量涨，档位不能跌。取整写错时最容易出的就是「某一段压平甚至回落」。
+        boolean monotone = true;
+        String firstDrop = "";
+        for (int mi = 0; mi < maxes.length; mi++) {
+            int prev = -1;
+            for (int v = 0; v <= 100; v++) {
+                int got = PlaybackPolicy.systemStreamVolumeFor(v, maxes[mi]);
+                if (got < prev) {
+                    monotone = false;
+                    if (firstDrop.length() == 0) {
+                        firstDrop = "streamMax=" + maxes[mi] + " 在 volume=" + v
+                                + " 处从 " + prev + " 掉到 " + got;
+                    }
+                }
+                prev = got;
+            }
+        }
+        check("穷举：音量单调递增时档位单调不减（取整不许把某一段压平或压回去）",
+                monotone, firstDrop.length() > 0 ? firstDrop : "");
+
+        // 「档位不许被压平成一档」：streamMax=15 时 1~100 至少要能取到 10 个不同档位。
+        // 防的是有人图省事写成 volume/10 之类 —— 那会让音量条大半段没反应。
+        TreeSet<Integer> distinct = new TreeSet<Integer>();
+        for (int v = 1; v <= 100; v++) {
+            distinct.add(PlaybackPolicy.systemStreamVolumeFor(v, 15));
+        }
+        check("streamMax=15 时能取到足够多的不同档位（音量条不是大半段没反应）",
+                distinct.size() >= 10,
+                "只取到 " + distinct.size() + " 个不同档位：" + distinct);
+
         System.out.println();
         System.out.println("=".repeat(62));
         System.out.println("播放策略：" + passed + " / " + total + " 通过");

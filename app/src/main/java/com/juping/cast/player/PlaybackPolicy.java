@@ -813,4 +813,51 @@ public final class PlaybackPolicy {
         m.staleHeld = false;
         return MODE_IDLE;
     }
+
+    // --------------------------------------------------- 音量 → 系统流音量
+
+    /**
+     * 把 DLNA 的 0~100 音量映射到系统某个音频流的档位（{@code 0 ~ streamMax}）。
+     *
+     * <h3>为什么需要这一步（§7.6 第③层）</h3>
+     * 原来音量只落在**播放器实例**上（{@code MediaPlayer.setVolume(v, v)}）——
+     * 那是**相对系统 {@code STREAM_MUSIC} 音量**的一个乘数。盒子自己的媒体音量
+     * 若是 0 或很低，控制点怎么调都是「没反应」：我们记了、也下发了、日志一切正常，
+     * 就是听不出来。真机上「音量调不动」最可能的解释正是这一条。
+     *
+     * <p>所以 {@code SetVolume} 除了照旧下发实例音量，还要把系统流音量一起推到位。
+     *
+     * <h3>为什么写成纯函数放在这里</h3>
+     * 映射里的取整与夹取全是边界：{@code streamMax} 各机型不同（常见 15，也有 10 / 7），
+     * 而「拉满必须等于满格」「一个都不许越界」「单调不减」这三条都是能穷举的 ——
+     * 放在 {@link MediaPlayerController} 里就只能靠真机试，放这里能在桌面上扫一遍。
+     *
+     * <h3>拿不到流上限时返回 -1</h3>
+     * {@code getStreamMaxVolume()} 在个别 ROM 上会返回 0 甚至负数。那时**什么都别做**：
+     * 返回 -1 是给调用方的明确信号「这次别动系统音量」。用 0 当"不动"是不行的 ——
+     * 0 是合法档位（真正的静音），两者混在一起会把"读不到"变成"静音"。
+     *
+     * <p><b>本函数与静音无关</b>：静音仍然只走播放器实例（{@code setVolume(0,0)}）。
+     * 把系统流压到 0 会把整台盒子的声音一起静掉（别的应用也跟着哑），
+     * 取消静音还得记住原来的值再还原 —— 那不是 DLNA 渲染端该有的副作用。
+     *
+     * @param volume0to100 控制点给的音量；越界会被夹到 0~100
+     * @param streamMax    目标流的最大档位（{@code AudioManager.getStreamMaxVolume}）
+     * @return 系统流档位 {@code 0 ~ streamMax}；{@code streamMax <= 0} 时返回 -1（别动）
+     */
+    public static int systemStreamVolumeFor(int volume0to100, int streamMax) {
+        if (streamMax <= 0) {
+            return -1;
+        }
+        int v = Math.max(0, Math.min(100, volume0to100));
+        // 用浮点算再四舍五入：整数除法会把 99% 也压成 0（streamMax 小时尤其明显），
+        // 于是「拖到 99 和拖到 0 一样」—— 那是比不生效更难查的 bug。
+        //
+        // 这里**不再夹第二次**：v 已经在 0~100 内，{@code round(v * streamMax / 100f)}
+        // 必然落在 0~streamMax（v=100 时正好等于 streamMax）。
+        // 多一层夹取看着"更稳"，实际是**不可达的死分支**，而且会让人以为上面那句
+        // 夹取可以省 —— 省掉它才是真的会越界。这条由 PolicyTest §19 的穷举钉住：
+        // 把上面那行去掉，110/15 会算出 17，穷举断言当场变红。
+        return Math.round(v * streamMax / 100f);
+    }
 }

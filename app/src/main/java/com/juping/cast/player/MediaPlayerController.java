@@ -336,6 +336,14 @@ public class MediaPlayerController {
     private boolean muted;
 
     /**
+     * 懒取的 {@code AudioManager}，只用来推系统 {@code STREAM_MUSIC} 音量（§7.6 第③层）。
+     *
+     * <p>懒取而不是在构造里取：多数会话里控制点一次音量都不调，没必要为一个
+     * 可能用不到的服务去碰系统。取不到就保持 null，调用方按"不动系统音量"处理。
+     */
+    private AudioManager audioManager;
+
+    /**
      * 当前流有没有视频轨。onPrepared 时用 {@code getVideoWidth()} 判定。
      *
      * <p>用 getVideoWidth 而不是 {@code getTrackInfo()}：后者是 API 16 才有的，
@@ -1644,6 +1652,14 @@ public class MediaPlayerController {
         // 先记下来再下发：重连会重建 MediaPlayer 实例，不记的话音量会丢。
         this.volume = Math.max(0f, Math.min(1f, volume));
         applyVolume();
+        // §7.6 第③层：实例音量只是**相对系统流音量**的一个乘数 —— 盒子自己的
+        // 媒体音量若很低，控制点怎么调都听不出来（我们记了、也下发了、日志正常）。
+        // 所以「控制点显式设了一次音量」时，把系统 STREAM_MUSIC 一起推到位。
+        //
+        // 刻意**只在这里**做、不放进 applyVolume()：applyVolume() 还会在重建
+        // 播放器实例时被重放（见它的注释），而重放不该去改系统音量 ——
+        // 用户刚在盒子上用遥控器调过的音量，不该因为一次断流重连就被拽回控制点的值。
+        applySystemVolume();
     }
 
     /** 当前音量，0 ~ 100。给 RenderingControl 的 GetVolume 回读用。 */
@@ -1700,6 +1716,77 @@ public class MediaPlayerController {
             Log.i(TAG, "取证 音量已下发: " + v + "（muted=" + muted + "）");
         } catch (Exception e) {
             Log.w(TAG, "应用音量失败", e);
+        }
+    }
+
+    /**
+     * 把当前音量推到系统 {@code STREAM_MUSIC} 流上（§7.6 第③层）。
+     *
+     * <p><b>为什么需要它</b>：{@code player.setVolume(v, v)} 是**相对系统流音量**
+     * 的乘数。盒子自己的媒体音量是 0 时，实例音量拉到 1.0 也是静音 ——
+     * 这正是真机上「音量调不动」最可能的解释。所以控制点显式设音量时，
+     * 顺手把系统流档位一起推到位。
+     *
+     * <p><b>与静音的分工</b>：静音**只**走播放器实例（{@code applyVolume()} 里的
+     * {@code v = 0}）。不把系统流压到 0，是因为那会把整台盒子的声音一起静掉
+     * （别的应用也跟着哑），而且取消静音还得记住原值再还原。
+     *
+     * <p><b>读回不受影响</b>：{@code GetVolume} 报的仍是控制点设过的那个值
+     * （{@link #volume}），不是系统流档位换算回来的数 —— 否则用户在盒子上按一下
+     * 遥控器，控制点那边的音量条就会自己跳。
+     *
+     * <p><b>真机验收点</b>：这一层的效果只能在真机上确认（盒子系统媒体音量
+     * 调到很低，再让控制点拉到 100，听音量是否真的上去）。两条取证日志
+     * （「系统音量已下发」/「系统音量未下发」）就是给那次验收用的。
+     */
+    private void applySystemVolume() {
+        int streamMax = streamMaxVolume();
+        int target = PlaybackPolicy.systemStreamVolumeFor(Math.round(volume * 100f), streamMax);
+        if (target < 0) {
+            // -1 = 拿不到流上限（个别 ROM 返回 0 / 负数）。什么都别做，但要说出来：
+            // 「这次没动系统音量」和「动了但没生效」在真机上长得一样，只有日志能分开。
+            Log.i(TAG, "取证 系统音量未下发（拿不到 STREAM_MUSIC 上限=" + streamMax + "）");
+            return;
+        }
+        AudioManager am = audioManager();
+        if (am == null) {
+            return;
+        }
+        try {
+            am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0);
+            Log.i(TAG, "取证 系统音量已下发: STREAM_MUSIC=" + target + "/" + streamMax);
+        } catch (Throwable t) {
+            // 个别 ROM 会要求 MODIFY_AUDIO_SETTINGS。本项目**刻意不声明**它
+            // （权限面最小，见 AndroidManifest 的注释）；真机若在这里打出
+            // SecurityException，再回来补那一条权限 —— 那时就有实测依据了。
+            Log.w(TAG, "设置系统音量失败（若为 SecurityException，说明本机要求 "
+                    + "MODIFY_AUDIO_SETTINGS）", t);
+        }
+    }
+
+    /** 懒取 AudioManager；拿不到返回 null（不抛）。 */
+    private AudioManager audioManager() {
+        if (audioManager == null && context != null) {
+            try {
+                audioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+            } catch (Throwable t) {
+                Log.w(TAG, "取 AudioManager 失败", t);
+            }
+        }
+        return audioManager;
+    }
+
+    /** {@code STREAM_MUSIC} 的最大档位；读不到返回 -1（由映射函数兜住，表示"别动"）。 */
+    private int streamMaxVolume() {
+        AudioManager am = audioManager();
+        if (am == null) {
+            return -1;
+        }
+        try {
+            return am.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+        } catch (Throwable t) {
+            Log.w(TAG, "读 STREAM_MUSIC 上限失败", t);
+            return -1;
         }
     }
 
