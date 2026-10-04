@@ -9,7 +9,7 @@
   ③ 系统音量层    → 由桌面侧同时抓的 logcat 判（取证 系统音量已下发/未下发/失败）
 
 用法：
-    python3 /tmp/volume-check.py <IP> <端口> <0-100>
+    python3 tools/volume-check.py <IP> <端口> <0-100>
     依次：GetVolume(基线) → SetVolume(N) → GetVolume(回读) → SetMute(1) → GetMute
           → SetMute(0) → 再 GetVolume（静音恢复后音量不该被吃掉，见控制器注释）
 """
