@@ -92,8 +92,8 @@ Juping/
     │   ├── verify-device-selftest.sh  用假 adb 验 verify-on-device.sh 的管道
     │   └── android/util/Log.java    android.util.Log 的桌面替身
     ├── policy-test/          播放重连策略测试（纯逻辑，不需要真机）
-│   ├── run.sh            编译 + 197 项断言 + 476 条源码级守卫
-│   └── PolicyTest.java   197 项断言 + 「卡死→重连→又卡死」循环模拟
+│   ├── run.sh            编译 + 231 项断言 + 487 条源码级守卫
+│   └── PolicyTest.java   231 项断言 + 「卡死→重连→又卡死」「片尾→误判→从头再放」循环模拟
     ├── proxy-test/           本地预取代理字节一致性测试（11 项）
     │   ├── run.sh            编译 → 起源站 → 全量/Range/回拖/EOS/中途重连 逐字节比对
     │   └── ProxyTest.java    JDK 自带 HttpServer 当片源
@@ -1434,7 +1434,7 @@ SCPD 如实声明、控制点发的动作如实响应 —— 做不到的如实�
   死循环、切歌后媒体服务卡死（全部见「排障」一节）。
   桌面核验现在是十六项全绿：编译 / lint `NewApi` 零命中 /
   API 引用 412 项（release 419 项）全命中 / DEX 版本 035 / 签名在 API 15 上有效 /
-  DLNA 协议 245 项通过 / 播放策略 197 项断言 + 476 条源码级守卫通过 /
+  DLNA 协议 245 项通过 / 播放策略 231 项断言 + 487 条源码级守卫通过 /
   断言/守卫计数与 README、AGENTS 文档一致（`check_gate_counts.py`，覆盖协议/代理/网页/probe/策略五道）/
   本地预取代理字节一致性 11 项通过 / 网页逻辑一致性 52 项通过 / R8 dex 入口点 47 项通过 /
   控制点自检脚本 33 或 34 项通过（组播回退分支所致，均为合法值）/

@@ -124,7 +124,7 @@ tools/
 ├── apk_info.py           APK 包名/minSdk 解析
 ├── make_icon.py          位图资源生成（纯标准库）
 ├── protocol-test/        DLNA 协议一致性 245 项（桌面 JVM + 真实协议栈桩）
-├── policy-test/          播放策略 197 断言 + 476 源码级守卫
+├── policy-test/          播放策略 231 断言 + 487 源码级守卫
 ├── proxy-test/           MediaProxy 字节一致性 11 项
 └── web-test/             MultipartLite + sanitize + ApkScan 网页逻辑一致性（52 项）
 ```
@@ -140,7 +140,7 @@ tools/
 | verify_dex | R8 后框架回调/Thread 子类/协议常量存活 | 全量 |
 | verify_protocol | DLNA 协议一致性（drive.py，期望 245/245） | 245 |
 | ↳ 内含 probe | 控制点自检（**33 或 34 双态**：组播回退分支） | 33/34 |
-| verify_policy | 播放策略 197 断言 + 476 源码级守卫 | 87+ |
+| verify_policy | 播放策略 231 断言 + 487 源码级守卫 | 87+ |
 | ↳ 内含计数 | 文档里的用例总数 ↔ 闸门期望值（`check_gate_counts.py`，覆盖协议/代理/网页/probe/策略） | 一致性 |
 | verify_proxy | MediaProxy 字节一致性（全量/Range/回拖/EOS/中途重连） | 11 |
 | verify_web | multipart 解析逐字节一致 / 名字编码 / APK 扫描内核 / 上传页与安装页零外链 | 52 |

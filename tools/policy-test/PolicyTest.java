@@ -179,31 +179,77 @@ public class PolicyTest {
         System.out.println("   而 prepareAsync 要几百毫秒以上 —— Play 到达时几乎必然还在准备中。");
 
         check("已就绪 → 直接 start",
-                PlaybackPolicy.playAction(true, false, true) == PlaybackPolicy.PLAY_START,
+                PlaybackPolicy.playAction(true, false, true, false) == PlaybackPolicy.PLAY_START,
                 "prepared=true");
         check("【关键】准备中 → 什么都不做（绝不重建播放器）",
-                PlaybackPolicy.playAction(false, true, true) == PlaybackPolicy.PLAY_WAIT,
+                PlaybackPolicy.playAction(false, true, true, false) == PlaybackPolicy.PLAY_WAIT,
                 "旧实现这里会 startInternal() → releasePlayer()，把正在 prepare 的"
                 + "实例掐掉重建 —— 两条指令互相拆台，表现为「有时候投不上去」");
         check("还没开始、但已有地址 → 该重新 prepare",
-                PlaybackPolicy.playAction(false, false, true) == PlaybackPolicy.PLAY_PREPARE,
+                PlaybackPolicy.playAction(false, false, true, false) == PlaybackPolicy.PLAY_PREPARE,
                 "prepared=false, preparing=false, hasUrl=true");
         check("没地址也没在准备 → 什么都不做",
-                PlaybackPolicy.playAction(false, false, false) == PlaybackPolicy.PLAY_NONE,
+                PlaybackPolicy.playAction(false, false, false, false) == PlaybackPolicy.PLAY_NONE,
                 "prepared=false, preparing=false, hasUrl=false");
 
         check("prepared 与 preparing 同时为真时，按「已就绪」处理",
-                PlaybackPolicy.playAction(true, true, true) == PlaybackPolicy.PLAY_START,
+                PlaybackPolicy.playAction(true, true, true, false) == PlaybackPolicy.PLAY_START,
                 "理论上不该同时为真；真出现了也绝不能去重建");
         check("已就绪时，有没有地址都不重建",
-                PlaybackPolicy.playAction(true, false, false) == PlaybackPolicy.PLAY_START,
+                PlaybackPolicy.playAction(true, false, false, false) == PlaybackPolicy.PLAY_START,
                 "地址可能刚被 stop() 清掉，但播放器还在 —— 直接 start 即可");
         check("准备中时，没有地址也不重建",
-                PlaybackPolicy.playAction(false, true, false) == PlaybackPolicy.PLAY_WAIT,
+                PlaybackPolicy.playAction(false, true, false, false) == PlaybackPolicy.PLAY_WAIT,
                 "准备中的实例不能动，这是唯一的处置");
         check("preparing 优先于「重新 prepare」",
-                PlaybackPolicy.playAction(false, true, true) == PlaybackPolicy.PLAY_WAIT,
+                PlaybackPolicy.playAction(false, true, true, false) == PlaybackPolicy.PLAY_WAIT,
                 "这一格就是重投失败的核心：有地址 + 准备中 ≠ 该重建");
+
+        System.out.println("\n── 7b. 「正在建实例」也是「准备中」（异步 release 引入的空窗期）──");
+        System.out.println("   厂商 MediaPlayer.release() 被挪到后台线程后，从「开始释放」到");
+        System.out.println("   「回调里 new MediaPlayer()」之间，player==null 且 preparing==false ——");
+        System.out.println("   这一格与「没有实例、该建一个」长得一模一样。漏判的后果是真机实测");
+        System.out.println("   的一次换片源出现**两次 release + 两次 prepare**（多花约 400ms、多闪一下）。");
+
+        check("【关键】正在建实例 + 有地址 → 等，不许再 prepare",
+                PlaybackPolicy.playAction(false, false, true, true) == PlaybackPolicy.PLAY_WAIT,
+                "player==null 但 buildPending=true：新实例在路上，Play 必须等它，"
+                + "而不是 startInternal() 再拆一遍");
+        check("正在建实例 + 没地址 → 同样等",
+                PlaybackPolicy.playAction(false, false, false, true) == PlaybackPolicy.PLAY_WAIT,
+                "正在建就是「有实例在路上」，与有没有地址无关");
+        check("building 与 preparing 是同一处置，且与「都没有」不同",
+                PlaybackPolicy.playAction(false, true, false, true) == PlaybackPolicy.PLAY_WAIT
+                        && PlaybackPolicy.playAction(false, false, false, true) == PlaybackPolicy.PLAY_WAIT
+                        && PlaybackPolicy.playAction(false, false, false, false) == PlaybackPolicy.PLAY_NONE,
+                "两种「在飞」的形态给出同一个处置；而 building=false 那一格是 PLAY_NONE。"
+                + "三格摆在一起才说明 building 真的被看了 —— 只查 preparing 那一格是恒真的"
+                + "（preparing=true 本来就返回 WAIT，删掉 building 分支它也照样绿）");
+        check("prepared 优先于 building（顺序不能反）",
+                PlaybackPolicy.playAction(true, false, false, true) == PlaybackPolicy.PLAY_START,
+                "已就绪时不存在「正在建」；真同时出现也该直接 start，绝不重建");
+        check("building=false 时与旧行为逐格一致（新参数不改既有语义）",
+                PlaybackPolicy.playAction(false, false, true, false) == PlaybackPolicy.PLAY_PREPARE
+                        && PlaybackPolicy.playAction(false, true, true, false) == PlaybackPolicy.PLAY_WAIT
+                        && PlaybackPolicy.playAction(true, false, true, false) == PlaybackPolicy.PLAY_START
+                        && PlaybackPolicy.playAction(false, false, false, false) == PlaybackPolicy.PLAY_NONE,
+                "加参数是为了补空窗期，不是改老格子");
+
+        boolean buildingAlwaysWaits = true;
+        boolean preparedAlwaysStarts = true;
+        for (int i = 0; i < 16; i++) {
+            boolean p = (i & 1) != 0;
+            boolean q = (i & 2) != 0;
+            boolean h = (i & 4) != 0;
+            boolean b = (i & 8) != 0;
+            int a = PlaybackPolicy.playAction(p, q, h, b);
+            if (b && !p && a != PlaybackPolicy.PLAY_WAIT) buildingAlwaysWaits = false;
+            if (p && a != PlaybackPolicy.PLAY_START) preparedAlwaysStarts = false;
+        }
+        check("穷举 16 格：building=true 且未就绪 → 恒为 PLAY_WAIT",
+                buildingAlwaysWaits, "building 是「准备中」的等价形态，不该漏任何一格");
+        check("穷举 16 格：prepared=true → 恒为 PLAY_START（最高优先级）",
+                preparedAlwaysStarts, "就绪优先于一切，绝不被 building/preparing 抢走");
 
         System.out.println("\n── 8. Seek「待决」的收敛判定（「拖拽不同步」的正解）──");
 
@@ -238,11 +284,11 @@ public class PolicyTest {
                 oldResumeWouldRebuild(false, true),
                 "旧代码：if (prepared) start(); else if (currentUrl != null) startInternal();");
         check("【反向验证】新逻辑在同样输入下不重建（两者结论相反）",
-                PlaybackPolicy.playAction(false, true, true) != PlaybackPolicy.PLAY_PREPARE,
+                PlaybackPolicy.playAction(false, true, true, false) != PlaybackPolicy.PLAY_PREPARE,
                 "新逻辑给的是 PLAY_WAIT。新旧不同 → 这条断言能区分对错，不是恒真");
         check("【反向验证】旧逻辑在「没准备 + 有地址」时也重建（这一格两者一致）",
                 oldResumeWouldRebuild(false, true)
-                        && PlaybackPolicy.playAction(false, false, true) == PlaybackPolicy.PLAY_PREPARE,
+                        && PlaybackPolicy.playAction(false, false, true, false) == PlaybackPolicy.PLAY_PREPARE,
                 "真的什么都没开始时，重建才是对的 —— 修的是「准备中」那一格，别误伤这一格");
 
         System.out.println("\n── 10. SetAVTransportURI 的幂等判定（「拖拽蓝屏重连」的正解）──");
@@ -253,27 +299,46 @@ public class PolicyTest {
         final String ub = "http://192.168.1.9:8192/media/b.mp4";
 
         check("同地址 + 已就绪 → 不重建（拖拽走的就是这一格）",
-                !PlaybackPolicy.shouldRebuild(ua, ua, true, false),
+                !PlaybackPolicy.shouldRebuild(ua, ua, true, false, false),
                 "prepared=true：播放器还在，同一个地址不该动它");
         check("同地址 + 准备中 → 不重建",
-                !PlaybackPolicy.shouldRebuild(ua, ua, false, true),
+                !PlaybackPolicy.shouldRebuild(ua, ua, false, true, false),
                 "prepareAsync 已发、回调未到 —— 这时候重建会把正在准备的实例掐掉");
         check("【关键】同地址 + 播放器已释放 → 仍然重建",
-                PlaybackPolicy.shouldRebuild(ua, ua, false, false),
+                PlaybackPolicy.shouldRebuild(ua, ua, false, false, false),
                 "出过错、已被 release 的播放器必须允许重建 —— 只比 URL 的实现"
                 + "会把这一格也拦掉，于是控制点重发同地址就再也救不回来了");
         check("换地址 → 重建（换片必须切）",
-                PlaybackPolicy.shouldRebuild(ub, ua, true, false),
+                PlaybackPolicy.shouldRebuild(ub, ua, true, false, false),
                 "地址不同，哪怕当前正在播也要切");
         check("当前没有地址（首次投屏）→ 重建",
-                PlaybackPolicy.shouldRebuild(ua, null, false, false),
+                PlaybackPolicy.shouldRebuild(ua, null, false, false, false),
                 "currentUrl 为 null 时 equals 给 false，走重建 —— 这是对的");
         check("空地址 → 不重建（什么都不做）",
-                !PlaybackPolicy.shouldRebuild("", ua, true, false),
+                !PlaybackPolicy.shouldRebuild("", ua, true, false, false),
                 "空地址不是「换片」，是无效指令");
         check("null 地址 → 不重建（防御性）",
-                !PlaybackPolicy.shouldRebuild(null, ua, true, false),
+                !PlaybackPolicy.shouldRebuild(null, ua, true, false, false),
                 "别让 NPE 在这里冒出来");
+
+        check("【关键】同地址 + 正在建实例 → 不重建（空窗期幂等）",
+                !PlaybackPolicy.shouldRebuild(ua, ua, false, false, true),
+                "building=true：新实例在路上，同地址再发一遍必须忽略 —— "
+                + "否则就是真机那次「两次 release + 两次 prepare」");
+        check("换地址 + 正在建实例 → 仍然重建",
+                PlaybackPolicy.shouldRebuild(ub, ua, false, false, true),
+                "地址真变了就得切，building 不能把换片也拦掉");
+        check("空地址 + 正在建实例 → 不重建",
+                !PlaybackPolicy.shouldRebuild("", ua, false, false, true),
+                "空地址优先于一切，building 也不例外");
+        check("building 与 prepared/preparing 对同地址给出同一结论",
+                PlaybackPolicy.shouldRebuild(ua, ua, true, false, false)
+                        == PlaybackPolicy.shouldRebuild(ua, ua, false, false, true),
+                "三种「这次播放已在飞」的形态，幂等判据必须一致");
+        check("building 不影响「换地址必重建」（穷举对照）",
+                PlaybackPolicy.shouldRebuild(ub, ua, true, false, false)
+                        && PlaybackPolicy.shouldRebuild(ub, ua, false, false, true),
+                "换片是硬需求，任何在飞状态都不该把它压掉");
 
         System.out.println("\n── 11. 反向验证：两代旧实现各错一格，新逻辑要同时躲开 ──");
 
@@ -1098,6 +1163,204 @@ public class PolicyTest {
                 distinct.size() >= 10,
                 "只取到 " + distinct.size() + " 个不同档位：" + distinct);
 
+        System.out.println("\n── 20. 片尾 ≠ 卡死（厂商不送播完回调时的自救）──");
+        System.out.println("   真机：B站 1080P 位置走到 204900ms / 时长 205000ms 就冻住，");
+        System.out.println("   厂商栈**一次播完回调都没送**。看门狗等满 20 秒把它判成「卡死」、");
+        System.out.println("   重连、从 0 再放一遍 —— 而每一轮都从片尾重新开始，这个循环永远不会停。");
+        System.out.println("   「播完」与「卡死」在位置上长得一模一样，唯一区别是**停在哪里**。");
+
+        check("位置正好等于时长 → 片尾",
+                PlaybackPolicy.isAtEndOfStream(205000, 205000),
+                "自然播完的最后一拍就该长这样");
+        check("位置超过时长 → 片尾（这台厂商播放器会报出超过时长的位置）",
+                PlaybackPolicy.isAtEndOfStream(204900, 204000),
+                "位置 204900 > 时长 204000：真机上「位置」与「时长」来自两个不同的源，"
+                        + "位置跑过时长是常态，不能因此判成「不在片尾」");
+        check("离时长差 100ms → 片尾（B站 1080P 实测的冻结点）",
+                PlaybackPolicy.isAtEndOfStream(204900, 205000),
+                "真机冻在 204900 / 205000，差 100ms");
+        check("离时长差 1234ms → 片尾（本地 360P 自然播完时最后采到的位置）",
+                PlaybackPolicy.isAtEndOfStream(59766, 61000),
+                "采样本身有滞后：厂商回调里记下的最后位置是 59766ms，"
+                        + "比时长少 1234ms —— 容差比这还小的话，正常播完会被判成「不在片尾」");
+        check("离时长差 3 秒 → 不是片尾（容差之外）",
+                !PlaybackPolicy.isAtEndOfStream(202000, 205000),
+                "差 3 秒已经超出采样滞后能解释的范围，那是「播着播着停住」");
+        check("停在 50000ms / 时长 205000ms → 不是片尾",
+                !PlaybackPolicy.isAtEndOfStream(50000, 205000),
+                "真卡死必须不受影响：它该走卡死判据去重连，不能被片尾判据放行");
+        check("停在 0ms / 时长 205000ms → 不是片尾",
+                !PlaybackPolicy.isAtEndOfStream(0, 205000),
+                "「起播后位置一直停在 0ms」是另一件事（isNotStarted 管），别被这里吃掉");
+
+        // 直播没有片尾：位置本来就可能在末尾附近长时间不动。
+        check("时长未知（0）→ 永远不是片尾",
+                !PlaybackPolicy.isAtEndOfStream(0, 0)
+                        && !PlaybackPolicy.isAtEndOfStream(999999, 0),
+                "直播的 duration 恒为 0，把 0 当片尾的话每一条直播都会被判成播完");
+        check("时长负数（更极端的未知）→ 永远不是片尾",
+                !PlaybackPolicy.isAtEndOfStream(100000, -1),
+                "duration <= 0 一律按直播处理，见 isLiveStream");
+
+        // 容差的**边界**：正好落在容差上算片尾，多 1ms 就不算。
+        // 这条防的是有人把 >= 写成 > —— 差 1ms 的判据在真机上是随机翻面的。
+        check("容差边界：正好差 EPS 算片尾，差 EPS+1 不算",
+                PlaybackPolicy.isAtEndOfStream(205000 - PlaybackPolicy.END_OF_STREAM_EPS_MS, 205000)
+                        && !PlaybackPolicy.isAtEndOfStream(
+                                205000 - PlaybackPolicy.END_OF_STREAM_EPS_MS - 1, 205000),
+                "差 " + PlaybackPolicy.END_OF_STREAM_EPS_MS + "ms 该算片尾，"
+                        + "差 " + (PlaybackPolicy.END_OF_STREAM_EPS_MS + 1) + "ms 不该算");
+
+        // 穷举：整个区间上「位置越大越不会漏判」，且判为片尾的恰好是最后一段。
+        // 单调性防的是有人写成 Math.abs 之类的对称判据 —— 那会把**开头**也算成片尾。
+        boolean endMonotone = true;
+        String endFirstBreak = "";
+        boolean sawEnd = false;
+        boolean endIsSuffix = true;
+        for (int p = 0; p <= 205000; p += 1000) {
+            boolean atEnd = PlaybackPolicy.isAtEndOfStream(p, 205000);
+            if (atEnd) {
+                sawEnd = true;
+            } else if (sawEnd) {
+                endIsSuffix = false;
+                if (endFirstBreak.length() == 0) {
+                    endFirstBreak = "位置 " + p + "ms 从「是片尾」翻回「不是片尾」";
+                }
+            }
+            if (p > 0) {
+                boolean prevAtEnd = PlaybackPolicy.isAtEndOfStream(p - 1000, 205000);
+                if (prevAtEnd && !atEnd) {
+                    endMonotone = false;
+                }
+            }
+        }
+        check("穷举：判为片尾的恰好是最后一段（不会在中间误判）",
+                endIsSuffix && sawEnd, endFirstBreak);
+        check("穷举：位置越大越不会漏判（判据关于位置单调）",
+                endMonotone,
+                "写成 Math.abs 之类的对称判据会把**开头**也算成片尾，"
+                        + "于是每次起播都会被判成播完");
+
+        // ---- 把用户看到的现象直接编码成断言 ----
+        //
+        // 旧判据（只看「停了多久」）在这路流上会反复「重连 → 从 0 再放」；
+        // 新判据（先问「停在哪儿」）第一拍就停手。
+        int oldRuleReconnects = simulateNoCompletionLoop(false, 300);
+        int oldRuleLonger = simulateNoCompletionLoop(false, 600);
+        check("模拟：厂商不送播完回调的流，旧判据会反复从头再放（而且永不收敛）",
+                oldRuleReconnects >= 3 && oldRuleLonger > oldRuleReconnects,
+                "300 拍内重连 " + oldRuleReconnects + " 次，600 拍内 " + oldRuleLonger
+                        + " 次 —— 重连次数随观察时长一起涨，就是「永远不会停」；"
+                        + "每一次重连都从 0 再放一遍，用户看到的是「播完自己跳回开头」");
+        int newRuleReconnects = simulateNoCompletionLoop(true, 300);
+        check("模拟：同一路流，片尾判据一次就停手（不再重连）",
+                newRuleReconnects == 0,
+                "得到重连 " + newRuleReconnects + " 次");
+
+        // ---------------------------------------------------------------- 21
+        // 后台 release 挂死：阈值语义 + 错误分类
+        //
+        // 判据来自 2026-10-04 的真机 ANR 转储（pid 4424 / 1718）：
+        // 厂商栈对「DPB 溢出、硬件已放弃视频解码」那路流，MediaPlayer.release()
+        // **永久挂起**。控制器侧的形状（必须交给后台线程）由 run.sh 的源码守卫钉；
+        // 这里钉的是纯语义：多久算挂死、挂死归哪一类。
+
+        // 边界：正好落在阈值上算挂死，少 1ms 不算。
+        // 防的是有人把 >= 写成 > —— 差 1ms 的判据在真机上是随机翻面的。
+        check("释放挂死边界：正好等满阈值算挂死，少 1ms 不算",
+                PlaybackPolicy.isReleaseStuck(PlaybackPolicy.RELEASE_STUCK_MS)
+                        && !PlaybackPolicy.isReleaseStuck(
+                                PlaybackPolicy.RELEASE_STUCK_MS - 1),
+                "等 " + PlaybackPolicy.RELEASE_STUCK_MS + "ms 该算挂死，"
+                        + "等 " + (PlaybackPolicy.RELEASE_STUCK_MS - 1) + "ms 不该算");
+
+        check("还没开始等（0ms）不算挂死",
+                !PlaybackPolicy.isReleaseStuck(0L),
+                "0 是「没有在飞的释放」的哨兵值，不能判成挂死");
+
+        // ---- 拿真机实测的耗时分布核对阈值 ----
+        //
+        // 正常释放（pid 2828 进程 12 次里可读到耗时的 8 次）全部 ≤ 888ms；
+        // 挂死的那次厂商内部先 Failed ! 再 ok !，卡了 20000ms —— 而 release()
+        // 本身**从未返回**（ANR 转储里线程还停在 _release(Native Method)）。
+        final long[] normalReleases = { 3L, 5L, 36L, 452L, 718L, 803L, 833L, 888L };
+        final long observedStuck = 20000L;
+
+        boolean noFalsePositive = true;
+        String firstFalsePositive = "";
+        for (long ms : normalReleases) {
+            if (PlaybackPolicy.isReleaseStuck(ms)) {
+                noFalsePositive = false;
+                if (firstFalsePositive.length() == 0) {
+                    firstFalsePositive = "正常释放 " + ms + "ms 被判成了挂死";
+                }
+            }
+        }
+        check("实测的正常释放耗时（8 个样本，最坏 888ms）一个都不许误判成挂死",
+                noFalsePositive, firstFalsePositive);
+
+        check("实测挂死的那次（20000ms）必须判成挂死",
+                PlaybackPolicy.isReleaseStuck(observedStuck),
+                "阈值定得比 20000ms 还大的话，这条路径永远不会上报");
+
+        // 下界留 10 倍余量：真机上「正常」与「挂死」之间**没有中间态**
+        // （实测要么 ≤888ms，要么永不返回），所以阈值绝不能贴着正常值放 ——
+        // 贴着放的话，哪天厂商卡了 1.2 秒就会被误报成「播放器栈已死」，
+        // 而那时它其实只是慢，重连一次就好了。
+        // 上界是实测挂死值：报得比它晚，这条路径就永远不会触发。
+        final long releaseStuckFloor = 10L * 888L;
+        check("阈值对最坏正常值留有 10 倍余量，且不晚于实测挂死值",
+                PlaybackPolicy.RELEASE_STUCK_MS >= releaseStuckFloor
+                        && PlaybackPolicy.RELEASE_STUCK_MS <= observedStuck,
+                "要求 " + releaseStuckFloor + "ms <= 阈值 "
+                        + PlaybackPolicy.RELEASE_STUCK_MS + "ms <= "
+                        + observedStuck + "ms（下界 = 实测最坏正常值 888ms × 10）");
+
+        // 穷举：等待时长越大越不会从「挂死」翻回「不挂死」。
+        // 单调性防的是有人写成区间判据（比如 waited < X || waited > Y）——
+        // 那会让挂了 10 分钟的情形反而判成正常。
+        boolean stuckMonotone = true;
+        String stuckFirstBreak = "";
+        boolean sawStuck = false;
+        for (long w = 0; w <= 60000L; w += 100L) {
+            boolean stuck = PlaybackPolicy.isReleaseStuck(w);
+            if (stuck) {
+                sawStuck = true;
+            } else if (sawStuck) {
+                stuckMonotone = false;
+                if (stuckFirstBreak.length() == 0) {
+                    stuckFirstBreak = "等 " + w + "ms 从「挂死」翻回「不挂死」";
+                }
+            }
+        }
+        check("穷举：判为挂死的恰好是最后一段（等得越久越不会翻回正常）",
+                stuckMonotone && sawStuck, stuckFirstBreak);
+
+        // ---- 错误分类 ----
+        check("挂死有自己的分类名（不蹭 STALLED / GIVEUP）",
+                "PLAYER_DEAD".equals(PlaybackPolicy.errorKindName(PlaybackPolicy.ERR_PLAYER_DEAD))
+                        && PlaybackPolicy.ERR_PLAYER_DEAD != PlaybackPolicy.ERR_STALLED
+                        && PlaybackPolicy.ERR_PLAYER_DEAD != PlaybackPolicy.ERR_GIVEUP,
+                "卡死还能重连、放弃是重连用尽，挂死是**厂商栈已经死了** —— "
+                        + "三者对用户是三种不同的话，日志里也要能一眼分开");
+
+        // 穷举：0..8 全部不重名（防止新分类被写成已有编号，静默顶掉原语义）。
+        boolean namesUnique = true;
+        String firstClash = "";
+        for (int a = 0; a <= 8 && namesUnique; a++) {
+            for (int b = a + 1; b <= 8; b++) {
+                String na = PlaybackPolicy.errorKindName(a);
+                String nb = PlaybackPolicy.errorKindName(b);
+                if (na.equals(nb) && !"NONE".equals(na)) {
+                    namesUnique = false;
+                    firstClash = "kind " + a + " 与 kind " + b + " 同名（" + na + "）";
+                    break;
+                }
+            }
+        }
+        check("穷举：0..8 的错误分类名两两不重名",
+                namesUnique, firstClash);
+
         System.out.println();
         System.out.println("=".repeat(62));
         System.out.println("播放策略：" + passed + " / " + total + " 通过");
@@ -1631,5 +1894,49 @@ public class PolicyTest {
     static RenderState snap(int kind, boolean audioOnly, boolean preparing, long durationMs) {
         return new RenderState(true, true, kind, audioOnly, false, preparing, false,
                 0L, durationMs, 0, 0);
+    }
+
+    /**
+     * 模拟一路「播到片尾就冻住、而且厂商不送播完回调」的流。
+     *
+     * <p>这是真机上真实存在的一路流（B站 1080P）：位置一路走到 205s，
+     * 然后冻在离时长 100ms 的地方，{@code onCompletion} 一次都不来。
+     *
+     * <p>时间按 {@link PlaybackPolicy#WATCHDOG_INTERVAL_MS} 一跳；每次判定
+     * 「该重连」就重连一次，并把位置拉回 0（重连的语义就是从头再放）。
+     *
+     * @param useEndOfStreamRule true = 带片尾判据（新）；false = 只有卡死判据（旧）
+     * @return 在 maxRounds 拍内重连了多少次。
+     *         <b>旧判据下它随 maxRounds 一起涨</b> —— 那正是「永远不会停」的定义：
+     *         每 20 秒重连一次、每次都从 0 再放一遍，没有一个时刻会收手。
+     */
+    static int simulateNoCompletionLoop(boolean useEndOfStreamRule, int maxRounds) {
+        final int durationMs = 205000;
+        final long endPosition = durationMs - 100;   // 真机冻结点：204900
+        long pos = 0L;
+        long lastProgressAt = 0L;
+        long now = 0L;
+        int reconnectCount = 0;
+
+        for (int round = 0; round < maxRounds; round++) {
+            now += PlaybackPolicy.WATCHDOG_INTERVAL_MS;
+            long next = Math.min(pos + PlaybackPolicy.WATCHDOG_INTERVAL_MS, endPosition);
+            if (next != pos) {
+                pos = next;                 // 还在往前走
+                lastProgressAt = now;
+                continue;
+            }
+            // 位置冻在片尾了 —— 两条判据从这里分岔。
+            if (useEndOfStreamRule && PlaybackPolicy.isAtEndOfStream(pos, durationMs)) {
+                return reconnectCount;      // 判成「播完」，停手
+            }
+            if (!PlaybackPolicy.isStalled(now - lastProgressAt, durationMs)) {
+                continue;                   // 还没到卡死阈值
+            }
+            reconnectCount++;
+            pos = 0L;                       // 重连 = 从头再放
+            lastProgressAt = now;
+        }
+        return reconnectCount;
     }
 }

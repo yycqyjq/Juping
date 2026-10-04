@@ -1200,10 +1200,20 @@ if resume:
     report('resume 认得 PLAY_WAIT（准备中：什么都不做）',
            'PLAY_WAIT' in resume,
            'prepare 完成时本来就会 start()，这里再插一脚只会把准备中的实例掐掉')
+    report('resume 把 buildPending 真的传给了 playAction（不能恒传 false）',
+           re.search(r'playAction\([^)]*buildPending', resume) is not None,
+           '异步 release 之后有一段空窗期：player==null 且 preparing==false。'
+           'buildPending 恒传 false 就等于把这一格永远走成"重建" ——'
+           '真机实测表现为一次换片源两次 release + 两次 prepare。'
+           '（与上面那条 preparing 守卫同一个模子：新参数也可能被恒量化）')
 
 report('MediaPlayerController 有 preparing 状态位',
        re.search(r'boolean\s+preparing', ctrl) is not None,
        '没有它就无法区分「准备中」与「还没开始」')
+
+report('MediaPlayerController 有 buildPending 状态位（异步释放的空窗期）',
+       re.search(r'boolean\s+buildPending', ctrl) is not None,
+       '没有它就无法区分「上一个实例正在后台释放、新的还没建」与「压根没有实例」')
 
 si = body_of(ctrl, 'private void startInternal()')
 report('startInternal 方法体已找到', si is not None, '锚点：private void startInternal()')
@@ -1211,6 +1221,21 @@ if si:
     report('startInternal 在 prepareAsync 之前置 preparing',
            re.search(r'preparing\s*=\s*true', si) is not None,
            '不置位的话，prepare 期间的 Play 会走进"重建"分支')
+    # 「上一次建实例还在路上」—— 必须**在方法最前面**早退，且真的 return。
+    # 位置也要钉：放到 releasePlayer() 之后就晚了（那时已经又释放了一次）。
+    bp = si.find('buildPending')
+    rp = si.find('releasePlayer(')
+    report('startInternal 开头对 buildPending 早退（真的 return）',
+           bp >= 0 and rp >= 0 and bp < rp
+                   and re.search(r'if\s*\(\s*buildPending\s*\)[\s\S]{0,600}?return\s*;',
+                                 si) is not None,
+           '不早退的话，异步释放的空窗期里 Play 会再建一次实例、把刚建好的那个'
+           '又拆掉 —— 换片源两次 release + 两次 prepare。而早退必须发生在'
+           'releasePlayer() 之前：放到后面等于又释放了一遍才返回')
+    report('startInternal 区分「正在建」与「栈已死」两种空窗期',
+           re.search(r'if\s*\(\s*releaseStuckReported\s*\)', si) is not None,
+           '栈已死时 release 永不返回、不会有回调 —— 还打「并入它的回调」就是句'
+           '空话，而这条日志正是排障时唯一能看到的线索（日志说谎比不写更糟）')
 
 prep = body_of(ctrl, 'new MediaPlayer.OnPreparedListener()')
 report('OnPreparedListener 匿名类体已找到', prep is not None,
@@ -1521,10 +1546,19 @@ if ib:
 # 这一组守卫守的是「判据还在、接线还没断」：把判据删掉、把重连换成直接报停、
 # 或把判据挪到 notifyState("STOPPED") 之后，编译运行全都正常，
 # 只是「首次 Set 即 STOPPED」悄悄回来。
-oc = body_of(ctrl, 'new MediaPlayer.OnCompletionListener()')
-report('OnCompletionListener 匿名类体已找到', oc is not None,
-       '锚点：new MediaPlayer.OnCompletionListener()')
+oc = body_of(ctrl, 'private void handleCompletion(MediaPlayer mp)')
+report('handleCompletion（播完的唯一处置点）已找到', oc is not None,
+       '锚点：private void handleCompletion(MediaPlayer mp)')
 if oc:
+    report('onCompletion 监听器只是转调 handleCompletion（入口不许分叉）',
+           'handleCompletion(mp)' in (body_of(ctrl, 'new MediaPlayer.OnCompletionListener()') or ''),
+           '两个入口各写一份处置的话，「续播接棒 / 假 EOS 甄别 / STOPPED 上报」'
+           '迟早会走岔 —— 而"播完了"只有一个含义')
+    stall_body = body_of(ctrl, 'private void checkStall()') or ''
+    report('看门狗在片尾走同一条处置（厂商不送播完回调时的自救）',
+           'isAtEndOfStream(' in stall_body and 'handleCompletion(player)' in stall_body,
+           '片尾判据只记日志、不处置的话，位置会一直冻在片尾，控制点永远收不到 '
+           'STOPPED，用户看到的是一块定格画面 —— 真机 B站 1080P 就是这个现象')
     report('onCompletion 校验过期实例（mp != player）',
            re.search(r'mp\s*!=\s*player', oc) is not None,
            '重连 / 换片 / 续播都会重建实例，老实例的回调可能在新实例开工之后才到 —— '
@@ -1930,11 +1964,12 @@ if pl:
     report('play 里调用了幂等判定（PlaybackPolicy.shouldRebuild）',
            'PlaybackPolicy.shouldRebuild(' in pl,
            '不判幂等的话，控制点重发同一个地址就会被当成"换片源"')
-    report('幂等判定传了地址与播放器状态两组参数',
+    report('幂等判定传了地址、播放器状态与"正在建"三组参数',
            re.search(r'shouldRebuild\(\s*url\s*,\s*currentUrl\s*,'
-                     r'\s*prepared\s*,\s*preparing\s*\)', pl) is not None,
+                     r'\s*prepared\s*,\s*preparing\s*,\s*buildPending\s*\)', pl) is not None,
            '只比 URL 不比状态的话，出错停掉的播放器会再也重建不起来 ——'
-           '重发同地址就彻底救不回来了。四个参数缺一不可')
+           '重发同地址就彻底救不回来了。而漏掉 buildPending（异步释放的空窗期）'
+           '会让同一次换片源出现两次 release + 两次 prepare。五个参数缺一不可')
     report('幂等判定取反使用（判据给 false 时才拦）',
            re.search(r'if\s*\(\s*!\s*PlaybackPolicy\.shouldRebuild\(', pl) is not None,
            '去掉这个 ! 的话语义正好反了：同地址时反而重建、换片时反而忽略')
@@ -3629,21 +3664,62 @@ report('探针随实例重建（releasePlayer 里 stopSampler）',
                                       'private boolean releasePlayer(Runnable onReleased)'),
        '不复位的话，新实例起来后读的还是旧实例的位置 —— 进度条永远不动')
 
-# ③ native 挂起时释放必须挪到后台：否则 ANR 只是从 ticker 搬到「重建播放器」
+# ③ native release() 一律交给后台线程：持锁同步调 native = ANR + 控制指令排队
+#
+# 2026-10-04 真机 ANR 转储（pid 4424 / 1718）定案：厂商栈对「DPB 溢出、硬件已放弃
+# 视频解码」那路流，MediaPlayer.release() 会**永久挂起**（到进程被杀都没返回）。
+# 而 releasePlayer() 是被 play()（synchronized）/ stop() / release() 调的 ——
+# 同步释放 = 调用方持着控制器实例锁去等一个不返回的 native 调用：
+# 控制点看到「投上了但一直加载中」，主线程一按键就 ANR。
+# 原来只有「探针挂起」才走后台，覆盖不到 release 自己挂起。
 rlp = body_of(ctrl, 'private boolean releasePlayer(Runnable onReleased)')
-report('releasePlayer 有「native 已挂起」分支', rlp is not None and 'isProbeWedged()' in rlp,
-       '少了它，release() 会排在挂起的 seek 后面 —— 主线程一碰又是 ANR')
-report('挂起分支把 release 交给后台线程，完成后回主线程继续',
+report('releasePlayer 把 release 交给后台线程，完成后回主线程继续',
        rlp is not None and 'new Thread(' in rlp and 'handler.post(onReleased)' in rlp,
-       '主线程不能等：等的就是那次不返回的 native 调用')
-report('挂起分支在同步释放之前就 return（同步路径不得继续走）',
+       '调用方（HTTP 线程 / 主线程）不能等：等的就是那次不返回的 native 调用')
+report('releasePlayer 在交出后台线程之前不调 native release',
+       rlp is not None and '.release()' not in rlp.split('new Thread(')[0],
+       '这条才是真正的不变量：调用方（play() 是 synchronized，HTTP 线程 / 主线程都在）'
+       '持着控制器实例锁 —— 前面一旦出现 native release，锁就被一个可能永不返回的'
+       '调用占住，后续控制指令全部排队、主线程一按键就 ANR（真机 ANR 转储定案）')
+report('releasePlayer 在启动后台线程之后就 return false（调用方一律等回调）',
        rlp is not None and re.search(
-           r'if \(wedged\)[\s\S]*?t\.start\(\)[\s\S]*?return false;', rlp) is not None,
-       '两条路都往下走的话，旧实例被释放两次')
+           r't\.start\(\);[\s\S]*?return false;\s*\}\s*$', rlp) is not None,
+       '这里再往下走的话，旧实例还没释放完就 new MediaPlayer() —— '
+       'teardown 落到新实例的 prepareAsync 头上（蓝屏 F1 那个竞态）')
+report('releasePlayer 不再依赖探针挂起判据（release 自己挂起也必须走后台）',
+       rlp is not None and 'isProbeWedged()' not in re.sub(
+           r'//[^\n]*', '', re.sub(r'/\*[\s\S]*?\*/', '', rlp)),
+       '探针判据看的是采样超时，覆盖不到「release 自己挂起」—— '
+       'ANR 转储里卡住的正是 _release(Native Method)，而当时探针是好的。'
+       '（判据前先剥注释：方法里有一段注释正是在解释「为什么不再依赖它」，'
+       '不剥的话「不用 X」会被读成「用了 X」—— 同 strip_comments 的说明）')
+report('releasePlayer 挂上「释放挂死」判定看门狗',
+       rlp is not None and 'handler.postDelayed(releaseStuckWatchdog' in rlp,
+       '后台释放不返回时必须有人如实上报，否则控制点永远停在「加载中」。'
+       '判据钉在 postDelayed 上而不是标识符上 —— 只留 removeCallbacks 的话，'
+       '看门狗从没被排期，标识符还在、守卫照样绿')
 report('startInternal 尊重「释放已改到后台」的返回值',
        'if (!releasePlayer(' in ctrl,
        '不尊重的话，旧实例还没释放完就 new MediaPlayer() —— '
        'teardown 落到新实例的 prepareAsync 头上（蓝屏 F1 那个竞态）')
+rlp_nc = re.sub(r'//[^\n]*', '', re.sub(r'/\*[\s\S]*?\*/', '', rlp)) if rlp else ''
+report('releasePlayer 标出「建实例在路上」的空窗期（buildPending = 有回调）',
+       re.search(r'buildPending\s*=\s*\(\s*onReleased\s*!=\s*null\s*\)', rlp_nc) is not None,
+       '有回调 = 释放完成后要接着建实例。不标出来的话，这段空窗期'
+       '（player==null 且 preparing==false）与「压根没有实例」无法区分 —— '
+       'Play 必然落进来再建一次（真机实测两次 release + 两次 prepare）。'
+       '判据钉在赋值本身而不是标识符上：方法里那句注释正好写着「见 buildPending」，'
+       '只查标识符的话注释就能把守卫喂饱（同上面 isProbeWedged 那条的坑）')
+# 回调是在 startInternal 里构造后传给 releasePlayer 的，所以判据落在 startInternal 上。
+# 本块没有 strip_comments，这里就地剥一次注释：回调上方那段注释里正好写着
+# 「必须在 startInternal() 之前清」，不剥的话这句注释就能把守卫喂饱
+# （同上面 isProbeWedged 那条的坑）。
+si726 = body_of(ctrl, 'private void startInternal()')
+si726 = re.sub(r'//[^\n]*', '', re.sub(r'/\*[\s\S]*?\*/', '', si726)) if si726 else ''
+report('释放回调在 startInternal 之前清 buildPending',
+       re.search(r'buildPending\s*=\s*false[\s\S]{0,400}?startInternal\(\)', si726) is not None,
+       '回调不清标志的话，它里面的 startInternal() 会被自己刚挂的那道早退挡回来 —— '
+       '卡在「正在建」的状态里，永远建不出实例')
 
 # ④ seek 落地看门狗：超时后重建，判据收在 PlaybackPolicy
 cs = body_of(ctrl, 'private void checkStall()')
@@ -3677,6 +3753,9 @@ report('resume 在 native 挂起时不下发',
 report('挂起阈值与采样间隔定义在 PlaybackPolicy',
        'NATIVE_PROBE_STUCK_MS' in pol and 'POSITION_SAMPLE_INTERVAL_MS' in pol,
        '写死在控制器里就没法在桌面上把边界跑一遍')
+report('「释放挂死」阈值与分类也定义在 PlaybackPolicy',
+       'RELEASE_STUCK_MS' in pol and 'ERR_PLAYER_DEAD' in pol,
+       '这条判据是拿真机 ANR 换来的，边界（15s）必须在桌面上可断言')
 
 # ⑦ 界面层不得自己绕过控制器去读 native
 report('MainActivity 读进度只经 service.getPlayer()（不自己 new 播放器）',

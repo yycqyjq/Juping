@@ -102,6 +102,86 @@ public class MediaPlayerController {
     private Listener listener;
 
     /**
+     * 后台释放开始的时刻（0 = 当前没有在飞的释放）。
+     *
+     * <p>由调用线程在**启动后台线程之前**写上，由后台线程在 {@code release()}
+     * 返回之后清掉。挂死时它就一直留着 —— 那正是判定器要的信号。
+     *
+     * <p>同一时刻最多只有一次在飞的释放：{@code player} 在交给后台线程之前
+     * 就被置空了，后来的 {@code releasePlayer()} 走 {@code player == null}
+     * 那条早退分支，不会再起第二个。
+     */
+    private volatile long releaseStartedAtMs = 0L;
+
+    /** 这一轮后台释放是否已经判定为「厂商栈挂死」并上报过 —— 防每拍重复上报。 */
+    private volatile boolean releaseStuckReported = false;
+
+    /**
+     * 有实例正在后台释放、新实例还没建出来 —— 也就是「这次建实例还在路上」。
+     *
+     * <p>native 的 {@code release()} 一律交给后台线程之后（见
+     * {@link #releasePlayer}），建实例不再发生在调用方那一条语句里，而是等
+     * 释放线程回主线程跑回调。这段空窗期里 {@code player == null} 且
+     * {@code preparing == false}，与「根本没有实例、该建一个」长得一模一样 ——
+     * 于是 {@code Play}（与 SetAVTransportURI 只隔几十毫秒）会判成
+     * 「该建实例」，把刚建好、正在 prepare 的那个又拆了重建。
+     *
+     * <p>真机 2026-10-04 实测：一次换片源出现**两次 release + 两次 prepare**。
+     * 这个标志就是为了把那段空窗期标出来，让重复的建实例请求并入在飞的这一次。
+     *
+     * <p>只有「释放完成后会回来续跑」（{@code onReleased != null}）才算数 ——
+     * Stop / 退出路径没有后续动作，不该被它挡住。
+     */
+    private volatile boolean buildPending = false;
+
+    /**
+     * 「后台释放卡死」的判定器。
+     *
+     * <p>只做一件事：到点还没等到 {@code release()} 回来，就**如实上报一次**。
+     *
+     * <p><b>刻意不在这里做任何恢复动作</b>（重建实例 / 重启进程）：
+     * 旧实例的 native 释放还占着厂商那套资源，赌「再建一个就能绕过」
+     * 是拿竞态换概率 —— 这个项目已经在 {@code reset()} 的跨实例竞态上
+     * 吃过一次亏（视频蓝屏 F1）。所以这里只负责「说清楚发生了什么」：
+     * 用户看到错误提示、控制点不再转圈、日志里留下判据。
+     *
+     * <p>恢复手段只有**重新启动应用**：旧实例的 native 释放还占着厂商那套资源，
+     * 再建新实例只是排在同一个坑后面（这也是这里不自动重启进程的原因 ——
+     * 那是有用户可见代价的决定，得由人拍）。
+     */
+    private final Runnable releaseStuckWatchdog = new Runnable() {
+        @Override
+        public void run() {
+            long started = releaseStartedAtMs;
+            if (started == 0L || releaseStuckReported) {
+                return;
+            }
+            long waited = System.currentTimeMillis() - started;
+            if (!PlaybackPolicy.isReleaseStuck(waited)) {
+                // 还没到点 —— 再排一次补足剩下的时间（不按固定周期轮询，
+                // 免得阈值改了之后实际判定时间跟着漂）。
+                handler.postDelayed(this, PlaybackPolicy.RELEASE_STUCK_MS - waited);
+                return;
+            }
+            releaseStuckReported = true;
+            Log.e(TAG, "厂商 MediaPlayer.release() 已挂起 " + waited + "ms 仍未返回"
+                    + " —— 判定播放器栈已死：这一路播放无法继续，后续投屏也会被并入"
+                    + "这次永不返回的释放（不重复建实例，免得再踩同一个 native 锁）。"
+                    + "服务本身还活着（遥控器不再 ANR），恢复手段是重新启动应用");
+            if (listener != null) {
+                listener.onError(PlaybackPolicy.ERR_PLAYER_DEAD,
+                        "release() 挂起 " + waited + "ms 未返回");
+            }
+            // 让控制点别再转圈：这一路播放到此为止。
+            //
+            // 走 "ERROR" 而不是 "STOPPED" —— 服务层把 ERROR 也映射成
+            // TransportState=STOPPED，但语义上「出错停的」和「用户停的」
+            // 不是一回事，日志里要能一眼分开。
+            notifyState("ERROR");
+        }
+    };
+
+    /**
      * 只用于 {@code MediaPlayer.setWakeMode()}。
      *
      * <p>持有的是 Service 自身，生命周期与这个控制器完全一致，不会泄漏。
@@ -273,6 +353,19 @@ public class MediaPlayerController {
     private volatile long playStartedAtMs;
 
     /**
+     * 「这一轮播放已经到片尾了」—— 看门狗补判出来的播完，防止它每拍重报一次。
+     *
+     * <p>为什么需要这个闩锁：厂商栈对一部分流不送 {@code onCompletion}
+     * （见 {@link PlaybackPolicy#isAtEndOfStream}），所以看门狗得替它判。
+     * 但片尾的位置是**冻住不动的** —— 判完之后下一拍（5 秒后）看到的是同一个
+     * 位置，会再判一次、再报一次 STOPPED，日志和控制点都被刷。
+     *
+     * <p>清除时机只有一个：位置真的动了（换片源、用户拖走、重连成功）。
+     * 也就是说它表达的是「当前位置处在本轮的片尾」，而不是「这一轮播过了」。
+     */
+    private volatile boolean reachedEndOfStream;
+
+    /**
      * 最后一次从播放器读到的有效位置，给「未就绪期间」兜底用。
      *
      * <p>重连会释放播放器，那段时间 {@code getCurrentPosition()} 读不到东西。
@@ -419,7 +512,7 @@ public class MediaPlayerController {
         // 判定本身抽到了 PlaybackPolicy.shouldRebuild —— 那边是纯逻辑，
         // 「同地址 × 各种播放器状态」的组合能在桌面上逐个跑断言，
         // 而不是只能靠在真机上一遍遍试。
-        if (!PlaybackPolicy.shouldRebuild(url, currentUrl, prepared, preparing)) {
+        if (!PlaybackPolicy.shouldRebuild(url, currentUrl, prepared, preparing, buildPending)) {
             Log.i(TAG, "收到与当前相同的地址，幂等忽略（不重建播放器）");
             return false;
         }
@@ -432,6 +525,10 @@ public class MediaPlayerController {
         clearAspectUnless(url);
         retryCount = 0;
         stallCount = 0;
+        // 「已在片尾」同理作废：新片子还没播，谈不上片尾。
+        // 不清的话，投一部新片而它的首拍位置恰好也在片尾附近时，
+        // 会被上一部的闩锁顶掉、少判一次。
+        reachedEndOfStream = false;
         userPaused = false;
         // 换了片源，上一次的 seek 目标立刻作废 ——
         // 不清的话，新片子的「当前位置」会先报成上一部片子拖到的进度。
@@ -457,12 +554,36 @@ public class MediaPlayerController {
     }
 
     private void startInternal() {
+        // ---- 「上一次建实例还在路上」：并入那一次，不重复建 ----
+        //
+        // 异步释放之后，从「开始释放」到「回调里 new MediaPlayer()」之间有一段空窗期，
+        // 期间 player == null、preparing == false —— 与「没有实例、该建一个」无法区分。
+        // 控制点是 SetAVTransportURI + Play 连着发的（隔几十毫秒），Play 必然落进
+        // 这段空窗期，于是会再建一次、把刚建好的那个又拆掉（真机实测两次 release
+        // + 两次 prepare）。这里直接早退：currentUrl 已经在 play() 里更新过，
+        // 在飞的那次回调会用**最新**的地址去建，语义上完全等价。
+        if (buildPending) {
+            // 两种情形都会走到这里，必须分开说 —— 否则日志会说谎：
+            //   ① 释放正常进行中：回调会来，它会用**最新**的 currentUrl 建实例；
+            //   ② 释放已判定永不返回（releaseStuckReported）：不会有任何回调，
+            //      「并入它的回调」是句空话，真实含义是「这一路及后续投屏都不受理了」。
+            if (releaseStuckReported) {
+                Log.w(TAG, "播放器栈已死（release 永不返回），本次投屏不受理"
+                        + " —— 恢复手段是重新启动应用");
+            } else {
+                Log.i(TAG, "上一次建实例还在路上，本次并入它的回调（不重复建播放器）");
+            }
+            return;
+        }
         // 释放可能被挪到后台线程（native 已挂起时）—— 那种情况下**先返回**，
         // 等释放完成再由回调重新进来。不能在这里同步等：等的就是那次挂起的 native。
         // 重新进来时 player 已是 null，releasePlayer 立刻返回 true，正常往下走。
         if (!releasePlayer(new Runnable() {
             @Override
             public void run() {
+                // 释放回来了，「建实例还在路上」这段空窗期到此结束 ——
+                // 必须在 startInternal() 之前清，否则会被上面那道早退挡回来。
+                buildPending = false;
                 // 后台释放完成 —— 世界可能已经变了（用户暂停了、停止投屏了），
                 // 与 pendingRetry 的回调同一条纪律：条件不成立就不再起播。
                 if (!userPaused && currentUrl != null) {
@@ -520,8 +641,14 @@ public class MediaPlayerController {
             player.setDataSource(playUrl);
             // 取证（视频蓝屏 F1/F3 决策）：setDataSource 完成时刻 —— 与
             // 「释放播放器: release 结束」的时差就是 teardown→prepare 的实际间隔。
+            //
+            // lastReleaseAtMs == 0 表示**本次进程还从没释放过播放器**（冷投的第一部）。
+            // 这时不能拿 0 当基准相减：那会打出「距释放 1791076172236ms」这种
+            // 17 亿毫秒的垃圾，把真正有用的那条时间线搅浑。
             Log.i(TAG, "setDataSource 完成: t=" + prepareStartedAt
-                    + "，距释放 " + (prepareStartedAt - lastReleaseAtMs) + "ms");
+                    + "，距释放 " + (lastReleaseAtMs == 0
+                            ? "（本次进程尚未释放过）"
+                            : (prepareStartedAt - lastReleaseAtMs) + "ms"));
             // 起播的同时异步探一下直连 MP4 的真实宽高（软件信箱用）。
             // 探测只对非 m3u8 地址有意义 —— 这里不重复挡 m3u8，交给
             // VideoAspectProbe.probe 自己挡（红线只留一处，免得两处判据漂移）。
@@ -542,6 +669,10 @@ public class MediaPlayerController {
                     // 一清就等于熔断永不触发，变成无限重连。
                     retryCount = 0;
                     lastPosition = -1L;
+                    // 新的一轮播放从 prepare 完成算起 —— 「已在片尾」这个闩锁
+                    // 必须跟着复位，否则重连出来的新实例会在片尾判据上被
+                    // 上一轮的状态顶掉（见字段说明）。
+                    reachedEndOfStream = false;
                     lastProgressAt = System.currentTimeMillis();
                     // 起播时刻与 lastProgressAt 同源取一次。之后 lastProgressAt 会被
                     // 位置前进反复刷新，这个起点不动 —— 见字段说明与 checkStall 的判据。
@@ -621,108 +752,7 @@ public class MediaPlayerController {
             player.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
                 @Override
                 public void onCompletion(MediaPlayer mp) {
-                    // 取证：每一次「播完」回调都把判据的输入留下来。
-                    //
-                    // 没有这一行，「判据为什么不触发」事后完全无法回溯 —— 真机踩到过：
-                    // 一次 4 分钟 prepare 卡死之后等来的 EOS，日志里只剩一句
-                    // 「播放状态: STOPPED」，preparing / 已观察位置 / duration
-                    // 当时各是什么值，全无从查起。
-                    //
-                    // 刻意放在**过期实例校验之前**：被丢弃的过期回调同样是静默的，
-                    // 而"这次播完为什么被丢掉"恰恰是要查的问题之一。
-                    long sinceStart = System.currentTimeMillis() - prepareStartedAt;
-                    int dur = getDuration();
-                    Log.i(TAG, "播完回调：过期实例=" + (mp != player)
-                            + "，preparing=" + preparing + "，prepared=" + prepared
-                            + "，userPaused=" + userPaused + "，已观察最远位置=" + maxPlayedMs
-                            + "ms，时长=" + dur + "ms，起播至今=" + sinceStart + "ms");
-                    // 过期实例的「播完」一概忽略：重连 / 换片 / 续播都会重建实例，
-                    // 而老实例的回调可能在新实例已经开工之后才到 —— 照单全收
-                    // 会把刚起来的播放报成 STOPPED。与 scheduleVideoRecheck /
-                    // scheduleContentTypeProbe 是同一条纪律。
-                    if (mp != player) {
-                        return;
-                    }
-                    // 播放列表续播：SetNextAVTransportURI 预告过的下一曲在这里接棒。
-                    // 必须抛到下一轮消息循环再重建播放器 —— 在播放器自己的
-                    // onCompletion 回调里 release 它自己，老平台上有崩溃先例。
-                    if (nextUrl != null && nextUrl.length() > 0 && !userPaused) {
-                        final String u = nextUrl;
-                        final String m = nextMetadata;
-                        nextUrl = null;
-                        nextMetadata = null;
-                        Log.i(TAG, "当前曲目播完，自动续播下一曲: " + u);
-                        notifyState("TRANSITIONING");
-                        // 切源 + 重建放**后台线程**：与 onSetUri 的 HTTP 线程模式
-                        // 一致，且避免厂商播放器的 setDataSource 在主线程上卡住
-                        // 时把整个应用冻住（手机端表现为永久「加载中」）。
-                        // 此刻已不在 onCompletion 回调栈里，release 旧实例安全。
-                        new Thread(new Runnable() {
-                            @Override
-                            public void run() {
-                                currentUrl = u;
-                                // 续播绕过了 play()（不经 SOAP、不重进那条幂等判定），
-                                // 但「换片源清宽高账」这一步**不能跟着被绕过**：
-                                // 视频→视频续播时不清账，新片探完之前会拿着上一部
-                                // 的宽高摆信箱 —— 黑边方向直接错（QA 复审②）。
-                                clearAspectUnless(u);
-                                startInternal();
-                                if (listener != null) {
-                                    listener.onSourceChanged(u, m);
-                                }
-                            }
-                        }, "auto-advance").start();
-                        return;
-                    }
-                    // ---- 「假 EOS」判据 ----
-                    //
-                    // 厂商栈会把「释放旧播放器资源」和「切换输入源」规范化成一次
-                    // EOS（日志原文 "This is adt event,the Normal event type is EOS!!!"），
-                    // 框架据此回调到这里。真机 8 次实测，每次都在起播后 1 秒内，
-                    // 最典型的是「投完视频再投音频，首次 Set 直接变 STOPPED」——
-                    // 手机显示投上了，电视其实已经停了。
-                    //
-                    // 判据与阈值全在 PlaybackPolicy（纯逻辑，桌面上有断言）。
-                    // 放在续播分支**之后**：有下一曲时照常接棒，既有行为不变。
-                    if (!userPaused
-                            && PlaybackPolicy.isSpuriousCompletion(preparing, sinceStart,
-                                    maxPlayedMs, dur)) {
-                        Log.w(TAG, "收到疑似假 EOS（厂商层把「释放旧资源 / 切输入源」"
-                                + "当成了播完）：preparing=" + preparing + "，已观察最远位置 "
-                                + maxPlayedMs + "ms / 时长 " + dur + "ms，起播至今 "
-                                + sinceStart + "ms —— 重建播放器，不报 STOPPED");
-                        // 重建要走 releasePlayer()，而那里会把 pendingSeekMs 清掉 ——
-                        // 用户刚拖的那一次 seek 就被这一次假 EOS 吃掉了（真机：Seek 下发
-                        // 113ms 后就来假 EOS，重建完位置回到 0，手机上看就是「拖了没反应」；
-                        // 后面几首偶尔不触发假 EOS，于是"切到后面几首又可以了"）。
-                        // 记到 seekAfterRebuildMs 上：它能扛过 releasePlayer，
-                        // 由 onPrepared 补发。
-                        //
-                        // **但补发必须有上限**：厂商栈对个别文件会直接拒绝 seek
-                        // （真机：秋殇 mp3 → Failed / MTK ret -6），补发过去照样失败、
-                        // 照样来假 EOS。没有上限就是「重建 → 补发 → 又失败 → 又重建」
-                        // 的死循环（真机连续 51 轮）。补发够次数仍失败，就认定这个
-                        // seek 厂商做不到：丢掉它照常播放，不再谎报那个到不了的位置。
-                        if (pendingSeekMs >= 0) {
-                            if (PlaybackPolicy.canReplaySeekAfterRebuild(seekReplayCount)) {
-                                seekAfterRebuildMs = pendingSeekMs;
-                                seekReplayCount++;
-                                Log.w(TAG, "把这次 seek " + pendingSeekMs + "ms 存下来，"
-                                        + "等重建后补发（第 " + seekReplayCount + " 次）");
-                            } else {
-                                Log.w(TAG, "seek " + pendingSeekMs + "ms 重建后补发仍失败，"
-                                        + "放弃该 seek（不再重建），按真实位置继续播放");
-                                seekAfterRebuildMs = -1L;
-                                pendingSeekMs = -1L;
-                                pendingSeekLanded = false;
-                                hiRaw = -1;
-                                hiWall = 0;
-                            }
-                        }
-                        scheduleRetry();
-                        return;
-                    }
-                    notifyState("STOPPED");
+                    handleCompletion(mp);
                 }
             });
 
@@ -1150,6 +1180,123 @@ public class MediaPlayerController {
         play(url);
     }
 
+
+    /**
+     * 「播完了」的**唯一处置点**。
+     *
+     * <p><b>两个入口共用它</b>：① 厂商送来的 {@code onCompletion}；
+     * ② 看门狗在片尾补判的 —— 厂商栈对一部分流**根本不送播完回调**
+     * （真机 B站 1080P：位置走到 205s，一次播完回调都没有），
+     * 判据见 {@link PlaybackPolicy#isAtEndOfStream}。
+     *
+     * <p>刻意合成一处：这里面有 nextUrl 接棒、假 EOS 甄别、STOPPED 上报三件事，
+     * 拆成两份迟早会走岔 —— 而"播完了"这件事本来就只有一个含义。
+     */
+    private void handleCompletion(MediaPlayer mp) {
+        // 取证：每一次「播完」回调都把判据的输入留下来。
+        //
+        // 没有这一行，「判据为什么不触发」事后完全无法回溯 —— 真机踩到过：
+        // 一次 4 分钟 prepare 卡死之后等来的 EOS，日志里只剩一句
+        // 「播放状态: STOPPED」，preparing / 已观察位置 / duration
+        // 当时各是什么值，全无从查起。
+        //
+        // 刻意放在**过期实例校验之前**：被丢弃的过期回调同样是静默的，
+        // 而"这次播完为什么被丢掉"恰恰是要查的问题之一。
+        long sinceStart = System.currentTimeMillis() - prepareStartedAt;
+        int dur = getDuration();
+        Log.i(TAG, "播完回调：过期实例=" + (mp != player)
+                + "，preparing=" + preparing + "，prepared=" + prepared
+                + "，userPaused=" + userPaused + "，已观察最远位置=" + maxPlayedMs
+                + "ms，时长=" + dur + "ms，起播至今=" + sinceStart + "ms");
+        // 过期实例的「播完」一概忽略：重连 / 换片 / 续播都会重建实例，
+        // 而老实例的回调可能在新实例已经开工之后才到 —— 照单全收
+        // 会把刚起来的播放报成 STOPPED。与 scheduleVideoRecheck /
+        // scheduleContentTypeProbe 是同一条纪律。
+        if (mp != player) {
+            return;
+        }
+        // 播放列表续播：SetNextAVTransportURI 预告过的下一曲在这里接棒。
+        // 必须抛到下一轮消息循环再重建播放器 —— 在播放器自己的
+        // onCompletion 回调里 release 它自己，老平台上有崩溃先例。
+        if (nextUrl != null && nextUrl.length() > 0 && !userPaused) {
+            final String u = nextUrl;
+            final String m = nextMetadata;
+            nextUrl = null;
+            nextMetadata = null;
+            Log.i(TAG, "当前曲目播完，自动续播下一曲: " + u);
+            notifyState("TRANSITIONING");
+            // 切源 + 重建放**后台线程**：与 onSetUri 的 HTTP 线程模式
+            // 一致，且避免厂商播放器的 setDataSource 在主线程上卡住
+            // 时把整个应用冻住（手机端表现为永久「加载中」）。
+            // 此刻已不在 onCompletion 回调栈里，release 旧实例安全。
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    currentUrl = u;
+                    // 续播绕过了 play()（不经 SOAP、不重进那条幂等判定），
+                    // 但「换片源清宽高账」这一步**不能跟着被绕过**：
+                    // 视频→视频续播时不清账，新片探完之前会拿着上一部
+                    // 的宽高摆信箱 —— 黑边方向直接错（QA 复审②）。
+                    clearAspectUnless(u);
+                    startInternal();
+                    if (listener != null) {
+                        listener.onSourceChanged(u, m);
+                    }
+                }
+            }, "auto-advance").start();
+            return;
+        }
+        // ---- 「假 EOS」判据 ----
+        //
+        // 厂商栈会把「释放旧播放器资源」和「切换输入源」规范化成一次
+        // EOS（日志原文 "This is adt event,the Normal event type is EOS!!!"），
+        // 框架据此回调到这里。真机 8 次实测，每次都在起播后 1 秒内，
+        // 最典型的是「投完视频再投音频，首次 Set 直接变 STOPPED」——
+        // 手机显示投上了，电视其实已经停了。
+        //
+        // 判据与阈值全在 PlaybackPolicy（纯逻辑，桌面上有断言）。
+        // 放在续播分支**之后**：有下一曲时照常接棒，既有行为不变。
+        if (!userPaused
+                && PlaybackPolicy.isSpuriousCompletion(preparing, sinceStart,
+                        maxPlayedMs, dur)) {
+            Log.w(TAG, "收到疑似假 EOS（厂商层把「释放旧资源 / 切输入源」"
+                    + "当成了播完）：preparing=" + preparing + "，已观察最远位置 "
+                    + maxPlayedMs + "ms / 时长 " + dur + "ms，起播至今 "
+                    + sinceStart + "ms —— 重建播放器，不报 STOPPED");
+            // 重建要走 releasePlayer()，而那里会把 pendingSeekMs 清掉 ——
+            // 用户刚拖的那一次 seek 就被这一次假 EOS 吃掉了（真机：Seek 下发
+            // 113ms 后就来假 EOS，重建完位置回到 0，手机上看就是「拖了没反应」；
+            // 后面几首偶尔不触发假 EOS，于是"切到后面几首又可以了"）。
+            // 记到 seekAfterRebuildMs 上：它能扛过 releasePlayer，
+            // 由 onPrepared 补发。
+            //
+            // **但补发必须有上限**：厂商栈对个别文件会直接拒绝 seek
+            // （真机：秋殇 mp3 → Failed / MTK ret -6），补发过去照样失败、
+            // 照样来假 EOS。没有上限就是「重建 → 补发 → 又失败 → 又重建」
+            // 的死循环（真机连续 51 轮）。补发够次数仍失败，就认定这个
+            // seek 厂商做不到：丢掉它照常播放，不再谎报那个到不了的位置。
+            if (pendingSeekMs >= 0) {
+                if (PlaybackPolicy.canReplaySeekAfterRebuild(seekReplayCount)) {
+                    seekAfterRebuildMs = pendingSeekMs;
+                    seekReplayCount++;
+                    Log.w(TAG, "把这次 seek " + pendingSeekMs + "ms 存下来，"
+                            + "等重建后补发（第 " + seekReplayCount + " 次）");
+                } else {
+                    Log.w(TAG, "seek " + pendingSeekMs + "ms 重建后补发仍失败，"
+                            + "放弃该 seek（不再重建），按真实位置继续播放");
+                    seekAfterRebuildMs = -1L;
+                    pendingSeekMs = -1L;
+                    pendingSeekLanded = false;
+                    hiRaw = -1;
+                    hiWall = 0;
+                }
+            }
+            scheduleRetry();
+            return;
+        }
+        notifyState("STOPPED");
+    }
+
     /**
      * 看门狗：检测「没报错但也不走了」的假死状态。
      *
@@ -1239,11 +1386,32 @@ public class MediaPlayerController {
                 // 放在 onPrepared 里会让「能 prepare 但立刻卡死」的流永远清空计数，
                 // 熔断失效、无限重连（PlaybackPolicy 里有详细说明）。
                 stallCount = 0;
+                // 「已在片尾」同理作废：位置离开了片尾（用户拖回去了、或者
+                // 重连之后从头开始），下一轮就该按正常判据走。
+                reachedEndOfStream = false;
                 return;
             }
 
             // 时长已知 → 点播流，用严格阈值；时长未知或为 0 → 直播/分段流，放宽
             int duration = cachedDurationMs;
+            // ---- 片尾 ≠ 卡死 ----
+            //
+            // 这两件事在位置上长得一模一样（都是不再前进），唯一区别是**停在哪里**。
+            // 厂商栈对一部分流不送 onCompletion，位置会一直停在片尾 ——
+            // 没有这一条，看门狗等满 20 秒就把它判成"卡死"、重连、从 0 再放一遍，
+            // 而这个循环永远不会停（每一轮都从片尾重新开始）。
+            // 真机证据：B站 1080P，位置冻在 204900ms / 时长 205000ms，20 秒后重连。
+            if (PlaybackPolicy.isAtEndOfStream(pos, duration)) {
+                if (!reachedEndOfStream) {
+                    reachedEndOfStream = true;
+                    Log.i(TAG, "位置已到片尾（位置 " + pos + "ms / 时长 " + duration
+                            + "ms），厂商没送播完回调 —— 按播完处理，不重连");
+                    // 走与真 onCompletion 同一条处置路径：续播接棒 / 假 EOS 甄别 /
+                    // STOPPED 上报。这里不自己拼一套 —— 见 handleCompletion 的注释。
+                    handleCompletion(player);
+                }
+                return;
+            }
             // 「起播了，但一直没出声」：位置从起播到现在恒为 0。
             // 与「卡死」是两件事（位置前进过 vs 从来没动过），阈值也该是两档 ——
             // 详见 PlaybackPolicy.isNotStarted。真机：秋殇 mp3 起播后位置冻在 0ms
@@ -1306,7 +1474,7 @@ public class MediaPlayerController {
     public synchronized void resume() {
         userPaused = false;
         int action = PlaybackPolicy.playAction(player != null && prepared, preparing,
-                currentUrl != null);
+                currentUrl != null, buildPending);
         if (action == PlaybackPolicy.PLAY_START) {
             // native 已挂起时不碰实例（同 pause）：start() 会排在挂起的那次 native
             // 调用后面。挂起态下"取消暂停"没有意义 —— 那个播放器已经僵住了，
@@ -1928,15 +2096,15 @@ public class MediaPlayerController {
     /**
      * 释放当前实例并清掉一切与它绑定的状态。
      *
-     * @param onReleased native 已挂起、释放被挪到后台线程时，释放完成后回主线程执行的动作；
+     * <p><b>native 的 {@code release()} 永远交给后台线程</b>，调用方立刻返回 ——
+     * 这条纪律没有例外，理由见方法体里那段注释。
+     *
+     * @param onReleased 释放完成后回主线程执行的动作（调用方靠它接着往下走）；
      *                   {@code null} = 不需要后续动作（停止 / 退出路径）。
-     *                   同步释放（正常路径）**不会**调用它 —— 调用方在返回值处继续即可。
-     * @return {@code true} = 已经彻底释放完，调用方可以继续；
-     *         {@code false} = 释放改到后台执行了，等 {@code onReleased} 回来再继续。
+     * @return {@code true} = 本来就没有实例可释放，调用方可以直接继续；
+     *         {@code false} = 释放已交给后台线程，等 {@code onReleased} 回来再继续。
      */
     private boolean releasePlayer(Runnable onReleased) {
-        // 挂起判定必须在清任何状态**之前**做：判据要的正是「当前实例上的那次采样超时」。
-        final boolean wedged = isProbeWedged();
         prepared = false;
         // 释放后 native 播放器不可再碰（任何方法调用都会触发 -38 错误回调）
         playerReleased = true;
@@ -1964,62 +2132,83 @@ public class MediaPlayerController {
         // 视频尺寸复查同理：载体（MediaPlayer 实例）没了就必须摘掉，
         // 否则过期复查会对着已释放的实例跑 —— 判定套到新片源上。
         cancelVideoRecheck();
-        if (player != null) {
-            final MediaPlayer doomed = player;
-            // 先摘引用：后台释放期间任何访问器都不该再看到这个实例
-            player = null;
-            if (wedged) {
-                // ---- native 已挂起：绝不在主线程上 release() ----
-                //
-                // release() 会排在挂起的那次 seek 后面（同一个 native 串行锁），
-                // 在主线程上调就是把 ANR 从「ticker 读位置」原样搬到「重建播放器」。
-                // 所以交给后台线程：主线程立刻返回，释放完再回主线程继续建新实例 ——
-                // 顺序没有变（新实例仍然只在旧实例释放完**之后**才创建），
-                // 变的只是"谁在等"。
-                Log.w(TAG, "native 已挂起，释放播放器改到后台线程执行（主线程不等待）");
-                Thread t = new Thread(new Runnable() {
-                    @Override
-                    public void run() {
-                        try {
-                            doomed.release();
-                        } catch (Exception e) {
-                            Log.w(TAG, "后台释放 MediaPlayer 出错", e);
-                        }
-                        lastReleaseAtMs = System.currentTimeMillis();
-                        Log.i(TAG, "释放播放器: 后台 release 结束");
-                        if (onReleased != null) {
-                            handler.post(onReleased);
-                        }
-                    }
-                }, "juping-release");
-                t.setDaemon(true);
-                t.start();
-                return false;
-            }
-            // 视频蓝屏修复 F1：这里**不再** player.reset()。
-            //
-            // 真机 A/B 日志（`.agent/video-bluescreen-plan.md` §1）定案：厂商栈
-            // （海信 CmpbPlayer / MTK）的 reset 是**异步**的（reset_nosync），
-            // 旧实例这次 teardown 会落到紧接着 new MediaPlayer() 的 prepareAsync
-            // 头上 —— mReseted 标志跨实例共享，于是新实例的 prepare 被判成
-            // "already reset" 成空操作（无回调），直到看门狗重建才出画面：
-            // 表现就是「投视频先蓝屏 30 秒」。
-            //
-            // reset() 的唯一语义是「复位实例以便复用」，而这里 player 随即置
-            // null、下一轮永远 new 一个 —— 它既多余又是竞态源头。直接 release()
-            // 是官方推荐的释放方式。取证日志量「teardown → prepare」的实际间隔。
-            long teardownAt = System.currentTimeMillis();
-            Log.i(TAG, "释放播放器: release 开始（reset 已移除）");
-            try {
-                doomed.release();
-            } catch (Exception e) {
-                Log.w(TAG, "释放 MediaPlayer 出错", e);
-            }
-            lastReleaseAtMs = System.currentTimeMillis();
-            Log.i(TAG, "释放播放器: release 结束，耗时 "
-                    + (lastReleaseAtMs - teardownAt) + "ms");
+        if (player == null) {
+            // 本来就没有实例：没什么可释放的，调用方直接往下走。
+            return true;
         }
-        return true;
+        final MediaPlayer doomed = player;
+        // 先摘引用：后台释放期间任何访问器都不该再看到这个实例
+        player = null;
+        // ---- native 的 release() 一律交给后台线程，**没有例外** ----
+        //
+        // 这条纪律是 2026-10-04 用真机 ANR 转储换来的，与 seekTo() 是同一个模子：
+        //
+        //   "upnp-conn" tid=15 NATIVE
+        //     at android.media.MediaPlayer._release(Native Method)
+        //     at b.a.B0(...)   ← 就是这里
+        //   "main" tid=1 MONITOR
+        //     - waiting to lock <...> held by tid=15 (upnp-conn)
+        //
+        // 厂商栈（海信 MTK / CmpbPlayer）对「DPB 溢出、硬件已放弃视频解码」那路流，
+        // release() 会**永久挂起**（实测 pid 4424 / 1718：到 ANR、到进程被杀都没返回）。
+        // 而 releasePlayer() 是被 play()（synchronized）/ stop() / release() 调的 ——
+        // 同步释放等于让**调用方持着控制器实例锁**去等一个不返回的 native 调用：
+        // ① 后续所有控制指令（Play / SetAVTransportURI / SetVolume）排在那把锁后面，
+        //    控制点看到「投上了但一直加载中」；
+        // ② 主线程一按键（onKeyDown 要同一把锁）立刻 ANR；
+        // ③ 系统最终杀进程。三条都在真机上实测到了。
+        //
+        // 原来只有「**探针**已挂起」（isProbeWedged()，看的是采样超时）才走后台 ——
+        // 那条判据覆盖不到「release 自己挂起」，因为 release 不经过探针。
+        // 现在无条件走后台：release 从此只可能拖住它自己那条线程。
+        //
+        // 顺序没有变：新实例仍然只在旧实例释放完**之后**才创建（由 onReleased 驱动），
+        // 变的只是"谁在等"。
+        //
+        // 视频蓝屏修复 F1：这里**不再** player.reset()。
+        //
+        // 真机 A/B 日志（`.agent/video-bluescreen-plan.md` §1）定案：厂商栈
+        // （海信 CmpbPlayer / MTK）的 reset 是**异步**的（reset_nosync），
+        // 旧实例这次 teardown 会落到紧接着 new MediaPlayer() 的 prepareAsync
+        // 头上 —— mReseted 标志跨实例共享，于是新实例的 prepare 被判成
+        // "already reset" 成空操作（无回调），直到看门狗重建才出画面：
+        // 表现就是「投视频先蓝屏 30 秒」。
+        //
+        // reset() 的唯一语义是「复位实例以便复用」，而这里 player 随即置
+        // null、下一轮永远 new 一个 —— 它既多余又是竞态源头。直接 release()
+        // 是官方推荐的释放方式。取证日志量「teardown → prepare」的实际间隔。
+        final long teardownAt = System.currentTimeMillis();
+        releaseStartedAtMs = teardownAt;
+        releaseStuckReported = false;
+        // 有回调 = 释放完成后要接着建实例 —— 把这段空窗期标出来（见 buildPending）。
+        // 没有回调（Stop / 退出）就没有后续建实例，不该挡住别的路径。
+        buildPending = (onReleased != null);
+        Log.i(TAG, "释放播放器: release 开始（后台线程，reset 已移除）");
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    doomed.release();
+                } catch (Exception e) {
+                    Log.w(TAG, "后台释放 MediaPlayer 出错", e);
+                }
+                long doneAt = System.currentTimeMillis();
+                lastReleaseAtMs = doneAt;
+                // 先清「在飞」标记再回主线程：判据读的就是它。
+                releaseStartedAtMs = 0L;
+                Log.i(TAG, "释放播放器: release 结束，耗时 " + (doneAt - teardownAt) + "ms");
+                if (onReleased != null) {
+                    handler.post(onReleased);
+                }
+            }
+        }, "juping-release");
+        t.setDaemon(true);
+        t.start();
+        // 挂一个「挂死判定」：到点还没回来就如实上报一次（见 releaseStuckWatchdog）。
+        // 排在这里而不是后台线程里 —— 后台线程正是那个可能永远不往下走的地方。
+        handler.removeCallbacks(releaseStuckWatchdog);
+        handler.postDelayed(releaseStuckWatchdog, PlaybackPolicy.RELEASE_STUCK_MS);
+        return false;
     }
 
     private void notifyState(String state) {

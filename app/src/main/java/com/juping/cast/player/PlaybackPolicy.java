@@ -269,6 +269,47 @@ public final class PlaybackPolicy {
     }
 
     /**
+     * 「位置停在片尾」的容差。
+     *
+     * <p>取 2 秒的依据是**实测的采样滞后**，不是拍脑袋 —— 两个方向的实测：
+     * <ul>
+     *   <li>本地 360P（时长 61000ms）自然播完时，厂商回调里记下的最后位置是
+     *       <b>59766ms</b>，比时长少 1234ms。位置采样本身有滞后（探针 250ms 一拍，
+     *       叠上厂商 {@code getCurrentPosition} 的内部滞后），最后一帧也未必采得到。</li>
+     *   <li>B站 1080P（时长 205000ms，厂商栈**不送播完回调**）位置冻在
+     *       <b>204900ms</b>，离时长只差 100ms。</li>
+     * </ul>
+     * 两种情形都落在 2 秒以内。
+     */
+    public static final long END_OF_STREAM_EPS_MS = 2000L;
+
+    /**
+     * 位置是不是已经停在片尾 —— 也就是「播完了」，而不是「卡死了」。
+     *
+     * <h3>为什么必须把这两件事分开</h3>
+     *
+     * <p>「播完」与「卡死」在位置上<b>长得一模一样</b>：都是位置不再前进。
+     * 唯一的区别是<b>停在哪里</b>。而厂商栈对一部分流**根本不送
+     * {@code onCompletion}** —— 真机（B站 1080P）实测：位置一路走到 205s、
+     * 一次播完回调都没有。于是看门狗等满 20 秒后把"播完"判成了"卡死"，
+     * 重连之后从 0 再放一遍：用户看到的是「播完自己跳回开头」，
+     * 而且这个循环<b>永远不会停</b>（每一轮都从片尾重新开始）。
+     *
+     * <p>判据只看「位置与时长」，不看「停了多久」：停了多久是
+     * {@link #isStalled} 的事，这里回答的是"停的地方对不对"。两件事分开，
+     * 才可能既救得回真卡死、又不误杀真播完。
+     *
+     * <p>直播流（时长未知）一律 {@code false} —— 直播没有"片尾"，
+     * 位置本来就可能在末尾附近长时间不动。
+     */
+    public static boolean isAtEndOfStream(long positionMs, int durationMs) {
+        if (isLiveStream(durationMs)) {
+            return false;
+        }
+        return positionMs >= (long) durationMs - END_OF_STREAM_EPS_MS;
+    }
+
+    /**
      * 连续卡死到这个程度就该停手了。
      *
      * <p><b>为什么必须有一个上限</b>：卡死和网络瞬断不一样，重连不一定能救回来。
@@ -322,13 +363,28 @@ public final class PlaybackPolicy {
      * @param prepared 是否已经就绪
      * @param preparing 是否正在 prepare（prepareAsync 已发、回调未到）
      * @param hasUrl 当前是否有片源地址
+     * @param building 上一个实例正在后台释放、新实例还没建出来
+     *                 （见 {@code MediaPlayerController.releasePlayer}：native 的
+     *                 {@code release()} 一律交给后台线程，建实例要等它的回调）
      * @return {@link #PLAY_START} / {@link #PLAY_PREPARE} / {@link #PLAY_WAIT} / {@link #PLAY_NONE}
      */
-    public static int playAction(boolean prepared, boolean preparing, boolean hasUrl) {
+    public static int playAction(boolean prepared, boolean preparing, boolean hasUrl,
+                                 boolean building) {
         if (prepared) {
             return PLAY_START;
         }
         if (preparing) {
+            return PLAY_WAIT;
+        }
+        // 「正在建」也是「准备中」的一种 —— 同一个不变量（别把在飞的这次准备拆掉）
+        // 换了个形态而已。
+        //
+        // 漏掉它的话：SetAVTransportURI 触发的释放被挪到后台线程之后，Play 到达时
+        // player 已经是 null、preparing 还是 false，于是判成 PLAY_PREPARE →
+        // startInternal() → 把刚建好、正在 prepare 的那个实例又释放重建一遍。
+        // 真机 2026-10-04 实测：一次换片源出现**两次 release + 两次 prepare**
+        // （08:25:24.443 与 .870 各一次），白白多花约 400ms 并多闪一下画面。
+        if (building) {
             return PLAY_WAIT;
         }
         return hasUrl ? PLAY_PREPARE : PLAY_NONE;
@@ -362,11 +418,15 @@ public final class PlaybackPolicy {
      * @return true 表示需要重建播放器
      */
     public static boolean shouldRebuild(String newUrl, String currentUrl,
-                                        boolean prepared, boolean preparing) {
+                                        boolean prepared, boolean preparing,
+                                        boolean building) {
         if (newUrl == null || newUrl.length() == 0) {
             return false;   // 空地址什么都不做
         }
-        if (newUrl.equals(currentUrl) && (prepared || preparing)) {
+        // 「正在建」（上一个实例还在后台释放、新实例没建出来）与「就绪 / 准备中」
+        // 是同一种状态：这次播放**已经在飞**，同地址再发一遍不该把它拆了重来。
+        // 见 playAction 的 building 说明。
+        if (newUrl.equals(currentUrl) && (prepared || preparing || building)) {
             return false;   // 同地址、播放器还在 —— 幂等忽略
         }
         return true;
@@ -446,6 +506,28 @@ public final class PlaybackPolicy {
     }
 
     /**
+     * 后台 {@code MediaPlayer.release()} 超过这么久仍未返回 = 厂商播放器栈已挂死。
+     *
+     * <p>取值 15 秒的依据是**实测的释放耗时分布**（真机 pid 2828 进程 12 次）：
+     * 正常释放 3 / 5 / 36 / 452 / 718 / 803 / 833 / 888 ms —— 最坏的一次是
+     * 厂商 {@code IMtkPb_Ctrl_Stop()} 先 {@code Failed !} 再 {@code ok !}，卡了
+     * **20000ms**。
+     *
+     * <p>⚠️ 注意那 20000ms 那次也**没有真的返回**：厂商内部的 {@code ok !}
+     * 打完之后 {@code doomed.release()} 依然没往下走，日志里「释放播放器: release 结束」
+     * 从未出现，ANR 转储里线程还停在 {@code MediaPlayer._release(Native Method)}。
+     * 所以 15 秒不是「比 20 秒小的安全值」，而是**在已观测到的正常值（≤888ms）
+     * 与已观测到的挂死之间取的一个偏早的点** —— 早报一秒不误伤，晚报一秒手机
+     * 就多转一圈。
+     */
+    public static final long RELEASE_STUCK_MS = 15000L;
+
+    /** 后台释放是否已经挂死（等待时长超过 {@link #RELEASE_STUCK_MS}）。 */
+    public static boolean isReleaseStuck(long waitedMs) {
+        return waitedMs >= RELEASE_STUCK_MS;
+    }
+
+    /**
      * seek 看门狗：这次 seek 该不该「重建播放器再补发一次」。
      *
      * <p>三种「不该」各自对应一个真机踩过的故障，缺一不可：
@@ -504,6 +586,19 @@ public final class PlaybackPolicy {
 
     /** 归不了类的兜底 */
     public static final int ERR_UNKNOWN = 6;
+
+    /**
+     * 厂商播放器栈已死：{@code MediaPlayer.release()} 挂起不返回。
+     *
+     * <p>与 {@link #ERR_STALLED} 的区别是**还能不能重连**：
+     * 卡死可以换个实例接着播（那正是重连在做的事）；这个不行 ——
+     * 旧实例的 native 释放永不返回，厂商那套 native 资源回收不了，
+     * 再建新实例也只是排在同一个坑后面。所以它报给控制点的是
+     * 「这一路播放到此为止」，而不是「正在重连」。
+     *
+     * <p>触发条件与阈值见 {@link #RELEASE_STUCK_MS}。
+     */
+    public static final int ERR_PLAYER_DEAD = 7;
 
     /**
      * 把 {@code MediaPlayer.OnErrorListener} 的 {@code what}/{@code extra} 分类。
@@ -569,6 +664,7 @@ public final class PlaybackPolicy {
             case ERR_DECODE:  return "DECODE";
             case ERR_STALLED: return "STALLED";
             case ERR_GIVEUP:  return "GIVEUP";
+            case ERR_PLAYER_DEAD: return "PLAYER_DEAD";
             case ERR_UNKNOWN: return "UNKNOWN";
             default:          return "NONE";
         }
