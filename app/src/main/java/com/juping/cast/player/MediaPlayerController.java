@@ -304,6 +304,16 @@ public class MediaPlayerController {
     private volatile String aspectProbing;
 
     /**
+     * 当前片源的 DPB 预检是否超限（真机表现＝硬件放弃视频、黑屏有声）。
+     *
+     * <p><b>与 {@link #videoAspect} 同一份探测、同一个临界区落账、同样按地址作废</b> ——
+     * 两个结论都从 {@link VideoAspectProbe#probeResult} 一次拿回，不存在"宽高是新的、
+     * 超限标志是旧的"。A3 提示条据此亮文案；解不出（null）时为 false ——
+     * 「没预检出」绝不许伪装成「超限」。
+     */
+    private volatile boolean aspectDpbExceeds;
+
+    /**
      * 是否正在 prepare（{@code prepareAsync} 已发出、回调还没到）。
      *
      * <p><b>必须和 {@link #prepared} 分开</b>：这两者的正确处置完全相反。
@@ -2053,9 +2063,23 @@ public class MediaPlayerController {
     private synchronized void clearAspectUnless(String url) {
         if (!url.equals(aspectUrl)) {
             videoAspect = null;
+            // 超限标志与宽高同生共死：换片源一起作废。只清宽高的话，上一条
+            // 超限流的标志会挂在新片源上 —— 提示条对着一条合规的流喊超限。
+            aspectDpbExceeds = false;
             aspectUrl = null;
             aspectProbing = null;
         }
+    }
+
+    /**
+     * 当前片源的 DPB 预检是否超限（真机表现＝黑屏有声）；A3 提示条据此亮文案。
+     *
+     * <p>{@code false} 有两种含义：「判过、合规」与「没判出来（HLS / 非 H.264 /
+     * 解不出）」—— 对提示条而言处置相同（不亮），所以不必区分。<b>解不出一律
+     * 不许伪装成超限</b>（null 红线的延伸：宁可不提示，也不指错方向）。
+     */
+    public boolean isAspectDpbExceeds() {
+        return aspectDpbExceeds;
     }
 
     /**
@@ -2101,7 +2125,7 @@ public class MediaPlayerController {
         Thread t = new Thread(new Runnable() {
             @Override
             public void run() {
-                final int[] size = VideoAspectProbe.probe(url);
+                final VideoAspectProbe.Result r = VideoAspectProbe.probeResult(url);
                 handler.post(new Runnable() {
                     @Override
                     public void run() {
@@ -2120,7 +2144,11 @@ public class MediaPlayerController {
                                 }
                                 return;
                             }
-                            videoAspect = size;
+                            videoAspect = r.size;
+                            // 超限标志与宽高**同一临界区、同一次探测**落账 ——
+                            // 拆成两次写的话，清账能插在中间，提示条拿着旧流的
+                            // 超限标志配新流的宽高（或反过来）。
+                            aspectDpbExceeds = r.dpbExceeds;
                             aspectUrl = url;
                             aspectProbing = null;
                         }

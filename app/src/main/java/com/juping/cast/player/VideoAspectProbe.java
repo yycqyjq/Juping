@@ -58,18 +58,32 @@ public final class VideoAspectProbe {
     /**
      * 探测 {@code url} 指向的直连 MP4 的视频宽高；探不到返回 {@code null}。
      *
+     * <p>薄包装 {@link #probeResult}：只要宽高的调用方用它，两个结论都要的
+     * （A3 提示条）用 {@code probeResult} —— 逻辑只有一份，不会漂移。
+     *
      * <p>调用方拿到 {@code null} 一律按「全屏」处理 —— 探测失败是常态（HLS、
      * 非 MP4、网络不通、服务器不支持 Range），绝不能因此影响播放。
      *
      * @return {@code {width, height}}，或 {@code null}
      */
     public static int[] probe(String url) {
+        return probeResult(url).size;
+    }
+
+    /**
+     * 探测视频宽高 **与 DPB 超限标志**（两个结论、同一份窗口、同样次数请求）。
+     *
+     * <p>宽高给软件信箱；超限标志给 A3 提示条 —— 硬件解码器对超 DPB 的流
+     * <b>放弃视频、音频照放、一个错误都不报</b>，预检是唯一的判据来源
+     * （厂商日志 / getVideoWidth / 截图三路全部无效，见 todo §7.21）。
+     */
+    public static Result probeResult(String url) {
         // 地址无效 / 不是 http(s) 流：没什么可探的。
         if (url == null || url.length() == 0) {
-            return null;
+            return new Result(null, false);
         }
         if (!url.startsWith("http://") && !url.startsWith("https://")) {
-            return null;
+            return new Result(null, false);
         }
         // **红线**：HLS（.m3u8）走厂商自研的信箱链，比例本来就是对的 ——
         // 我们再去摆一次就是双重信箱。看到就立刻放弃，连请求都不发。
@@ -78,7 +92,7 @@ public final class VideoAspectProbe {
         // 实测 .M3U8 拿大写时无参版拦不住 —— 虽然后果只是白发一次请求
         // （m3u8 是文本、looksLikeMp4 不匹配照样返 null），但红线就该是红线。
         if (url.toLowerCase(java.util.Locale.US).contains(".m3u8")) {
-            return null;
+            return new Result(null, false);
         }
         try {
             // 头窗口：faststart 的文件 moov 就在前面（哪怕 moov 有几百 KB，
@@ -88,7 +102,7 @@ public final class VideoAspectProbe {
             if (head == null || !looksLikeMp4(head.buf, head.len)) {
                 // 不是 MP4（MP3 / AAC / 未知格式）：头四个字节一读就知道，
                 // 没必要再发第二次请求。
-                return null;
+                return new Result(null, false);
             }
             int[] size = Mp4Aspect.parse(head.buf, head.len);
             // **DPB 预检复用同一个窗口** —— avcC 在 stsd 里、stsd 在 moov 里，
@@ -110,23 +124,27 @@ public final class VideoAspectProbe {
             // 先记 DPB 判定、再走下面的宽高闸：宽高解不出不代表 DPB 解不出，
             // 而预检要的正是「这条流本机解不解得了」这个独立结论。
             logDpb(url, dpb);
+            // logDpb 之后、尺寸闸之前取结论：宽高没落进 16~8192 的合法区不代表
+            // DPB 判定无效 —— 提示条要的恰是这个独立结论（超限的流摆不摆信箱
+            // 都放不出来）。
+            boolean exceeds = dpb != null && dpb.exceedsDevice();
             if (size == null) {
-                return null;
+                return new Result(null, exceeds);
             }
             // 尺寸合法性闸：stsdSize 读到音频 entry 的垃圾字节时会给出荒谬值。
             // 宁可全屏，也不摆一个错的信箱 —— 摆错比不摆更难看。
             if (size[0] < MIN_DIM || size[0] > MAX_DIM
                     || size[1] < MIN_DIM || size[1] > MAX_DIM) {
-                return null;
+                return new Result(null, exceeds);
             }
             // 成功才打日志。**只打域名，不打完整 URL** —— 抖音/腾讯这类地址常带
             // token 与过期时间，签名本身就是播放凭证，落进日志等于泄漏。
             Log.i(TAG, "探测到直连 MP4 真实宽高 " + size[0] + "x" + size[1]
                     + "（域名 " + hostOf(url) + "）");
-            return size;
+            return new Result(size, exceeds);
         } catch (Exception e) {
             // 任何异常都静默退回全屏：探测是可选优化，失败不能影响播放本身。
-            return null;
+            return new Result(null, false);
         }
     }
 
@@ -264,6 +282,26 @@ public final class VideoAspectProbe {
             this.buf = buf;
             this.len = len;
             this.total = total;
+        }
+    }
+
+    /**
+     * 一次探测的两个独立结论：显示宽高（信箱用）+ DPB 超限标志（A3 提示条用）。
+     *
+     * <p><b>为什么是两个结论而不是一个</b>：宽高解不出不代表 DPB 解不出（各走各的
+     * 字段），而提示条要的正是「这条流本机解不解得了」这个独立结论 —— 把它捆在
+     * 宽高返回值里，宽高失败时超限判定就白白丢了。二者<b>共用同一份窗口</b>，
+     * 不是两次请求。
+     */
+    public static final class Result {
+        /** 视频真实宽高；探不到为 {@code null}（调用方退回全屏）。 */
+        public final int[] size;
+        /** 流声明的 DPB 是否超出本机解码能力（真机表现＝黑屏有声）。 */
+        public final boolean dpbExceeds;
+
+        Result(int[] size, boolean dpbExceeds) {
+            this.size = size;
+            this.dpbExceeds = dpbExceeds;
         }
     }
 }

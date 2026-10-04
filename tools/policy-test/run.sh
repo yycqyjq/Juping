@@ -3293,7 +3293,10 @@ report('顶条：「画面出不来」要出现、且与出错一样亮红点',
        tb is not None
        and re.search(r'noPicture\s*=\s*service\.isVideoMissing\(\)', tb) is not None
        and re.search(r'show\s*=\s*error \|\| noPicture', tb) is not None
-       and re.search(r'if \(error \|\| noPicture\)', tb) is not None,
+       # 锚点放宽（A3 批）：判据现在可能带第三路（|| dpb），右括号不紧跟 noPicture。
+       # 语义不变：noPicture 必须参与 show、必须与 error 同支亮红点 —— dpb 的参与
+       # 由 A3 自己的守卫钉，这里只管「别把 noPicture 摘掉」。
+       and re.search(r'if\s*\(\s*error\s*\|\|\s*noPicture', tb) is not None,
        '不参与 show：顶条根本不出现，黑屏上还是一个字都没有（第一版就是'
        '只在 idle/暂停时出现，等于白写）；不亮红点：绿点会说"一切正常"，'
        '跟右边那句自相矛盾')
@@ -3418,18 +3421,21 @@ probe_src = strip_comments(
     pathlib.Path('app/src/main/java/com/juping/cast/player/VideoAspectProbe.java'
                  ).read_text(encoding='utf-8'))
 
-pb = body_of(probe_src, 'public static int[] probe(String url)')
-report('VideoAspectProbe.probe 方法体已找到', pb is not None,
-       '锚点：public static int[] probe(String url)')
+# 锚点迁移（A3 提示条批）：probe() 重构成薄包装后，判据体在 probeResult() ——
+# 锚点必须跟着逻辑走（startInternal 加 synchronized 打破锚点是同一类坑的第二次）。
+# 同时钉住「probe 只是包装」这条结构：逻辑只有一份，两条路不会漂移。
+pb = body_of(probe_src, 'public static Result probeResult(String url)')
+report('VideoAspectProbe.probeResult 方法体已找到', pb is not None,
+       '锚点：public static Result probeResult(String url)')
 if pb:
     _m = pb.find('.m3u8')
-    _r = pb.find('return null', _m) if _m >= 0 else -1
+    _r = pb.find('return new Result(null, false)', _m) if _m >= 0 else -1
     report('probe 对 .m3u8 早退返回 null（红线：HLS 不许碰）',
            _m >= 0 and _r > _m,
            'HLS 走厂商自研的信箱链，比例本来就是对的 —— 我们再摆一次就是'
            '双重信箱。这条是整个方案的红线')
     report('probe 的 catch 分支返回 null（不抛、不猜值）',
-           re.search(r'catch\s*\([^)]*\)\s*\{[^}]*return\s+null', pb) is not None,
+           re.search(r'catch\s*\([^)]*\)\s*\{[^}]*return\s+new\s+Result\(\s*null', pb) is not None,
            '探测是可选优化：任何异常都必须静默退回全屏，不许抛、不许弹错误')
     report('probe 有尺寸合法性闸（16~8192 上下界）',
            re.search(r'MIN_DIM\s*=\s*16\b', probe_src) is not None
@@ -3437,6 +3443,12 @@ if pb:
            and 'MIN_DIM' in pb and 'MAX_DIM' in pb,
            'stsdSize 读到音频 entry 的垃圾字节时会给出荒谬值 —— '
            '宁可全屏也不摆错信箱')
+_wrp = body_of(probe_src, 'public static int[] probe(String url)')
+report('probe(String) 是 probeResult 的薄包装（逻辑只有一份）',
+       _wrp is not None and 'probeResult(url).size' in _wrp
+       and 'readWindow' not in _wrp,
+       '宽高与超限两个结论必须出自同一次探测 —— 各自一份窗口逻辑迟早漂移'
+       '（提示条喊超限、信箱却用旧窗口结论）。钉法：probe 体内不许出现取窗调用')
 
 av = body_of(main_act, 'private void applyVideoAspect(int mode)')
 report('MainActivity.applyVideoAspect 方法体已找到', av is not None,
@@ -3563,7 +3575,7 @@ report('DlnaRendererService.getVideoAspect 存在且委托给 player（不自己
 # 本阶段只做「检测 + 日志」：判据要先在这台盒子上校准（尤其"解不出"的比例有多高），
 # 而加视图有把 MTK 蓝屏引回来的风险（§六 P2），提示条要单独做真机验证。
 # 注意：pb 本身已是 probe() 的方法体，源码在 probe_src —— 对 pb 再 body_of 必为 None
-_pb_probe = body_of(probe_src, 'public static int[] probe(String url)')
+_pb_probe = body_of(probe_src, 'public static Result probeResult(String url)')
 report('DPB 预检复用探测窗口，不为它多发一次 Range',
        _pb_probe is not None
        and 'Mp4Aspect.dpb(' in _pb_probe
@@ -3591,6 +3603,51 @@ report('DPB 解不出时静默（不刷屏、不影响播放）',
        _pb_log is not None and 'd == null' in _pb_log,
        '非 H.264（HLS / H.265 / MP3）、moov 没落进窗口、SPS 格式不认 —— '
        '都会返回 null。打出来只会淹没真信号，而后果仅仅是"没预检"')
+
+# ── A3 提示条接线（超限结论从探测一路走到顶条）──
+# 这条链跨四个文件（probe → controller → service → activity），桌面断言编译不到
+# MainActivity/DlnaRendererService（它们不在 policy 闸门编译范围内），只能钉源码调用形状。
+_a3_r = body_of(probe_src, 'public static Result probeResult(String url)')
+report('probeResult 把超限结论落进 Result（不止打日志）',
+       _a3_r is not None and 'exceedsDevice()' in _a3_r
+       and re.search(r'dpb\s*!=\s*null\s*&&\s*dpb\.exceedsDevice\(\)', _a3_r) is not None,
+       'A2 只 logDpb 打日志、结论当场丢弃；提示条要的是**同一个 dpb 变量**算出的布尔 —— '
+       '日志与结论必须同源，否则会出现"日志说超限、标志却是 false"')
+_a3_ca = body_of(ctrl, 'private synchronized void clearAspectUnless(String url)')
+report('超限标志与宽高同临界区落账、换片源一起作废',
+       _a3_ca is not None and 'aspectDpbExceeds = false' in _a3_ca
+       and 'videoAspect = null' in _a3_ca,
+       '只清宽不清标志（或反过来）= 上一条超限流的标志挂到新片源上 —— 提示条对着'
+       '一条合规的流喊超限。这是"旧宽高盖新片源"竞态的镜像，同一把锁一起清')
+_pp_body = body_of(ctrl, 'private void maybeProbeAspect(final String url)')
+report('maybeProbeAspect 消费 probeResult 并在锁内落标志',
+       _pp_body is not None and 'probeResult(url)' in _pp_body
+       and 'aspectDpbExceeds = r.dpbExceeds' in _pp_body
+       and re.search(r'synchronized\s*\(\s*MediaPlayerController\.this\s*\)', _pp_body) is not None,
+       '宽高与标志必须一次探测、同一临界区写入（与 QA 复审③ 同一条 happens-before 纪律）—— '
+       '分两次写，清账能插在中间，提示条拿旧流标志配新流宽高')
+report('控制器暴露 isAspectDpbExceeds（判据出得来）',
+       'public boolean isAspectDpbExceeds()' in ctrl and 'aspectDpbExceeds' in ctrl,
+       '与 getVideoAspect 同纪律：判据权威在控制器，界面不自己猜')
+_a3_svc = body_of(svc, 'public boolean isAspectDpbExceeds()')
+report('DlnaRendererService.isAspectDpbExceeds 委托 player（不自己算）',
+       _a3_svc is not None and 'isAspectDpbExceeds()' in _a3_svc and 'player' in _a3_svc,
+       '透传层不得自带判据 —— 与 getVideoAspect 的委托纪律一致')
+_a3_tb = body_of(main_act, 'private void applyTopBar(int mode)')
+report('顶条显隐认 DPB 超限（预检超限也顶出条子）',
+       _a3_tb is not None and 'isAspectDpbExceeds()' in _a3_tb
+       and re.search(r'show\s*=.*dpb', _a3_tb) is not None,
+       '厂商对超 DPB 的流**一个错误都不报**、getVideoWidth 恒 0 —— error/noPicture 都抓不到它，'
+       '顶条光认这两个就永远不亮。超限必须进 show 判据')
+_a3_rf = body_of(main_act, 'private void refresh()')
+report('顶条文案超限优先于 isVideoMissing（早结论盖晚观察）',
+       _a3_rf is not None and 'hint_dpb_exceeds' in _a3_rf
+       and _a3_rf.find('isAspectDpbExceeds()') < _a3_rf.find('isVideoMissing()'),
+       '预检是**播放前就有**的确定结论，"画面没出来"要等十几秒观察才敢断定；'
+       '更早、更准、还给具体动作（降 360P）。排在后面等于让模糊判据盖住精确判据')
+report('A3 文案字符串存在（删了编译期不红、装机才发现）',
+       'name="hint_dpb_exceeds"' in strings and '360P' in strings,
+       '360P 是真机实测能播的档位，数字写死在资源里 —— 引用缺失或改数都不该留到装机')
 
 # ---- 版本纪律（二夜定的规矩：每次 dist 构建必须升版本）----
 build_sh = pathlib.Path('tools/build.sh').read_text(encoding='utf-8')

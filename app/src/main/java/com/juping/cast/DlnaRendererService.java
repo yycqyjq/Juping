@@ -1522,6 +1522,17 @@ public class DlnaRendererService extends Service
         return p == null ? null : p.getVideoAspect();
     }
 
+    /**
+     * 当前片源的 DPB 预检是否超限（真机表现＝黑屏有声）；A3 提示条据此亮文案。
+     *
+     * <p>判据权威在播放控制器（探测与按地址记账都在那边），界面不自己猜 ——
+     * 与 {@link #getVideoAspect()} 同一条纪律、同一次落账、换片源一起作废。
+     */
+    public boolean isAspectDpbExceeds() {
+        MediaPlayerController p = player;
+        return p != null && p.isAspectDpbExceeds();
+    }
+
     public String getFriendlyName() {
         return friendlyName;
     }

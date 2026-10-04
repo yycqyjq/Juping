@@ -505,7 +505,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // （见 applyTopBar 的说明），所以让它说原因，优先级高于进度。
         // 真报错时不抢：报错自报错，别拿"编码不支持"去替真正的故障背锅。
         boolean error = (service.getLastErrorKind() != PlaybackPolicy.ERR_NONE);
-        if (!error && service.isVideoMissing()) {
+        // 三档优先级：真报错 > DPB 超限 > 画面没出来。
+        // 超限必须排在 isVideoMissing 之前 —— 预检是**播放前就确定**的判据
+        // （起播一秒内就有结论），而"画面没出来"靠观察、要等十几秒才敢断定。
+        // 结论更早、更准、还给了具体动作（降清晰度），没有让模糊判据盖住它的道理。
+        // applyTopBar 的显隐与这里必须同步（同一 tick、同一判据），否则会出现
+        // 「条子藏着、文案却在说超限」或反过来 —— 那边的 dpb 就是这里的前半句。
+        if (!error && service.isAspectDpbExceeds()) {
+            playingText.setText(R.string.hint_dpb_exceeds);
+        } else if (!error && service.isVideoMissing()) {
             playingText.setText(R.string.hint_video_unsupported);
         } else {
             playingText.setText(dur > 0 ? progress : currentLabel());
@@ -1332,9 +1340,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             // 还是这段视频放不了"都判断不了（真机实证见
             // PlaybackPolicy.INFO_VIDEO_CODEC_NOT_SUPPORT）。
             boolean noPicture = service.isVideoMissing();
-            show = error || noPicture || "PAUSED_PLAYBACK".equals(ts) || "TRANSITIONING".equals(ts);
-            if (error || noPicture) {
-                // 出错、以及「画面出不来」都亮红点。
+            // DPB 预检超限：这条流声明的参考帧 × 宏块数超了本机解码上限，硬件会
+            // **放弃视频、音频照放、一个错误都不报** —— error 与 noPicture 都抓不到它
+            // （厂商不报错、getVideoWidth 恒 0 的观察又滞后），预检是唯一判据。
+            // 与 noPicture 同性质（"视频轨放不出来"），所以同亮红点、顶条同为它显示。
+            boolean dpb = service.isAspectDpbExceeds();
+            show = error || noPicture || dpb || "PAUSED_PLAYBACK".equals(ts) || "TRANSITIONING".equals(ts);
+            if (error || noPicture || dpb) {
+                // 出错、以及「画面出不来」（含预检超限）都亮红点。
                 // 这个点原来是**写死的绿色**，而顶部条现在恰恰只在
                 // 「暂停 / 出错 / 缓冲」时出现 —— 出错时左边一个绿点、
                 // 右边写着「出错：…」，自己跟自己打架。
