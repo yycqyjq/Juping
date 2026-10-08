@@ -495,29 +495,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 updateCover(service.getCurrentAlbumArtUri());
             }
         }
-        // 顶部条现在只在暂停 / 出错 / 缓冲时出现，那些时刻用户要的正是
-        // 「放到哪儿了」，所以两种形态都报进度。原来音频时这里固定写
-        // 「音乐投屏」是因为状态条常驻、和音乐卡片的大标题重复了 ——
-        // 条子不再常驻，那个理由也就不成立了。
+        // 顶部条只在暂停 / 出错 / 缓冲时出现，那些时刻用户要的正是「放到哪儿了」，
+        // 所以两种形态都报进度。
         //
-        // 例外是「画面出不来」：那时进度条上的时间对用户毫无意义 ——
-        // 屏幕一片黑，他要知道的是"为什么黑"。而这条子正是为这种时刻准备的
-        // （见 applyTopBar 的说明），所以让它说原因，优先级高于进度。
-        // 真报错时不抢：报错自报错，别拿"编码不支持"去替真正的故障背锅。
-        boolean error = (service.getLastErrorKind() != PlaybackPolicy.ERR_NONE);
-        // 三档优先级：真报错 > DPB 超限 > 画面没出来。
-        // 超限必须排在 isVideoMissing 之前 —— 预检是**播放前就确定**的判据
-        // （起播一秒内就有结论），而"画面没出来"靠观察、要等十几秒才敢断定。
-        // 结论更早、更准、还给了具体动作（降清晰度），没有让模糊判据盖住它的道理。
-        // applyTopBar 的显隐与这里必须同步（同一 tick、同一判据），否则会出现
-        // 「条子藏着、文案却在说超限」或反过来 —— 那边的 dpb 就是这里的前半句。
-        if (!error && service.isAspectDpbExceeds()) {
-            playingText.setText(R.string.hint_dpb_exceeds);
-        } else if (!error && service.isVideoMissing()) {
-            playingText.setText(R.string.hint_video_unsupported);
-        } else {
-            playingText.setText(dur > 0 ? progress : currentLabel());
-        }
+        // （2026-10-08 二夜拍板）这里原先还有三档优先级：真报错 > DPB 超限 >
+        // 画面没出来，后两档会把进度换成一句技术诊断。已撤 —— 那两条都是
+        // **播放前的预测**，判错时会对一条能正常播的流喊超限，而且没有撤销回路，
+        // 一路赖到回主界面。诊断退回内部日志，用户侧的说明统一在主面板上给。
+        playingText.setText(dur > 0 ? progress : currentLabel());
     }
 
     /**
@@ -1324,6 +1309,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * </ul>
      * 正常播放中一律隐藏。
      *
+     * <p><b>它不再承担「按流的技术诊断」</b>（2026-10-08 二夜拍板）：原先
+     * 「画面编码解不了」与「DPB 预检超限」也会把顶条顶出来，但那两条都是
+     * **播放前的预测**，判错时会对着一条能正常播的流喊超限，且没有「画面
+     * 其实出来了」的撤销回路 —— 提示一路赖到回主界面。这两条诊断退回内部
+     * （日志 + {@code isVideoMissing}/{@code isAspectDpbExceeds} 仍保留供排障），
+     * 对用户的解释统一放到主面板的一句静态说明上。
+     *
      * <p>注意它**不能只写在 {@link #applyMode(int)} 里**：暂停与出错是同一个形态
      * 内部的变化，形态没切换，那些代码根本不会被走到。
      */
@@ -1335,24 +1327,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             // 用分类判断，不用「细节字符串非空」—— 后者是拿"有没有那句话"
             // 当"有没有出错"，一旦哪天细节被清空而分类还在，这里就会漏报。
             boolean error = (service.getLastErrorKind() != PlaybackPolicy.ERR_NONE);
-            // 「形态是视频、画面却始终没出来」也算"有话说"：那种情形下屏幕就是
-            // **一片纯黑**，而顶条是用户唯一能看到的解释。不写它，他连"是盒子坏了
-            // 还是这段视频放不了"都判断不了（真机实证见
-            // PlaybackPolicy.INFO_VIDEO_CODEC_NOT_SUPPORT）。
-            boolean noPicture = service.isVideoMissing();
-            // DPB 预检超限：这条流声明的参考帧 × 宏块数超了本机解码上限，硬件会
-            // **放弃视频、音频照放、一个错误都不报** —— error 与 noPicture 都抓不到它
-            // （厂商不报错、getVideoWidth 恒 0 的观察又滞后），预检是唯一判据。
-            // 与 noPicture 同性质（"视频轨放不出来"），所以同亮红点、顶条同为它显示。
-            boolean dpb = service.isAspectDpbExceeds();
-            show = error || noPicture || dpb || "PAUSED_PLAYBACK".equals(ts) || "TRANSITIONING".equals(ts);
-            if (error || noPicture || dpb) {
-                // 出错、以及「画面出不来」（含预检超限）都亮红点。
+            // （2026-10-08 二夜拍板）顶条**不再承载「按流的技术诊断」**。
+            // 原先它还会为「画面编码解不了」与「DPB 预检超限」两条亮起来，但那是
+            // **播放前的预测**：判错时会对一条能正常播的流喊"超限"，而且没有
+            // 「画面其实出来了」的撤销回路 —— 提示一路赖到回主界面才熄。
+            // 这类诊断现在只留在内部（日志 + isVideoMissing/isAspectDpbExceeds），
+            // 对用户则统一由主面板给一句静态说明。顶条回归本职：只报
+            // 「暂停 / 出错 / 缓冲」这三种真正需要一句话的时刻。
+            show = error || "PAUSED_PLAYBACK".equals(ts) || "TRANSITIONING".equals(ts);
+            if (error) {
                 // 这个点原来是**写死的绿色**，而顶部条现在恰恰只在
                 // 「暂停 / 出错 / 缓冲」时出现 —— 出错时左边一个绿点、
                 // 右边写着「出错：…」，自己跟自己打架。
-                // 三米外先被看见的是颜色而不是那行小字，所以颜色必须说实话；
-                // 「画面出不来」同样是"这条投屏没成功"，绿点会让人以为一切正常。
+                // 三米外先被看见的是颜色而不是那行小字，所以颜色必须说实话。
                 dot = R.drawable.dot_error;
             } else if ("TRANSITIONING".equals(ts)) {
                 // 缓冲 / 重连中：蓝点表示"还在动"，而不是"已经好了"

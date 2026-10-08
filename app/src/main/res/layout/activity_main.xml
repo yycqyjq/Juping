@@ -239,6 +239,20 @@
                 android:text="@string/guide_body"
                 android:textColor="@color/text_secondary"
                 android:textSize="17sp" />
+
+            <!-- 通用排障说明（2026-10-08 二夜拍板）。
+                 原来「编码不支持 / 解码能力放不下」是按流在顶条上实时弹的，
+                 判错会误报、且赖着不走。改成在这里给一句**静态**通用说明：
+                 不针对任何一条流，也就不存在误报；投不上时用户有个方向可循。
+                 用 text_hint 色（比正文浅）—— 它是补充，不该抢正文的注意力。 -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="14dp"
+                android:lineSpacingExtra="6dp"
+                android:text="@string/hint_play_failed"
+                android:textColor="@color/text_hint"
+                android:textSize="15sp" />
         </LinearLayout>
 
         <!-- 设备信息卡片 -->

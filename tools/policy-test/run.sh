@@ -3330,34 +3330,41 @@ report('换片两条入口都清掉「画面出不来」',
        'HEVC 再自动续播下一部（或换片），新片源一上来就顶着上一部的黑屏告警')
 
 tb = body_of(main_act, 'private void applyTopBar(int mode)')
-report('顶条：「画面出不来」要出现、且与出错一样亮红点',
+report('顶条不再认「画面出不来」（按流诊断退回内部，只报暂停/出错/缓冲）',
        tb is not None
-       and re.search(r'noPicture\s*=\s*service\.isVideoMissing\(\)', tb) is not None
-       and re.search(r'show\s*=\s*error \|\| noPicture', tb) is not None
-       # 锚点放宽（A3 批）：判据现在可能带第三路（|| dpb），右括号不紧跟 noPicture。
-       # 语义不变：noPicture 必须参与 show、必须与 error 同支亮红点 —— dpb 的参与
-       # 由 A3 自己的守卫钉，这里只管「别把 noPicture 摘掉」。
-       and re.search(r'if\s*\(\s*error\s*\|\|\s*noPicture', tb) is not None,
-       '不参与 show：顶条根本不出现，黑屏上还是一个字都没有（第一版就是'
-       '只在 idle/暂停时出现，等于白写）；不亮红点：绿点会说"一切正常"，'
-       '跟右边那句自相矛盾')
+       and 'isVideoMissing' not in tb
+       and 'isAspectDpbExceeds' not in tb
+       and re.search(r'show\s*=\s*error\s*\|\|\s*"PAUSED_PLAYBACK"', tb) is not None,
+       '（2026-10-08 二夜拍板）这两条都是**播放前的预测**：判错时会对一条能正常播的'
+       '流喊超限，且没有「画面其实出来了」的撤销回路，提示一路赖到回主界面。'
+       '诊断退回内部（日志 + getter 仍留），对用户的解释改到主面板静态给 —— '
+       '谁把 isVideoMissing / isAspectDpbExceeds 加回顶条，这条就红')
 
 rf = body_of(main_act, 'private void refresh()')
-report('顶条文案：画面出不来时报原因，且真报错时不抢',
+report('顶条文案只报进度/片名（不再被按流诊断顶掉）',
        rf is not None
-       and re.search(r'if \(!error && service\.isVideoMissing\(\)\)\s*\{'
-                     r'[\s\S]{0,120}?playingText\.setText\('
-                     r'R\.string\.hint_video_unsupported\)', rf) is not None,
-       '这时进度条上的时间对用户毫无意义（屏幕一片黑，他要的是"为什么黑"），'
-       '所以让原因压过进度；但前面那个 !error 不能去掉 —— '
-       '真正的故障有它自己的话要说，拿"编码不支持"去替它背锅会把人带偏')
+       and 'hint_dpb_exceeds' not in rf
+       and 'hint_video_unsupported' not in rf
+       and 'isAspectDpbExceeds' not in rf
+       and 'isVideoMissing' not in rf
+       and re.search(r'playingText\.setText\(dur > 0 \? progress : currentLabel\(\)\)',
+                     rf) is not None,
+       '原先这里有三档优先级（真报错 > DPB 超限 > 画面没出来），后两档会把进度'
+       '换成一句技术诊断。已撤：诊断退回内部日志，用户侧说明统一在主面板给。'
+       '谁把这两条文案加回 refresh，这条就红')
 
 strings = pathlib.Path('app/src/main/res/values/strings.xml'
                        ).read_text(encoding='utf-8')
-report('「编码不支持」那句话必须给出可执行的动作',
-       'hint_video_unsupported' in strings and 'H.264' in strings,
-       '只说"不支持"等于没说：用户不会知道下一步该干什么，'
-       '只会以为盒子坏了')
+report('两条按流文案已删、主面板静态说明给出可执行动作',
+       'hint_dpb_exceeds' not in strings
+       and 'hint_video_unsupported' not in strings
+       and 'hint_play_failed' in strings and '360P' in strings and 'H.264' in strings,
+       '按流文案删干净（留着就是死资源，且暗示"以后可能再弹"）；主面板那句必须给'
+       '可执行动作（360P / H.264）—— 只说"投不上"等于没说，用户不知道下一步做什么')
+report('MainActivity 全文件不再引用两条已删文案（防别处又接回来）',
+       'hint_dpb_exceeds' not in main_act and 'hint_video_unsupported' not in main_act,
+       'refresh 里撤了、别处又接回来一样会弹。整文件扫一遍比只看 refresh 更稳 —— '
+       '与"删干净"同一动机（注释已被 strip_comments 剥掉，不会假绿）')
 
 report('dex 核查表收录 OnInfoListener（否则闸门报「没被核到」而红）',
        'MediaPlayer$OnInfoListener'
@@ -3674,21 +3681,19 @@ _a3_svc = body_of(svc, 'public boolean isAspectDpbExceeds()')
 report('DlnaRendererService.isAspectDpbExceeds 委托 player（不自己算）',
        _a3_svc is not None and 'isAspectDpbExceeds()' in _a3_svc and 'player' in _a3_svc,
        '透传层不得自带判据 —— 与 getVideoAspect 的委托纪律一致')
-_a3_tb = body_of(main_act, 'private void applyTopBar(int mode)')
-report('顶条显隐认 DPB 超限（预检超限也顶出条子）',
-       _a3_tb is not None and 'isAspectDpbExceeds()' in _a3_tb
-       and re.search(r'show\s*=.*dpb', _a3_tb) is not None,
-       '厂商对超 DPB 的流**一个错误都不报**、getVideoWidth 恒 0 —— error/noPicture 都抓不到它，'
-       '顶条光认这两个就永远不亮。超限必须进 show 判据')
-_a3_rf = body_of(main_act, 'private void refresh()')
-report('顶条文案超限优先于 isVideoMissing（早结论盖晚观察）',
-       _a3_rf is not None and 'hint_dpb_exceeds' in _a3_rf
-       and _a3_rf.find('isAspectDpbExceeds()') < _a3_rf.find('isVideoMissing()'),
-       '预检是**播放前就有**的确定结论，"画面没出来"要等十几秒观察才敢断定；'
-       '更早、更准、还给具体动作（降 360P）。排在后面等于让模糊判据盖住精确判据')
-report('A3 文案字符串存在（删了编译期不红、装机才发现）',
-       'name="hint_dpb_exceeds"' in strings and '360P' in strings,
-       '360P 是真机实测能播的档位，数字写死在资源里 —— 引用缺失或改数都不该留到装机')
+report('撤 UI 不删内部判据：DPB 预检结论仍算出、仍可查（排障用）',
+       'public boolean isAspectDpbExceeds()' in ctrl and 'aspectDpbExceeds' in ctrl
+       and 'isAspectDpbExceeds()' in svc
+       and 'exceedsDevice()' in probe_src,
+       '二夜：「投不成就不成，内部逻辑没问题就行」。撤的是**界面出口**，不是判据 —— '
+       '预检照跑、结论照算、Log.w 照打（排障时能判断"是不是这条流超了本机能力"）。'
+       '谁把这条内部链顺手删了，排障就少一个抓手')
+report('主面板静态说明被布局真正引用（不是定义了没人用）',
+       'hint_play_failed' in strings
+       and re.search(r'@string/hint_play_failed', lay) is not None,
+       '定义了字符串却没人引用 = 死资源，装机后主面板上看不到那句话。'
+       '这条把「文案 → 布局」这一跳钉住 —— 与当初 A3「字符串存在」守卫同一动机，'
+       '方向反过来：现在要**删干净旧文案、接上新文案**')
 
 # ---- 版本纪律（二夜定的规矩：每次 dist 构建必须升版本）----
 build_sh = pathlib.Path('tools/build.sh').read_text(encoding='utf-8')
