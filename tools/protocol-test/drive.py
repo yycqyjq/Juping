@@ -1439,7 +1439,6 @@ check('反面对照：正常大小的 body 照常受理', _st.startswith('HTTP/1
 # 「芒果 TV 一直连接中」的根因候选之一就在这条路径上：控制点声明了
 # Content-Length 却少发 / 不发 body，原来的实现读完就一声不响地把连接关掉 ——
 # 控制点既等不到成功也等不到失败，界面就一直停在「连接中」。
-# 判据见 .agent/mangotv-compat-plan.md §7 的 B。
 # 手法：声明 100 字节、只发 5 字节，然后 shutdown(WR) 半关，让服务端读到 EOF
 # （不半关的话服务端会阻塞到自己的 10 秒超时，那时它是走异常分支、发不出 400）。
 _short = socket.create_connection((HOST, PORT), timeout=8)

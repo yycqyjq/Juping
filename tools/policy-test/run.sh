@@ -3421,7 +3421,7 @@ report('dex 核查表收录 OnInfoListener（否则闸门报「没被核到」�
 # ---- (13) 视频蓝屏修复（F1 去 reset / F2 阈值 / MODE_VIDEO_PENDING 占位层）----
 # 真机 A/B 定案：releasePlayer 的 reset() 触发厂商异步 reset_nosync，污染新实例
 # 的 prepareAsync（"already reset" 空操作）→ 投视频先蓝屏 30 秒。
-# 这组守卫钉的是「修好的东西别被改回去」—— 设计见 `.agent/video-bluescreen-plan.md`。
+# 这组守卫钉的是「修好的东西别被改回去」。
 rlp = body_of(ctrl, 'private boolean releasePlayer(Runnable onReleased)')
 report('releasePlayer 已找到且不含 player.reset()（F1 的直接回归判据）',
        rlp is not None and 'player.reset(' not in rlp,

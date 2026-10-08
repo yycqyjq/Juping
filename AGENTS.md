@@ -1,8 +1,6 @@
 # AGENTS.md — 聚屏（Juping）Agent 协作手册
 
-> 面向 AI Agent 的项目速查手册。用户文档看 `README.md`，当前任务与状态看
-> `.agent/todo.md`，历史方案看 `.agent/optimization-report.md` /
-> `modification-plan.md`。**改代码前必读本文的第 4、6 节。**
+> 面向 AI Agent 的项目速查手册。用户文档看 `README.md`。**改代码前必读本文的第 4、6 节。**
 
 ## 1. 项目速览
 
@@ -178,7 +176,7 @@ tools/
 | 时长解析错 | 个别 MP4 报短 | 无解，观察项 |
 | screencap 截不到视频层 | 只截应用 UI | 配合 GetPositionInfo 判真实播放 |
 | 蓝屏（视频层无内容） | MTK 硬件输出蓝色 | 空闲时藏 SurfaceView；退后台延迟 2.5s |
-| release→prepare 异步竞态 | 厂商 reset 是异步的（reset_nosync），mReseted 跨实例共享：旧实例 teardown 砸中新实例 prepareAsync →「already reset」空操作 → 投视频先蓝屏 30s | releasePlayer 不再 reset()（守卫钉着）；prepare 卡死阈值 30s→10s 作安全网；准备窗口 MODE_VIDEO_PENDING 藏层+占位。见 `.agent/video-bluescreen-plan.md` |
+| release→prepare 异步竞态 | 厂商 reset 是异步的（reset_nosync），mReseted 跨实例共享：旧实例 teardown 砸中新实例 prepareAsync →「already reset」空操作 → 投视频先蓝屏 30s | releasePlayer 不再 reset()（守卫钉着）；prepare 卡死阈值 30s→10s 作安全网；准备窗口 MODE_VIDEO_PENDING 藏层+占位。 |
 | 手机浏览器吞 POST 响应 | Vivo/自带浏览器会把局域网 POST 的**响应**吞掉或改写成错误页（服务端日志铁证：已回 200、操作确实生效，前端却报「响应异常」失败） | 网页端成败一律以 `GET /files` 服务器复核为准（上传=列表增量、删除=名字消失、投送=非200引导看电视），不信 POST 状态码。守卫钉在 web-test |
 | macOS zsh 无 setsid | 后台服务起不来 | 用受管后台任务（run_in_background） |
 | Mac 全局代理 | 局域网 curl 被 58199 拦 | curl 加 --noproxy '*' |
@@ -251,7 +249,8 @@ adb -s 192.168.1.8:5555 logcat -v time > /tmp/tv_session.log 2>&1
    （BubbleUPnP/腾讯视频/B站/网易云实测），SCPD 与 KNOWN_ACTIONS 同步。
 7. **真机验证 = 电视屏幕实际观察**：screencap 截不到视频层，位置数据
    用 GetPositionInfo 交叉验证；需要人眼看画面时明确请用户确认。
-8. **文档三处同步**：README（用户）、.agent/todo.md（状态）、本文件（Agent）。
+8. **文档同步**：改了行为或闸门计数后，README（用户）与本文件（Agent）一起改 ——
+   计数守卫（`tools/check_gate_counts.py`）会拿这两个文档核对，对不上就红。
 9. **零第三方依赖**（无 gradle dependency、无 aar/jar）。**唯一明示例外**：
    `io/nayuki/qrcodegen/` 的 QR 编码核心（MIT，纯 Java 源码内嵌、无二进制）。
    引入理由：二维码编码**不能自己写**（Reed-Solomon + 掩码 + 版本选择，
@@ -267,7 +266,7 @@ adb -s 192.168.1.8:5555 logcat -v time > /tmp/tv_session.log 2>&1
   0.2.4（19）批 3.9 视频蓝屏修复 F1/F2/占位层；0.2.3（18）批 3.8 诊断日志；
   0.2.2（17）批 3.7、0.2.1（16）批 3.6、0.2.0（15）批 3.5 中等更新。
   历史版本已全部推送 GitHub（main）。
-- **进行中：视频「先蓝屏约 30 秒」修复**（`.agent/video-bluescreen-plan.md`）。当前只落了
+- **进行中：视频「先蓝屏约 30 秒」修复**。当前只落了
   **第 1 步 = 诊断日志**（批 3.8，零行为改动）：形态变化 / SurfaceView 显隐 + Surface
   生命周期 / `prepare 开始（带 surface=?）`·`结束（带耗时）`。**已定案分流**：真机
   `surface=true` + 厂商 `already reset` 栈 → 坐实 release/reset 竞态（§2.3）。
@@ -289,6 +288,5 @@ adb -s 192.168.1.8:5555 logcat -v time > /tmp/tv_session.log 2>&1
   用户明确否掉了「播完 N 秒无控制指令就自动收尾」那种替用户猜意图的做法 ——
   别再往服务里加「自动回空闲」的判据。Auto-Stop（`checkAutoStop`）是另一回事：
   它管的是「还在播、控制点却真的走了」，判据是订阅者数，且从不过问 STOPPED 态。
-- 未完成/观察项清单：`.agent/todo.md` §五（真机发现）、§六（生态调研 P1/P2）。
 - 代理（MediaProxy）默认关：CmpbPlayer 黑盒两症状未定根因，开
   `PlaybackPolicy.PROXY_ENABLED=true` 可继续迭代。

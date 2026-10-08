@@ -11,7 +11,6 @@
 **「一次都没出现」本身就是结论** —— 比如「0 条 ANR」就是 seek 修复成立的证据。
 手工 grep 十几次既慢又容易漏。
 
-判据来源：`.agent/device-test-0213.md` 的分组。
 """
 import glob
 import os
