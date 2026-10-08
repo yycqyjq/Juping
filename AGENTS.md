@@ -150,13 +150,15 @@ tools/
 有意增删断言后必须同步 build.sh / run.sh 里的期望值。
 
 **计数单一事实来源**：策略的断言/守卫数，以及协议/proxy/web/probe 的用例总数，
-手写在 `README.md` 与 `.agent/AGENTS.md` 里（措辞「N 项断言」/「N 条源码级守卫」/
+手写在 `README.md` 与 `AGENTS.md` 里（措辞「N 项断言」/「N 条源码级守卫」/
 「N 项一致性」等，量词可有可无）。`verify_policy` 末尾用
 `tools/check_gate_counts.py` 拿这两个文档和闸门里的期望值核对，对不上就红 ——
 规范值的唯一出处仍是 `build.sh` / `protocol-test/run.sh` 里那句比较字符串，
 文档跟不上就报出来。再不用靠人肉同步多处手写数字（那必然漂，T9 就是被 QA
 抓到的；README 里那句样本输出写的 `协议一致性：219 / 219` 也是这么留下的）。
-`AGENTS.md` 因此**必须进版本库**（见根目录 `.gitignore` 里那条例外）。
+`AGENTS.md` 因此**必须进版本库** —— 它现在就在**仓库根目录**（2026-10-08 从
+`.agent/AGENTS.md` 挪出来，好让公开仓库里不再出现 `.agent/`），正常跟踪，
+不再需要 `.gitignore` 里的例外。
 
 ## 5. 真机调试手册（Hisense Vision-TV 实测坑）
 

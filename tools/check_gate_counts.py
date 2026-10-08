@@ -3,7 +3,7 @@
 
 为什么需要它
 -----------
-五道闸门的用例总数散落在 README.md 与 .agent/AGENTS.md 里**手写同步**，
+五道闸门的用例总数散落在 README.md 与 AGENTS.md 里**手写同步**，
 靠人肉必然漂。本轮之前就出过漂移：proxy 用例 10→11 时两处文档漏改
 （QA 跑测试才发现），README 里还留着一句样本输出写着 `协议一致性：219 / 219`
 （实际早就是 237）。「全部通过」和「该测的都测了」是两回事：断言被静默
@@ -45,7 +45,7 @@ SUMMARY = re.compile(r'播放策略：(\d+)\s*/\s*(\d+)\s*通过')
 DOC_ASSERTS = re.compile(r'(\d+)\s*(?:项)?\s*断言')
 DOC_GUARDS = re.compile(r'(\d+)\s*(?:条)?\s*源码级守卫')
 
-DOCS = ('README.md', '.agent/AGENTS.md')
+DOCS = ('README.md', 'AGENTS.md')
 
 BUILD = 'tools/build.sh'
 PROTOCOL_RUN = 'tools/protocol-test/run.sh'
@@ -58,22 +58,22 @@ ANCHORS = (
     ('protocol', 'README.md',        r'协议一致性：(\d+) / \d+ 通过'),
     ('protocol', 'README.md',        r'drive\.py\s+(\d+) 项一致性'),
     ('protocol', 'README.md',        r'协议 (\d+) 项通过'),
-    ('protocol', '.agent/AGENTS.md', r'协议一致性 (\d+) 项'),
-    ('protocol', '.agent/AGENTS.md', r'期望 (\d+)/\d+'),
+    ('protocol', 'AGENTS.md', r'协议一致性 (\d+) 项'),
+    ('protocol', 'AGENTS.md', r'期望 (\d+)/\d+'),
     # ---- 代理 11 ----
     ('proxy', 'README.md',        r'代理字节一致性测试（(\d+) 项）'),
     ('proxy', 'README.md',        r'代理字节一致性 (\d+) 项通过'),
-    ('proxy', '.agent/AGENTS.md', r'代理字节一致性（(\d+) 项）'),
-    ('proxy', '.agent/AGENTS.md', r'字节一致性 (\d+) 项'),
+    ('proxy', 'AGENTS.md', r'代理字节一致性（(\d+) 项）'),
+    ('proxy', 'AGENTS.md', r'字节一致性 (\d+) 项'),
     # ---- probe 33/34（双态）----
     ('probe', 'README.md',        r'自检脚本 (\d+) 或 (\d+) 项'),
-    ('probe', '.agent/AGENTS.md', r'直连降级，(\d+)/(\d+) 项'),
-    ('probe', '.agent/AGENTS.md', r'自检（\*\*(\d+) 或 (\d+) 双态'),
+    ('probe', 'AGENTS.md', r'直连降级，(\d+)/(\d+) 项'),
+    ('probe', 'AGENTS.md', r'自检（\*\*(\d+) 或 (\d+) 双态'),
     # ---- 网页 32 ----
     ('web', 'README.md',          r'网页逻辑一致性测试（(\d+) 项）'),
     ('web', 'README.md',          r'网页逻辑一致性 (\d+) 项通过'),
-    ('web', '.agent/AGENTS.md',   r'网页逻辑一致性（(\d+) 项）'),
-    ('web', '.agent/AGENTS.md',   r'网页逻辑一致性 (\d+) 项'),
+    ('web', 'AGENTS.md',   r'网页逻辑一致性（(\d+) 项）'),
+    ('web', 'AGENTS.md',   r'网页逻辑一致性 (\d+) 项'),
 )
 
 
@@ -187,12 +187,12 @@ def main():
         print('!! 计数漂移 —— 文档里写的用例总数与闸门期望值不符：', file=sys.stderr)
         for d in drift:
             print('     %s' % d, file=sys.stderr)
-        print('   改法：同步 README.md 与 .agent/AGENTS.md 里的数字'
+        print('   改法：同步 README.md 与 AGENTS.md 里的数字'
               '（用例只会越写越多，数字变小几乎必然是有一条被静默删掉）；'
               '若确实是措辞变了，连锚点一起改。', file=sys.stderr)
         return 1
 
-    print('  计数: 策略 %d 断言 + %d 守卫 = %d（与 README.md / .agent/AGENTS.md 一致）'
+    print('  计数: 策略 %d 断言 + %d 守卫 = %d（与 README.md / AGENTS.md 一致）'
           % (asserts, guards, asserts + guards))
     for line in extra:
         print(line)

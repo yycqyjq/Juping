@@ -50,10 +50,11 @@ desktop.ini
 __pycache__/
 *.pyc
 
-# 西瓜的本地待办/工作上下文，不进公开仓库
+# 本地工作上下文。`.agent/` 目录 2026-10-08 已清掉，
+# 这条留着兜底 —— 万一有工具又建出来，别让它进公开仓库。
 .agent/*
-# 例外：协作手册 AGENTS.md 要进版本库。
+# 协作手册 AGENTS.md 现在放在**仓库根目录**（原先在 .agent/AGENTS.md，
+# 2026-10-08 挪出来，好让公开仓库里不再出现 .agent/）。
 # 它是「断言/守卫计数」的单一事实来源之一 —— 计数守卫
 # （tools/check_gate_counts.py）要拿它核对，CI 与 clone 者也得看得到。
 # （QA 在 T9 点过：AGENTS.md 不进 commit，正是「计数单一事实来源不存在」的根因。）
-!.agent/AGENTS.md
