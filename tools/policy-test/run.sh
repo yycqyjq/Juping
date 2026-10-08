@@ -1559,6 +1559,52 @@ for label, marker in [('stop()', 'public synchronized void stop()'),
            b is not None and re.search(r'pendingSeekMs\s*=\s*-1', b) is not None,
            '不清的话，下一次播放会拿着上一次的 seek 目标当"当前位置"报给控制点')
 
+# ---- §7.31：「没有实例」必须是真的空操作，且早退排在一切状态清理之前 ----
+#
+# 为什么这条不能只靠上面那条：上面只要求 releasePlayer **存在** 清理语句，
+# 完全不管它在什么条件下执行。而真机挖出的缺陷正是"条件错了"——
+# startInternal() 等后台释放时先 return，释放完成的回调再进来一次，
+# 第二次 player 已是 null，早退却排在清理**之后**，于是控制点在窗口
+# （实测 39–55ms）里刚暂存进 pendingSeekMs 的 Seek 被静默抹掉：
+# 日志有「seek 请求早于 prepare，已暂存」、没有「prepare 完成，补发暂存的 seek」，
+# 用户看到「拖了进度条，电视从头发」。
+_rl31 = body_of(ctrl, 'private boolean releasePlayer(Runnable onReleased)')
+if _rl31 is None:
+    report('§7.31 releasePlayer 方法体已找到', False,
+           '锚点：private boolean releasePlayer(Runnable onReleased)')
+else:
+    # 先把注释剥掉再找位置 —— 否则注释里提到某个字段名就会让判据错位
+    # （本文件多处守卫吃过这个亏：判据要落在**代码**上，不是叙述上）。
+    _code31 = re.sub(r'/\*[\s\S]*?\*/', '', _rl31)
+    _code31 = re.sub(r'//[^\n]*', '', _code31)
+
+    def _pos31(pat):
+        _m = re.search(pat, _code31)
+        return _m.start() if _m else None
+
+    _null31 = _pos31(r'if\s*\(\s*player\s*==\s*null\s*\)')
+    _sync31 = re.search(r'synchronized\s*\(\s*this\s*\)\s*\{', _code31)
+    # 「与实例绑定」的状态 —— 这些一旦在早退之前执行，就说明"没实例"这条路径
+    # 又变成了"顺手清一遍"。
+    _state_pats31 = [r'prepared\s*=\s*false', r'playerReleased\s*=\s*true',
+                     r'pendingSeekMs\s*=\s*-1', r'stopSampler\s*\(',
+                     r'cancelVideoRecheck\s*\(']
+    _state_pos31 = [p for p in (_pos31(x) for x in _state_pats31) if p is not None]
+    report('§7.31 releasePlayer：「没有实例」的早退排在一切状态清理之前',
+           _null31 is not None
+           and len(_state_pos31) == len(_state_pats31)
+           and _null31 < min(_state_pos31),
+           '换片源重建时释放回调会重入 startInternal，再走一次 releasePlayer —— '
+           '那时 player 已是 null。早退若排在清理之后，控制点在窗口里刚暂存的 seek '
+           '会被静默抹掉（有「已暂存」无「补发」），用户看到「拖了进度条，电视从头发」。'
+           '另外 ' + str(len(_state_pats31)) + ' 条清理语句必须一条不少 —— '
+           '只把清理挪走、顺手删掉，等于把"真释放"那条路径也削了')
+    report('§7.31 releasePlayer：null 早退在实例锁内（不能挪到锁外）',
+           _sync31 is not None and _null31 is not None and _null31 > _sync31.end(),
+           '早退与"建实例"必须互斥在同一把锁里 —— 挪到 synchronized 之外，'
+           '就会在 startInternal 正建实例时插进来把 player 置空，'
+           '真机取证过：setDataSource 期间被置空 → setScreenOnWhilePlaying 直接 NPE')
+
 # ---- ③ 重投：HTTP 服务 bind 竞态不得泄漏端口 ----
 # 绑定已从 run() 移进 bindWithFallback()（为的是同步绑定 + 端口被占时回退），
 # 判据的锚点跟着移 —— 守的还是同一件事：绑上之后真关过一次 socket。

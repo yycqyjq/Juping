@@ -627,6 +627,10 @@ public class MediaPlayerController {
         // 释放可能被挪到后台线程（native 已挂起时）—— 那种情况下**先返回**，
         // 等释放完成再由回调重新进来。不能在这里同步等：等的就是那次挂起的 native。
         // 重新进来时 player 已是 null，releasePlayer 立刻返回 true，正常往下走。
+        //
+        // ⚠️ 那个 `true` **必须是真正的空操作**（§7.31）：这条重入路上，
+        // 控制点可能已经往 pendingSeekMs 暂存了一次 Seek（换片源 + 立刻拖进度条），
+        // 释放回调里再清一次状态就会把它静默吃掉 —— 用户看到「拖了，电视从头发」。
         if (!releasePlayer(new Runnable() {
             @Override
             public void run() {
@@ -2236,9 +2240,15 @@ public class MediaPlayerController {
      * <p><b>native 的 {@code release()} 永远交给后台线程</b>，调用方立刻返回 ——
      * 这条纪律没有例外，理由见方法体里那段注释。
      *
+     * <p><b>没有实例时本方法必须是真的空操作</b>（§7.31）：既不动 native，
+     * 也不清任何状态。下面那串清理只属于「真的释放掉了一个实例」这条路径 ——
+     * 否则「释放完成回调重入 startInternal」这条最常走的路会把控制点在窗口里
+     * 刚暂存的 seek 抹掉。方法体里 null 早退排在清理**之前**，就是为了这个。
+     *
      * @param onReleased 释放完成后回主线程执行的动作（调用方靠它接着往下走）；
      *                   {@code null} = 不需要后续动作（停止 / 退出路径）。
-     * @return {@code true} = 本来就没有实例可释放，调用方可以直接继续；
+     * @return {@code true} = 本来就没有实例可释放，调用方可以直接继续
+     *         （<b>且什么都没被改动</b>）；
      *         {@code false} = 释放已交给后台线程，等 {@code onReleased} 回来再继续。
      */
     private boolean releasePlayer(Runnable onReleased) {
@@ -2254,6 +2264,26 @@ public class MediaPlayerController {
         // 临界区里**不碰 native**（release 仍一律交给后台线程，见下），
         // 所以「native 挂起占住实例锁」那条老风险不会从这里回来。
         synchronized (this) {
+            // ---- 「没有实例可释放」必须**真的什么都不做**（§7.31）----
+            //
+            // 这个早退原来排在下面那串状态清理**之后**，于是「没实例」这条路径
+            // 照样会清状态。而它恰恰是最常被走到的一条：startInternal() 等后台
+            // 释放时先 return（见该方法里 `if (!releasePlayer(...)) return;`），
+            // 释放完成的回调再进来一次 —— 第二次 player 已经是 null。
+            //
+            // 控制点在这段窗口（实测 39–55ms）里发来的 Seek 会被暂存进
+            // pendingSeekMs，随即被这里的清理静默抹掉：日志有「seek 请求早于
+            // prepare，已暂存」、**没有**「prepare 完成，补发暂存的 seek」，
+            // 用户看到的是「拖了进度条，电视从头发」。
+            //
+            // 语义上本来也不该清：下面每一项都是**与实例绑定**的状态
+            // （外推锚点、假 EOS 水位线、采样缓存、探针），实例都没有了，
+            // 谈不上"与它绑定的状态"。真正的释放路径（下面 player != null 那段）
+            // 一个字节都没少。
+            if (player == null) {
+                // 本来就没有实例：没什么可释放的，调用方直接往下走。
+                return true;
+            }
             prepared = false;
             // 释放后 native 播放器不可再碰（任何方法调用都会触发 -38 错误回调）
             playerReleased = true;
@@ -2281,10 +2311,6 @@ public class MediaPlayerController {
             // 视频尺寸复查同理：载体（MediaPlayer 实例）没了就必须摘掉，
             // 否则过期复查会对着已释放的实例跑 —— 判定套到新片源上。
             cancelVideoRecheck();
-            if (player == null) {
-                // 本来就没有实例：没什么可释放的，调用方直接往下走。
-                return true;
-            }
             doomed = player;
             // 先摘引用：后台释放期间任何访问器都不该再看到这个实例
             player = null;
