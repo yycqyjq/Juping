@@ -3,7 +3,8 @@
 
 为什么需要它
 -----------
-五道闸门的用例总数散落在 README.md 与 AGENTS.md 里**手写同步**，
+五道闸门的用例总数散落在 README.md、AGENTS.md 与 doc/verification.md 里
+**手写同步**，
 靠人肉必然漂。本轮之前就出过漂移：proxy 用例 10→11 时两处文档漏改
 （QA 跑测试才发现），README 里还留着一句样本输出写着 `协议一致性：219 / 219`
 （实际早就是 237）。「全部通过」和「该测的都测了」是两回事：断言被静默
@@ -54,8 +55,10 @@ PROTOCOL_RUN = 'tools/protocol-test/run.sh'
 # 单值闸门：匹配到的每个数都必须等于规范值。
 # 双态闸门（probe）：匹配到的每个数都必须是合法态之一（33 / 34）。
 ANCHORS = (
-    # ---- 协议 237 ----
-    ('protocol', 'README.md',        r'协议一致性：(\d+) / \d+ 通过'),
+    # ---- 协议 245 ----
+    # 2026-10-09 README 拆分：这句样本输出跟着「五道深度验证」段移进了
+    # doc/verification.md —— 锚点按纪律改指新文件（数字本身没动）。
+    ('protocol', 'doc/verification.md', r'协议一致性：(\d+) / \d+ 通过'),
     ('protocol', 'README.md',        r'drive\.py\s+(\d+) 项一致性'),
     ('protocol', 'README.md',        r'协议 (\d+) 项通过'),
     ('protocol', 'AGENTS.md', r'协议一致性 (\d+) 项'),
@@ -187,12 +190,12 @@ def main():
         print('!! 计数漂移 —— 文档里写的用例总数与闸门期望值不符：', file=sys.stderr)
         for d in drift:
             print('     %s' % d, file=sys.stderr)
-        print('   改法：同步 README.md 与 AGENTS.md 里的数字'
+        print('   改法：同步 README.md / AGENTS.md / doc/verification.md 里的数字'
               '（用例只会越写越多，数字变小几乎必然是有一条被静默删掉）；'
               '若确实是措辞变了，连锚点一起改。', file=sys.stderr)
         return 1
 
-    print('  计数: 策略 %d 断言 + %d 守卫 = %d（与 README.md / AGENTS.md 一致）'
+    print('  计数: 策略 %d 断言 + %d 守卫 = %d（与 README.md / AGENTS.md / doc 锚点一致）'
           % (asserts, guards, asserts + guards))
     for line in extra:
         print(line)

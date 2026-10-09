@@ -237,7 +237,8 @@ verify_policy() {
     if tools/policy-test/run.sh >"$out" 2>&1; then
         echo "  策略: $(grep -oE '播放策略：.*' "$out" | head -1)"
         # 计数守卫 —— 防「文档里写的用例总数」与「闸门期望值/实际跑出来的」悄悄对不上。
-        # 存在的数字散落在 README.md 与 AGENTS.md（仓库根目录）里手写同步，靠人肉必然漂：
+        # 存在的数字散落在 README.md、AGENTS.md（仓库根目录）与 doc/verification.md
+        # 里手写同步，靠人肉必然漂：
         # 之前有过 proxy 用例 10→11、两处文档漏改（QA 跑测试才发现），README 里还
         # 长期留着一句 `协议一致性：219 / 219`（实际早是 237）。现在五道闸门的总数
         # 都由 tools/check_gate_counts.py 核对：规范值是这里/run.sh 里的期望字符串，

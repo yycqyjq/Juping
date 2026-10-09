@@ -108,6 +108,12 @@ app/src/main/java/io/nayuki/qrcodegen/            ← **唯一的第三方源码
 │                                少搬它会编译不过。API 15 适配只有两处：
 │                                requireNonNull → 显式判空、UTF-8 取字节走 Charset。
 │                                绘制不用上游 toImage()，改由 QrRenderer 逐格画）
+doc/                                            ← README 拆出的深度文档（2026-10-09）
+├── verification.md         五道深度验证 + 十二轮工程记录（bug 与证伪）
+│                           协议闸门那句样本输出「协议一致性：N / N 通过」的锚点在这
+├── design-notes.md         界面与播放行为笔记（为什么长这样）
+├── web.md                  扫码上传 / 安装包网页功能
+└── troubleshooting.md      logcat 日志逐条判读
 tools/
 ├── build.sh              一键构建+八道闸门（apk/api/dex/protocol/policy/proxy/web/secrets）
 ├── lib.sh                各脚本共用的 JDK 定位（build.sh 与四个 run.sh 都 source 它）
@@ -118,7 +124,7 @@ tools/
 ├── check_dex_entrypoints.py  R8 后 dex 入口点核查
 ├── check_sources.py      无 JDK 环境的源码结构检查
 ├── check_no_secrets.py   密钥泄漏核查
-├── check_gate_counts.py  五道闸门用例总数 ↔ README/AGENTS 文档 一致性
+├── check_gate_counts.py  五道闸门用例总数 ↔ README/AGENTS/doc 文档 一致性
 ├── apk_info.py           APK 包名/minSdk 解析
 ├── make_icon.py          位图资源生成（纯标准库）
 ├── protocol-test/        DLNA 协议一致性 245 项（桌面 JVM + 真实协议栈桩）
@@ -148,12 +154,13 @@ tools/
 有意增删断言后必须同步 build.sh / run.sh 里的期望值。
 
 **计数单一事实来源**：策略的断言/守卫数，以及协议/proxy/web/probe 的用例总数，
-手写在 `README.md` 与 `AGENTS.md` 里（措辞「N 项断言」/「N 条源码级守卫」/
-「N 项一致性」等，量词可有可无）。`verify_policy` 末尾用
-`tools/check_gate_counts.py` 拿这两个文档和闸门里的期望值核对，对不上就红 ——
+手写在 `README.md`、`AGENTS.md` 与 `doc/verification.md` 里（措辞「N 项断言」/
+「N 条源码级守卫」/「N 项一致性」等，量词可有可无）。`verify_policy` 末尾用
+`tools/check_gate_counts.py` 拿这些文档和闸门里的期望值核对，对不上就红 ——
 规范值的唯一出处仍是 `build.sh` / `protocol-test/run.sh` 里那句比较字符串，
 文档跟不上就报出来。再不用靠人肉同步多处手写数字（那必然漂，T9 就是被 QA
-抓到的；README 里那句样本输出写的 `协议一致性：219 / 219` 也是这么留下的）。
+抓到的；那句样本输出 `协议一致性：219 / 219` 历史上留在 README，2026-10-09
+README 拆分后它在 `doc/verification.md`，锚点已跟着改）。
 `AGENTS.md` 因此**必须进版本库** —— 它现在就在**仓库根目录**（2026-10-08 从
 `.agent/AGENTS.md` 挪出来，好让公开仓库里不再出现 `.agent/`），正常跟踪，
 不再需要 `.gitignore` 里的例外。
