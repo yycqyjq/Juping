@@ -113,6 +113,7 @@ doc/                                            ← README 拆出的深度文档
 │                           协议闸门那句样本输出「协议一致性：N / N 通过」的锚点在这
 ├── design-notes.md         界面与播放行为笔记（为什么长这样）
 ├── web.md                  扫码上传 / 安装包网页功能
+├── release.md              签名密钥与发布（README 摘出的维护者向内容）
 └── troubleshooting.md      logcat 日志逐条判读
 tools/
 ├── build.sh              一键构建+八道闸门（apk/api/dex/protocol/policy/proxy/web/secrets）

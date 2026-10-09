@@ -421,7 +421,7 @@ PY
     release)
         if [ ! -f keystore.properties ]; then
             echo "!! 缺少 keystore.properties，release 包会没有签名、装不上。" >&2
-            echo "   见 README 的「签名」一节。" >&2
+            echo "   见 doc/release.md。" >&2
             exit 1
         fi
         "$GRADLE_BIN" assembleRelease

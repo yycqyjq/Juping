@@ -92,6 +92,7 @@ Juping/
 ├── doc/                             深度文档（README 拆出的续篇）
 │   ├── verification.md          闸门与工程验证记录
 │   ├── design-notes.md          界面与播放行为笔记
+│   ├── release.md               签名密钥与发布（维护者向）
 │   ├── web.md                   扫码上传 / 安装包网页功能
 │   └── troubleshooting.md       logcat 日志判读
 └── tools/
@@ -185,37 +186,6 @@ dist/juping-<版本>-debug.apk     ← 排障用（带 debuggable 标记）
 curl -o android-15.zip https://dl.google.com/android/repository/android-15_r05.zip
 curl -o android-14.zip https://dl.google.com/android/repository/android-14_r04.zip
 # 解压后把 android.jar 放到 sdk/platforms/android-{15,14}/
-```
-
----
-
-## 签名
-
-release 密钥在 `keystore/juping-release.jks`，密码在 `keystore.properties`。
-**这两个文件都被 `.gitignore` 忽略**，不会跟着代码跑出去。
-
-> **务必备份这两个文件。**
-> 密钥丢了，就没法对已经装在盒子上的聚屏做覆盖升级 —— 只能先卸载再装，
-> 而卸载会清掉已保存的设备 UUID（手机投屏列表里会多出一台"新"设备）。
-
-### 为什么密钥用 SHA1withRSA
-
-`keytool` 生成时会警告「SHA1 是弱算法」。这是**刻意的取舍**：
-
-- 目标设备是 Android 4.0.4（API 15）。API 18 以下的平台对签名算法支持很窄，
-  `SHA1withRSA` 是唯一能确定被认的。
-- 这把密钥只用于本地侧载，不参与任何信任链。SHA-1 的碰撞攻击面在
-  「自己签自己」的场景下不构成实际风险。
-
-**兼容性 > 理论强度**，这是老设备上的必然选择。
-
-同理，APK 的 v1（JAR）签名摘要也必须是 SHA-1 —— 这一点由 `apksigner` 根据
-`minSdkVersion` 自动决定，本项目 minSdk=14，所以自动就是 SHA-1。
-可以用这个命令确认：
-
-```bash
-unzip -p dist/juping-<版本>-release.apk META-INF/MANIFEST.MF | grep Digest
-# 应该看到 SHA1-Digest: ...，而不是 SHA-256-Digest
 ```
 
 ---
@@ -529,6 +499,7 @@ adb shell am broadcast -a com.juping.cast.APPLY_RENAME --es name ""   # 恢复�
 | [doc/verification.md](doc/verification.md) | 五道深度验证 + 十二轮工程验证记录（bug 与证伪） | 想复核质量的人 |
 | [doc/design-notes.md](doc/design-notes.md) | 界面与播放行为笔记（为什么长这样） | 好奇的维护者 |
 | [doc/web.md](doc/web.md) | 扫码上传页 / 安装包页的端点与加固 | 用网页功能的人 |
+| [doc/release.md](doc/release.md) | release 签名：密钥位置、备份、SHA1withRSA 取舍 | 自己出包的维护者 |
 | [doc/troubleshooting.md](doc/troubleshooting.md) | logcat 日志逐条判读 | 盒子出问题的人 |
 | [AGENTS.md](AGENTS.md) | 面向 AI Agent 的项目速查手册 | 改代码的 Agent / 开发者 |
 
